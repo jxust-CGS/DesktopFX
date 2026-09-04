@@ -1,0 +1,262 @@
+# 桌面特效（DesktopFX）
+
+一个纯 Python 的 Windows 桌面特效程序：覆盖全桌面（含多显示器）的**下雨 / 下雪 / 聚光灯 / 窗口水波**等多种粒子与氛围特效，鼠标移动 / 点击时在光标位置生成涟漪。特效以「可独立开关的图层」组合，任意搭配（如雪 + 闪电、雨 + 雪、聚光灯 + 水波）。**所有参数实时可调，支持保存为自定义预设方案并随时删除**，配置自动持久化。
+
+## 效果一览
+
+- **下雨**：3 层景深（远 / 中 / 近），自带风偏、长度 / 浓度 / 速度 / 落点溅水花调节
+- **鼠标涟漪**：跟随鼠标移动 / 点击触发，多层同心圆环 + 真实 alpha 衰减
+- **随机闪电**：可选，画面整体短暂泛白 + 立即全屏涟漪
+- **聚光灯**：全屏压暗 + 鼠标处一个柔边透明圆洞，凸显光标周围；压暗只做整块内存赋值，圆洞仅在光标周围包围盒内逐像素计算，远处屏幕不会被逐像素扫描
+- **窗口水波**：枚举桌面窗口，窗口移动时沿其四条边荡开涟漪、松手（停止移动）时落点补一团大爆发，最小化 / 恢复也各触发一次；复用现成涟漪池，零新渲染算法
+- **零侵入**：覆盖层是 `WS_EX_LAYERED | WS_EX_TRANSPARENT` 置顶窗，鼠标事件完全穿透，不会拦截任何点击
+- **高 DPI 友好**：启动时声明 `DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2`，在 Win10/11 125%/150% 缩放下覆盖层仍精确贴合物理像素
+- **单实例**：进程互斥体保证只有一个实例在跑。重复双击不会叠出第二份雨，而是把已运行实例的面板叫出来
+
+实机渲染示例：4K 双屏 60 FPS，单帧渲染耗时 7-11 ms。最坏情况（暴雨 + 120 涟漪）88 FPS（用 `_verify_perf.py` 测得）。雨雪聚光灯同开（暴雨 620 + 暴雪 560 + 聚光灯）在 4K 双屏上仍高于 80 FPS（用 `_verify_perf_layers.py` 测得），长跑 3600 帧内存仅 +1 MB、无 NaN。
+
+> **可见度自检**：默认色与所有预设都用 `_verify_visibility.py` 在白底 (255,255,255) 和深底 (24,28,36) 上量化评分，并设了 **50 分硬门槛** —— 任一底色上不达标，脚本直接以退出码 1 失败，而不是默默放行。当前默认值评分 **70 / 94**（满分 100），14 个预设全部达标，开箱即用不挑桌面底色。
+>
+> 这个门槛是必要的：早期版本默认色 `#BFE3FF` 在白底只有 28 分，等于隐形；"毛毛雨"预设更低到 36 分。两者都已调深，并由门槛守住防止回退。
+
+## 快速开始
+
+### 一键启动
+
+双击 `启动桌面特效.bat`。启动器按优先级找 Python 和虚拟环境：
+
+1. Python：环境变量 `DESKTOP_FX_PY` → 本机已知的安装路径 → `PATH` 里的 `python`
+2. 虚拟环境：环境变量 `DESKTOP_FX_VENV` → 本机开发 venv → `%LOCALAPPDATA%\DesktopFX\venv`
+3. 首次运行自动创建 venv，并通过清华镜像安装依赖 `numpy`（渲染）+ `Pillow`（界面抗锯齿）
+4. 启动主程序 `desktop_fx.py`（依赖缺失或 venv 不存在时才需要联网，其余情况全离线）
+
+> 界面抗锯齿（滑块 / 开关 / 图标）依赖 Pillow；装不上时程序会自动退回无抗锯齿的 Canvas 画法继续运行。
+
+### 退出方式
+
+- 托盘图标 → 右键 → 退出
+- 控制面板顶栏的 × 按钮
+- 任务管理器结束 `pythonw` 进程
+
+> 程序只允许一个实例。再次双击启动器时，新的进程会把已运行实例的控制面板叫出来然后自己退出 —— 不会叠出第二层雨。
+
+### 维护启动器
+
+`启动桌面特效.bat` 有两个硬性要求，违反其中任何一条都会让它彻底打不开（症状是双击后一闪而过，或者报"系统找不到指定的批处理标签"）：
+
+1. **必须是纯 ASCII**。cmd.exe 用系统 ANSI 代码页（中文 Windows 上是 GBK）读 `.bat`，UTF-8 中文会被拆成乱码并破坏引号配对。
+2. **必须是 CRLF 换行**。只有 LF 时 `goto` 标签解析会失败。
+
+启动器由 `_make_launcher.py` 生成（自动保证 CRLF + ASCII）；**不要直接改 .bat**，要改逻辑请改生成器再运行它：
+
+```bash
+python _make_launcher.py   # 重新生成 启动桌面特效.bat（CRLF + ASCII）
+python _verify_launcher.py # 双击全链路验证（含路径存在性、goto 标签可达性）
+```
+
+另外：**不要用 Git Bash 写这个文件**。MSYS 会把"看起来像绝对路径"的内容里的反斜杠改成斜杠（`C:\Users\...` → `C://Users//...`）。
+
+## 拷到其它电脑（分发）
+
+整个 DesktopFX 目录拷到另一台 Windows 机器后**直接双击 bat 即可**，但目标机器要满足：
+
+1. **Windows 10 / 11**（依赖 `user32` `gdi32` `shell32` 的 Win32 API，纯 Windows）
+2. **已安装 Python 3.9+**（官方 python.org 安装包默认带 tkinter；安装时勾选 *Add python.exe to PATH*）
+3. **首次运行需要联网一次**：自动创建 `%LOCALAPPDATA%\DesktopFX\venv` 并 pip 安装 `numpy + Pillow`；装完即离线可跑
+
+说明：
+
+- **不要拷 venv**（Windows venv 不可迁移，路径写死在创建机器上）；启动器会自动重建。
+- `config.json` / `presets_user.json` / `ui_state.json` 是本机运行数据，拷过去等于带着你的设置；想当"全新安装"发给别人就删掉这三个 + `error.log`。
+- 开发辅助文件（`_verify_*.py` `_diag_*.py` `_mkcrlf.py` 等）与 `_*.png` 截图只在开发时有意义，可一并删除，不影响运行。
+- 机器上同时装了多份 Python 想指定用哪份：设环境变量 `DESKTOP_FX_PY=...python.exe` 即可；venv 位置用 `DESKTOP_FX_VENV` 覆盖。
+
+## 控制面板
+
+程序启动后会在屏幕中央出现一块 **Linear / Raycast 风格的深色工具面板**：
+
+- **视觉**：深色底色 + 卡片式分组 + 单一青色强调色，数值统一使用等宽字体避免抖动；
+  Win11 下自动调用 DWM 实现窗口圆角与亚克力模糊背景（Win10 旧版本会静默回退）。
+- **左侧栏导航**：每个分组配一个 1.5px 线性图标 + 中文标签，激活项左侧带青色指示条；
+  底部常驻 `暂停 / 隐藏到托盘 / 退出`。
+- **右侧内容区**：属性名 / 滑块 / 数值单行排列，全部调整即时生效；内容超高时滚轮滚动（界面无可见滚动条）。
+- **自定义控件**：Canvas 自绘 + PIL 抗锯齿（滑块为胶囊轨道 + 白色圆点，开关为胶囊 + 滑动旋钮），颜色与整体风格同源。
+- **预设方案下沉到特效页**：每个特效页列出该页的**内置预设**和**用户自定义预设**；
+  点击预设按钮就地刷新所有控件（不再整面板销毁重建，无闪烁）。
+- **保存 / 删除预设**：每页底部都有 `+ 保存当前为预设`，可把当前全部属性快照存为用户预设；
+  用户预设右侧会出现 `×` 删除按钮，内置预设不可删除。用户预设存于 `presets_user.json`。
+- **记住上次页**：关闭前停在哪个分组页，下次打开回到那一页（状态存于 `ui_state.json`，独立于 `config.json`）。
+
+| 分组 | 选项 |
+|------|------|
+| **下雨** | 启用下雨 / 雨量 / 下落速度 / 雨丝长度 / 风力（左负右正）/ 浓度 / 雨丝颜色 · 预设方案：毛毛雨 / 中雨 / 暴雨 / 斜风细雨 / 夜雨（青）/ 暖雨（金）/ 深蓝高对比 / 石墨冷灰 |
+| **下雪** | 启用下雪 / 雪量 / 飘落速度 / 雪花大小 / 横向漂移 / 浓度 / 雪花颜色 · 预设方案：初雪 / 暴雪 / 雪夜 |
+| **聚光灯** | 启用聚光灯 / 亮区半径 / 压暗强度 / 压暗颜色 · 预设方案：聚光灯 / 舞台光 |
+| **窗口水波** | 启用窗口水波 / 波大小 / 存续时间 / 浓度 / 边缘密度 / 涟漪颜色 · 预设方案：水面 |
+| **鼠标涟漪** | 跟随鼠标移动 / 点击时扩散 / 触发灵敏度 / 涟漪大小 / 存续时间 / 浓度 / 涟漪颜色 |
+| **其它** | 雨滴落地溅水花 / 随机闪电 / 帧率上限 / 开机时自动启动 |
+
+面板顶栏可拖动，关闭后通过托盘图标重新打开。
+
+## 系统托盘
+
+托盘图标使用 **WorkBuddy 品牌图标**（`tray_icon.ico`），加载不到时自动回退到自绘云雨图标。
+
+> 托盘图标走 `LoadImageW` 从 `.ico` 加载，内含 16/32/48/64/128/256 六档尺寸，
+> Windows 按托盘实际大小和高 DPI 缩放自动挑最清晰的一档。**不要**改成手搓
+> DIBSection —— 那条路在受限会话（无显示器 / 远程 / 部分 pythonw 场景）里
+> `CreateDIBSection` 会直接失败，图标就没了（见 `_verify_tray.py::test_tray_icon_loads`）。
+
+托盘图标右键菜单：
+
+- 打开面板
+- 暂停 / 继续
+- 退出
+
+左键单击 / 双击图标同样可开关面板；`Ctrl+Alt+R` 可直接暂停或继续。
+
+资源管理器重启（explorer 崩溃、Windows 更新、手动重启）会广播 `TaskbarCreated`，
+程序收到后会**重新挂载托盘图标**，不会出现"雨还在下但图标没了"的情况。
+开机自启时若本进程早于任务栏创建，首次挂载会失败，同样由这条广播补救。
+
+> 托盘宿主必须是**隐藏的顶层窗口**，不能用 `HWND_MESSAGE`（message-only 窗口）。
+> 实测（见 `_probe_broadcast.py`）：message-only 窗口收不到 `HWND_BROADCAST` 广播，
+> `TaskbarCreated` 处理写得再对也是死代码。它不设 `WS_VISIBLE` 因此不进任务栏，
+> 带 `WS_EX_TOOLWINDOW` 因此不进 Alt+Tab。
+
+## 文件结构
+
+```
+DesktopFX/
+├── desktop_fx.py        # 主程序：渲染线程 + 事件采集 + 生命周期
+├── fx_winlayer.py       # 分层透明窗口（Win32 UpdateLayeredWindow + DIBSection）
+├── fx_effects.py        # numpy 向量化雨滴 / 雪花 / 涟漪 / 聚光灯 / WindowProbe 窗口枚举 渲染
+├── fx_scene.py          # 场景合成器：把雨/雪/涟漪/闪电/聚光灯/窗口水波/鼠标组合成可开关的图层
+├── fx_tray.py           # 原生 Shell_NotifyIcon 托盘（LoadImageW 加载 tray_icon.ico）
+├── fx_ui.py             # tkinter 深色玻璃风控制面板（PIL 抗锯齿自绘控件 + 侧栏导航）
+├── _win32.py            # 统一的 ctypes 64-bit 类型与函数签名
+├── tray_icon.ico        # 托盘图标（WorkBuddy 品牌，16/32/48/64/128/256 六档）
+├── tray_icon.png        # 图标源图（256×256，仅用于重新生成 .ico）
+├── _make_launcher.py    # 启动器生成器（保 ASCII + CRLF，改 bat 走这里）
+├── _selftest.py         # 离屏渲染自检（输出 preview.png）
+├── _runtime_test.py     # 核心窗口 2 秒冒烟测试
+├── _verify_visibility.py  # 在白底 / 深底上量化每个预设的可见度
+├── _verify_config.py      # 内置预设 + 配置持久化 + snapshot 一致性
+├── _verify_user_presets.py # 用户预设：保存 / 按页分组 / 删除 / 应用
+├── _verify_autostart.py   # 开机自启注册表读写
+├── _verify_autosave.py     # 1s 防抖自动保存 + 崩溃恢复
+├── _verify_smoke.py        # 各特效 60 帧 + 闪电 + 雪 + 聚光灯 + 窗口水波 + 边界雨量，无回归烟雾
+├── _verify_snow.py         # 雪专项：动画 / 暗底可见 / 边界量 / resize / 换色 / 与雨同屏
+├── _verify_layers.py       # 图层专项：动画 / 透明洞 / 组合 / Scene 全预设端到端
+├── _verify_window_ripple.py # 窗口水波：WindowProbe diff + Scene 移动/松手/最小化/恢复触发，无 NaN
+├── _verify_perf.py         # 4K 双屏最坏情况（暴雨 + 120 涟漪）性能基准
+├── _verify_perf_layers.py  # 4K 双屏最坏情况（多图层全开）性能 + 3600 帧稳定性基准
+├── _diag_layers.py         # 真机验证：雨+聚光灯同屏启动，抓帧差分确认画到桌面
+├── _verify_stability.py    # 18000 帧长跑：内存泄漏 / 帧耗时漂移 / 池溢出
+├── _verify_mouse_init.py   # 鼠标探针首帧幽灵位移修复验证
+├── _verify_dpi.py          # DPI 感知声明验证
+├── _verify_launcher.py     # 双击入口端到端：文件卫生/启动/渲染/单实例
+├── _verify_ui_runtime.py    # 面板运行时冒烟：侧栏遍历 / 预设就地刷新 / 滚动，真实 Tk 下实例化
+├── _verify_single_instance.py # 互斥体跨进程语义 + 跨进程唤醒消息
+├── _verify_error_reporting.py # 故障可见性：落盘/去重/熔断/UI 横幅/上报路径自保
+├── _verify_tray.py         # 托盘：TaskbarCreated 重挂 / 开机竞态 / 真机图标可见
+├── _verify_icon_preview.py # 托盘图标像素级可见性验证（加载 tray_icon.png）
+├── _diag_tray.py           # 诊断：程序在跑时确认托盘图标是否真挂上、挂在哪
+├── _probe_broadcast.py     # 诊断：message-only 窗口收不到广播（托盘选型的依据）
+├── _mkcrlf.py           # 把启动器规范成 CRLF + ASCII（改完 bat 必跑）
+├── _pwdbg.py            # pythonw 无控制台时的日志捕获壳
+├── _shot.py             # 纯 ctypes 全屏截图工具
+└── 启动桌面特效.bat      # 一键启动器（由 _make_launcher.py 生成；ASCII + CRLF）
+```
+
+## 性能与限制
+
+- 渲染瓶颈在 Python 主循环；CPU 越多核越快，3.13+ 的 4 核机器 4K 双屏稳定 60 FPS
+- 第三方依赖只有两个：`numpy`（渲染必需）+ `Pillow`（界面抗锯齿，缺失时自动降级）；其余全部是标准库
+- 仅支持 Windows 10 / 11（依赖 `user32` `gdi32` `shell32` 的 64-bit API）
+
+## 配置持久化
+
+所有改动经 **1 秒防抖后** 自动写入程序目录下的 `config.json`（与 `desktop_fx.py` 同级），崩溃 / 强杀也只丢最近 1 秒的改动。要手动恢复默认：直接删除该文件即可（下次启动会以出厂配置重建）。
+
+用户自定义预设单独存于 `presets_user.json`，与主配置解耦；删除该文件即可清空所有用户预设，不影响内置预设和当前运行配置。
+
+配置文件损坏（JSON 语法错误、内容不是对象）时会自动回退到出厂值，并在 `error.log` 里留一条记录 —— 不会出现"设置莫名其妙变回默认值却查不到原因"。
+
+## 故障排查
+
+程序用 `pythonw.exe` 启动，没有控制台。所以运行期的异常会写到程序目录下的 **`error.log`**（时间戳 + 错误类型 + 消息），同时在控制面板顶部显示一条红色横幅：
+
+```
+注意  render: OSError: UpdateLayeredWindow failed ...
+详情见 error.log
+```
+
+| 现象 | 含义 |
+|------|------|
+| 面板顶部出现红色横幅 | 渲染或存盘出错了，横幅文本 + `error.log` 有详情 |
+| 桌面静止但面板没有横幅 | 特效被暂停了（`Ctrl+Alt+R` 或托盘菜单可切换） |
+| 设置改了重启后复原 | 配置存盘失败（只读 / 网盘占用），横幅会提示 `config-save` |
+| 程序自己退出了 | 连续 30 帧渲染失败触发熔断，见 `error.log` 最后一条 |
+
+设计要点：
+
+- 偶发单帧异常（比如改分辨率瞬间 DIB 正在重建）会被容忍，成功一帧即清零计数
+- **连续 30 帧失败才熔断退出**（约 6 秒），避免程序永远以 5 FPS 空转烧 CPU
+- 恒定不产生 `error.log` —— 正常运行不会制造噪音
+
+## 开发调试
+
+```bash
+# 离屏渲染 4 秒并保存 preview.png（不需要显示器）
+python _selftest.py
+
+# 窗口 + 渲染 2 秒冒烟（不启动托盘/UI）
+python _runtime_test.py
+
+# 十七个验证脚本：可见度 / 配置 / 开机自启 / 自动保存 / 故障可见性 / 托盘 /
+#   烟雾 / 性能 / 稳定性 / 鼠标探针 / DPI / 启动器 / 单实例 / 雪 / 图层组合 / 窗口水波
+# 托盘脚本会真机拉起程序（约 15 秒），并断言干净启动不产生 error.log
+# 稳定性脚本额外需要 psutil：pip install psutil
+python _verify_visibility.py
+python _verify_config.py
+python _verify_autostart.py
+python _verify_autosave.py
+python _verify_error_reporting.py
+python _verify_tray.py
+python _verify_smoke.py
+python _verify_snow.py
+python _verify_layers.py
+python _verify_window_ripple.py
+python _verify_perf.py
+python _verify_perf_layers.py
+python _verify_stability.py
+python _verify_mouse_init.py
+python _verify_dpi.py
+python _verify_launcher.py
+python _verify_single_instance.py
+python _verify_ui_runtime.py
+
+# 真机视觉验证（需真实桌面）：启动指定组合并抓帧差分，确认特效真的画到了桌面
+python _diag_layers.py     # 雨 + 聚光灯 同屏
+python _diag_snow.py       # 初雪预设
+
+# pythonw 没有控制台，看不到 print。用这个壳把输出和异常抓到 _pw.log：
+pythonw _pwdbg.py && type _pw.log
+
+# 实机运行 10 秒后自动退出（方便捕获日志）
+set DESKTOP_FX_AUTOKILL=10000
+python desktop_fx.py
+```
+
+## 开机自启
+
+控制面板"其它"分组里有一个 **开机时自动启动** 开关。开启后会写入 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\DesktopFX`，命令指向**本机实际运行的 venv**（即 `%LOCALAPPDATA%\DesktopFX\venv\Scripts\pythonw.exe`，开发机则可能是项目 venv），例如：
+
+```
+"…\venv\Scripts\pythonw.exe" "…\DesktopFX\desktop_fx.py"
+```
+
+- 使用 `pythonw.exe` ⇒ 登录后无控制台窗口闪烁
+- 仅写 HKCU，不需管理员权限
+- 关掉开关即删除注册表项，等同"取消自启"
