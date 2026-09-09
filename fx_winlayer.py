@@ -24,6 +24,10 @@ SM_CXVIRTUALSCREEN = 78
 SM_CYVIRTUALSCREEN = 79
 BI_RGB = 0
 DIB_RGB_COLORS = 0
+HWND_TOPMOST = wt.HWND(-1)
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOACTIVATE = 0x0010
 
 
 class POINT(ctypes.Structure):
@@ -208,6 +212,20 @@ class Overlay:
         while user32.PeekMessageW(ctypes.byref(msg), self.hwnd, 0, 0, 1):
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
+
+    def keep_on_top(self):
+        """把叠加层钉回最上层。
+
+        窗口创建时虽带 WS_EX_TOPMOST，但只要用户点开一个同样置顶的应用
+        （全屏视频 / 画中画 / 悬浮窗 / 部分游戏），对方被激活后就会压过我们。
+        topmost 不会因为普通窗口激活而丢失，所以"点击后特效跑到后面"几乎
+        都是被"别的置顶窗口"盖住了 —— 周期调用本方法即可 ≤0.5s 内复位。
+        NOACTIVATE 保证不抢焦点，点击仍 100% 穿透。
+        """
+        if not self.hwnd:
+            return
+        user32.SetWindowPos(self.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
 
     def destroy(self):
         if self._hdc_mem and self._old_bmp:

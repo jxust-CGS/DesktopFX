@@ -480,6 +480,7 @@ class App:
         last = time.perf_counter()
         frame = 0
         fps_ema = 60.0
+        _last_top = 0.0  # 上次"钉顶"时刻；见 ov.keep_on_top 注释
 
         while not self.stop_evt.is_set():
             t0 = time.perf_counter()
@@ -505,6 +506,13 @@ class App:
                     scene.resize(w, h)
                     scene.set_origin(ov.x, ov.y)
                 frame += 1
+
+                # 周期性把叠加层钉回最上层：被其它置顶窗口（全屏视频/画中画等）
+                # 盖住后，≤0.5s 内自动复位；NOACTIVATE 不抢焦点
+                now = time.perf_counter()
+                if now - _last_top > 0.5:
+                    _last_top = now
+                    ov.keep_on_top()
 
                 u32 = ov.u32
                 u32[:] = 0

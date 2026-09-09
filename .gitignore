@@ -1,0 +1,16 @@
+# Python / 构建临时产物
+__pycache__/
+*.py[cod]
+*.spec
+build/
+
+# PyInstaller 产物里只有 exe 入库；旁侧的运行数据不入库
+dist/*.json
+dist/error.log
+
+# 运行时个人数据（本地保留，不入库）
+config.json
+presets_user.json
+ui_state.json
+error.log
+*.log
