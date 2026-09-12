@@ -65,6 +65,9 @@ DEFAULTS = {
     "snow_speed": 90.0,
     "snow_size": 1.0,
     "snow_drift": 0.06,
+    "snow_wind": 25.0,           # 整场均匀风速（px/s），带阵风起伏
+    "snow_twinkle": 0.35,        # 亮度脉动幅度（只做变暗，峰值不衰减）
+    "snow_glow": 0.5,            # 近雪辉光强度（0 = 关闭，省性能）
     "snow_color": "#EAF2FF",
     "snow_opacity": 0.9,
     # ---- 聚光灯（全屏压暗 + 鼠标处透明圆洞）----
@@ -104,12 +107,15 @@ PRESETS = {
     # ---- 雪：独立特效层，可与闪电等任意组合 ----
     "初雪": dict(rain_enabled=False, snow_enabled=True, snow_amount=180,
               snow_speed=70, snow_size=1.0, snow_drift=0.10,
+              snow_wind=12, snow_twinkle=0.40, snow_glow=0.45,
               snow_color="#EAF2FF", snow_opacity=0.9, lightning=False),
     "暴雪": dict(rain_enabled=False, snow_enabled=True, snow_amount=560,
               snow_speed=130, snow_size=1.2, snow_drift=0.35,
+              snow_wind=85, snow_twinkle=0.22, snow_glow=0.65,
               snow_color="#FFFFFF", snow_opacity=0.95, lightning=False),
     "雪夜": dict(rain_enabled=False, snow_enabled=True, snow_amount=260,
               snow_speed=85, snow_size=1.0, snow_drift=0.12,
+              snow_wind=20, snow_twinkle=0.45, snow_glow=0.55,
               snow_color="#DCEBFF", snow_opacity=0.9, lightning=True),
     # ---- 聚光灯：与雨/雪/涟漪自由组合 ----
     "聚光灯": dict(rain_enabled=False, snow_enabled=False,

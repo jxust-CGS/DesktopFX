@@ -511,16 +511,32 @@ class SnowField:
     绝不会产生 NaN / Inf（_verify_snow 会专门盯这个）。
     """
 
-    K = 5  # 柔边圆点半径（核边长 2K+1）
+    K = 5                        # 基准柔边圆点半径（核边长 2K+1，中档 + size=1.0）
+    K_MAX = 20                   # 核半径上限：snow_size 拉满时不至于糊成一团
+    # 深度分档（depth 越大 = 越近：更快、更亮、也该更大）与对应的核半径倍率。
+    # 分档而非连续是为了让 draw 保持向量化的批量盖章：每档一次，共三次。
+    TIER_EDGES = (0.75, 1.15)
+    TIER_SCALES = (0.55, 1.0, 1.55)
+
+    KEEP = 0.012                 # 权重阈值：低于它的格子直接不盖章
+    # --- 辉光（廉价 bloom）---
+    # 只给"近档 + 偏亮"的粒子加一层大半径低 alpha 光晕。这不是省事，而是
+    # 真实 bloom 的做法：只有超过亮度阈值的像素才溢出光晕。远档又小又暗，
+    # 给它加光晕纯属浪费像素；近档也只有 vary>=1 的一半粒子发光，成本可控。
+    GLOW_TIER = 2                # 参与辉光的档位（0=远 1=中 2=近）
+    GLOW_VARY = 1.0              # 参与辉光的亮度门槛（vary 越大越亮）
+    GLOW_SCALE = 1.8             # 光晕半径上限 = 实心核半径 × 该倍率（glow=1 时）
+    GLOW_SCALE_MIN = 1.45        # 光晕半径下限倍率（glow→0+ 时），保证还能看见
+    GLOW_POWER = 1.25            # 光晕权重衰减指数（越小越"广"，外圈越亮）
+    GLOW_GAIN = 0.60             # 光晕亮度增益：a_halo = a × snow_glow × 该值
 
     def __init__(self, w, h, seed=9):
         self.rng = np.random.default_rng(seed)
         self.w, self.h = w, h
         self._t = 0.0
-        # 预生成柔边圆点核（1D，长度 2K+1），draw 时按 flake 的 alpha 缩放后盖章
-        k = np.arange(-self.K, self.K + 1, dtype=np.float32)
-        self._ox = k.astype(np.int32)
-        self._ker = (np.clip(1.0 - np.abs(k) / (self.K + 0.5), 0.0, 1.0) ** 1.5)
+        # 柔边圆点核按半径缓存（1D，长度 2K+1）：近大远小需要多种半径，
+        # 而 snow_size 可变，所以按需生成而不是构造时固定一套。
+        self._kern = {}
         self._rgb = (235.0, 240.0, 255.0)   # 默认淡蓝白
         self.n = 0
         self.x = np.zeros(0, np.float32)
@@ -530,11 +546,63 @@ class SnowField:
         self.phase = np.zeros(0, np.float32)
         self.sway_amp = np.zeros(0, np.float32)
         self.sway_freq = np.zeros(0, np.float32)
+        # 亮度脉动：每个粒子有独立的频率与相位，整片雪才不会"一起呼吸"
+        self.twk_freq = np.zeros(0, np.float32)
+        self.twk_phase = np.zeros(0, np.float32)
         self._speed = np.zeros(0, np.float32)
         self.set_amount(240, w, h)
 
     def resize(self, w, h):
         self.w, self.h = w, h
+
+    def _kernel(self, k_rad, power=1.5):
+        """取（并缓存）真·圆形柔边核，返回三个等长展平数组 (dx, dy, 权重)。
+
+        权重用**径向距离** `clip(1 - r/(K+0.5), 0, 1)^power`，等值线是圆，雪花
+        边缘才圆润；若用可分离积 `ker(dx)*ker(dy)` 等值线偏菱形、近方形。
+        power 越大衰减越软：实心核 1.5，辉光光晕 GLOW_POWER。
+        权重 <= KEEP 的格子预先裁掉，省下盖章时的无效像素。
+        """
+        key = (k_rad, power)
+        got = self._kern.get(key)
+        if got is not None:
+            return got
+        k = np.arange(-k_rad, k_rad + 1, dtype=np.int32)
+        m = k.size
+        dxs = np.tile(k, m)             # 快变：x 偏移
+        dys = np.repeat(k, m)           # 慢变：y 偏移
+        rr = np.sqrt(dxs.astype(np.float32) ** 2 + dys.astype(np.float32) ** 2)
+        w = np.clip(1.0 - rr / (k_rad + 0.5), 0.0, 1.0).astype(np.float32) ** power
+        keep = w > self.KEEP
+        got = (dxs[keep], dys[keep], w[keep])
+        self._kern[key] = got
+        return got
+
+    def _kernel_glow(self, k_rad, kr_core, amp):
+        """辉光复合核：权重 = max(实心核, amp × 光晕核)。
+
+        为什么不"多画一遍光晕"：stamp 是覆盖写，没有混合。光晕先画会被随后
+        的实心核覆盖掉一圈（核心边缘留一道**暗环**）；光晕后画又会把核心抹暗。
+        改成在权重上取 max（两项同乘该粒子的 alpha，所以可以直接比权重），
+        每个像素只写一次、径向亮度单调递减，天生没有这两种伪影，也没有额外
+        的一遍开销。
+        """
+        key = ("g", k_rad, kr_core, round(float(amp), 4))
+        got = self._kern.get(key)
+        if got is not None:
+            return got
+        k = np.arange(-k_rad, k_rad + 1, dtype=np.int32)
+        m = k.size
+        dxs = np.tile(k, m)
+        dys = np.repeat(k, m)
+        rr = np.sqrt(dxs.astype(np.float32) ** 2 + dys.astype(np.float32) ** 2)
+        core = np.clip(1.0 - rr / (kr_core + 0.5), 0.0, 1.0).astype(np.float32) ** 1.5
+        halo = np.clip(1.0 - rr / (k_rad + 0.5), 0.0, 1.0).astype(np.float32) ** self.GLOW_POWER
+        w = np.maximum(core, halo * np.float32(amp))
+        keep = w > self.KEEP
+        got = (dxs[keep], dys[keep], w[keep])
+        self._kern[key] = got
+        return got
 
     def _init_arrays(self, n, start=0, end=None):
         if end is None:
@@ -550,6 +618,8 @@ class SnowField:
         self.phase[start:end] = rng.uniform(0.0, TAU, cnt).astype(np.float32)
         self.sway_amp[start:end] = rng.uniform(8.0, 26.0, cnt).astype(np.float32)
         self.sway_freq[start:end] = rng.uniform(0.5, 1.4, cnt).astype(np.float32)
+        self.twk_freq[start:end] = rng.uniform(0.45, 1.8, cnt).astype(np.float32)
+        self.twk_phase[start:end] = rng.uniform(0.0, TAU, cnt).astype(np.float32)
 
     def set_amount(self, n, w=None, h=None):
         if w:
@@ -562,7 +632,7 @@ class SnowField:
         if n > self.n:
             # 所有逐粒子数组一起增长，保留旧数据、初始化新增部分
             for name in ("x", "y", "depth", "vary", "phase", "sway_amp",
-                         "sway_freq"):
+                         "sway_freq", "twk_freq", "twk_phase"):
                 old = getattr(self, name)
                 new = np.zeros(n, np.float32)
                 new[:len(old)] = old
@@ -570,7 +640,7 @@ class SnowField:
             self._init_arrays(n, start=self.n)
         else:
             for name in ("x", "y", "depth", "vary", "phase", "sway_amp",
-                         "sway_freq"):
+                         "sway_freq", "twk_freq", "twk_phase"):
                 setattr(self, name, getattr(self, name)[:n].copy())
         self.n = n
 
@@ -581,12 +651,22 @@ class SnowField:
 
         self._t += dt
         speed = np.float32(cfg["snow_speed"]) * self.depth * self.vary
+        # 风速与「横向漂移」是两个独立旋钮：
+        #   snow_drift 按 depth 放大 —— 近处的斜得更狠（透视倾斜）；
+        #   snow_wind  整场同向的均匀气流，并叠加两个慢正弦当阵风，
+        #              风忽大忽小，而不是一条笔直的斜线。
+        wind = float(cfg.get("snow_wind", 0.0))
+        if wind:
+            t = self._t
+            gust = (0.65 + 0.35 * np.sin(TAU * 0.07 * t)
+                    + 0.12 * np.sin(TAU * 0.23 * t + 1.7))
+            wind = np.float32(wind * gust)
         windx = np.float32(cfg.get("snow_drift", 0.0) * 60.0) * self.depth
         # 横向摆动：把 sin 当作时变速度叠加，制造左右轻飘
         sway = self.sway_amp * np.sin(self._t * self.sway_freq + self.phase)
 
         self.y += speed * dt
-        self.x += (windx + sway) * dt
+        self.x += (windx + wind + sway) * dt
 
         # 落到底边 -> 回到顶部重置
         hit = self.y >= self.h
@@ -599,6 +679,8 @@ class SnowField:
             self.phase[hit] = self.rng.uniform(0.0, TAU, k).astype(np.float32)
             self.sway_amp[hit] = self.rng.uniform(8.0, 26.0, k).astype(np.float32)
             self.sway_freq[hit] = self.rng.uniform(0.5, 1.4, k).astype(np.float32)
+            self.twk_freq[hit] = self.rng.uniform(0.45, 1.8, k).astype(np.float32)
+            self.twk_phase[hit] = self.rng.uniform(0.0, TAU, k).astype(np.float32)
 
         # 左右出界 -> 环绕
         span = self.w + 120.0
@@ -608,30 +690,82 @@ class SnowField:
         self._speed = speed
         return np.zeros(0, np.float32)
 
-    def draw(self, u32, w, h, cfg):
-        if self.n == 0:
+    def _stamp(self, u32, w, h, sel, ix0, iy0, kdx, kdy, kw, alpha, tint):
+        """把选中的粒子按 (dx, dy, 权重) 足迹盖到 u32 上（覆盖写）。
+
+        tint = (colr, colg, colb)。af 先按 KEEP 裁一遍再算索引，越界再裁一遍，
+        两轮过滤都能省掉大量下标运算 —— draw 是全项目最热的路径。
+        """
+        a = alpha[sel]
+        af = (a[:, None] * kw[None, :]).reshape(-1)
+        m = af > self.KEEP
+        if not m.any():
             return
-        n = self.n
-        alpha = (self.depth * self.vary * np.float32(cfg["snow_opacity"] * 0.9))
-        af = (alpha[:, None] * self._ker[None, :]).reshape(-1)   # (N*K2,)
-
-        ix0 = np.rint(self.x).astype(np.int32)
-        iy0 = np.rint(self.y).astype(np.int32)
-        wx = (ix0[:, None] + self._ox[None, :]).reshape(-1)
-        wy = (iy0[:, None] + self._ox[None, :]).reshape(-1)
-
-        m = (wx >= 0) & (wx < w) & (wy >= 0) & (wy < h) & (af > 0.012)
+        af = af[m]
+        wx = (ix0[sel, None] + kdx[None, :]).reshape(-1)[m]
+        wy = (iy0[sel, None] + kdy[None, :]).reshape(-1)[m]
+        m = (wx >= 0) & (wx < w) & (wy >= 0) & (wy < h)
+        if not m.any():
+            return
         wx, wy, af = wx[m], wy[m], af[m]
-        if wx.size == 0:
-            return
-
-        colr, colg, colb = self._rgb
+        colr, colg, colb = tint
         a_c = np.rint(af * 255.0).astype(np.uint32)
         packed = _premul_pack(
             np.rint(colb * af).astype(np.uint32),
             np.rint(colg * af).astype(np.uint32),
             np.rint(colr * af).astype(np.uint32), a_c)
         u32[wy * np.int32(w) + wx] = packed
+
+    def draw(self, u32, w, h, cfg):
+        if self.n == 0:
+            return
+        base = float(cfg.get("snow_size", 1.0))
+        glow = float(cfg.get("snow_glow", 0.0))
+        twk = float(cfg.get("snow_twinkle", 0.0))
+        colr, colg, colb = self._rgb
+        # alpha 必须裁到 1.0：depth(<=1.5) × vary(<=1.15) × opacity 可达 1.55，
+        # 打包时左移 24 位会溢出回绕，导致最亮的雪花中心反而变暗甚至全透明。
+        alpha = self.depth * self.vary * np.float32(cfg["snow_opacity"] * 0.9)
+        if twk > 0.0:
+            # 亮度脉动只做"变暗"不做"变亮"：峰值亮度不变，所以不会把本就接近
+            # 饱和的近雪推过 1.0 被裁平 —— 那样脉动会在一半周期里彻底消失。
+            ph = TAU * self.twk_freq * np.float32(self._t) + self.twk_phase
+            alpha = alpha * (1.0 - twk * (0.5 - 0.5 * np.sin(ph)))
+        np.clip(alpha, 0.0, 1.0, out=alpha)
+        ix0 = np.rint(self.x).astype(np.int32)
+        iy0 = np.rint(self.y).astype(np.int32)
+
+        # 近大远小：按 depth 分三档给不同核半径（透视感），再按「远 -> 近」
+        # 依次盖章 —— stamp 是覆盖写，后画的近雪压住先画的远雪，等价画家算法。
+        lv = np.digitize(self.depth, self.TIER_EDGES)
+        krad = [int(min(self.K_MAX, max(1, round(self.K * ks * base))))
+                for ks in self.TIER_SCALES]
+        tint = (colr, colg, colb)
+
+        for tier in range(len(self.TIER_SCALES)):
+            sel = lv == tier
+            if not sel.any():
+                continue
+            if glow > 0.0 and tier == self.GLOW_TIER:
+                # 近档拆成"发光的一半 / 不发光的一半"：偏亮的粒子用复合核
+                # （实心核 ∪ 光晕），其余照旧。等价于真实 bloom 的亮度阈值。
+                # 光晕半径也随辉光强度增长：低辉光只付小光晕的钱，拉满才铺开
+                # 最大的一圈（成本随滑条单调，不白花）。
+                kr = int(min(self.K_MAX * 2, max(2, round(
+                    krad[tier] * (self.GLOW_SCALE_MIN
+                                  + (self.GLOW_SCALE - self.GLOW_SCALE_MIN)
+                                  * glow)))))
+                core_k = self._kernel(krad[tier])
+                glow_k = self._kernel_glow(kr, krad[tier], glow * self.GLOW_GAIN)
+                hot = self.vary >= self.GLOW_VARY
+                for sub, (kdx, kdy, kw) in ((sel & ~hot, core_k),
+                                            (sel & hot, glow_k)):
+                    if sub.any():
+                        self._stamp(u32, w, h, sub, ix0, iy0,
+                                    kdx, kdy, kw, alpha, tint)
+                continue
+            kdx, kdy, kw = self._kernel(krad[tier])
+            self._stamp(u32, w, h, sel, ix0, iy0, kdx, kdy, kw, alpha, tint)
 
     def set_color(self, hex_str):
         bgr = hex_to_bgr(hex_str)
