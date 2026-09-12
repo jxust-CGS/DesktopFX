@@ -21,3 +21,10 @@ error.log
 # 一次性实验产物
 _patch_*.patch
 _*_compare.png
+
+# 开发期截图 / 预览产物（可由脚本重新生成，不入库）
+_diag_A.png
+_diag_B.png
+_diag_screen.png
+_diag_diff.png
+_icon_preview_*.png
