@@ -14,3 +14,10 @@ presets_user.json
 ui_state.json
 error.log
 *.log
+
+# WorkBuddy 项目数据（记忆 / 备份 / 项目级 skill），与运行无关
+.workbuddy/
+
+# 一次性实验产物
+_patch_*.patch
+_*_compare.png
