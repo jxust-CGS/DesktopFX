@@ -34,6 +34,24 @@ SHORT   = ctypes.c_short
 RECT = wt.RECT
 
 
+def hwnd_int(h):
+    """把 Win32 窗口句柄统一取成 int（NULL/无效 -> 0）。
+
+    必须走这里，不要直接 `int(h)`。ctypes 里同一个"句柄"有两种形态：
+      - Win32 函数**返回值**声明为 c_void_p 时，ctypes 会转成 int（或 NULL 时的
+        None）—— 这时 int(h) 没问题；
+      - 而**手动构造**的 HWND(x) 是 c_void_p 实例，它没有 __int__，int() 会退化
+        成"把 8 字节 buffer 当字节串解析"并抛 ValueError，
+        报错形如 `invalid literal for int() with base 10: b'\\xe8\\x03...'`。
+    两种形态混用时就是一颗地雷，故统一走本函数。
+    """
+    v = getattr(h, "value", h)
+    try:
+        return int(v) if v else 0
+    except (TypeError, ValueError):
+        return 0
+
+
 # ----------  Acrylic / rounded corners helpers (Win10 1803+ / Win11)
 # 注意：SetWindowCompositionAttribute 是未公开 API，但 Windows 已稳定支持多年。
 class ACCENT_POLICY(ctypes.Structure):
@@ -210,6 +228,12 @@ def patch_libs():
     user32.GetParent.argtypes = [HWND]
     user32.IsWindowVisible.restype = BOOL
     user32.IsWindowVisible.argtypes = [HWND]
+    # z 序遍历：配合 GW_HWNDPREV 判断"本窗口是否被别的置顶窗口盖住"。
+    # 不声明 restype 的话，64 位 handle 会被 ctypes 截成 c_int 丢掉高位。
+    user32.GetWindow.restype = HWND
+    user32.GetWindow.argtypes = [HWND, UINT]
+    user32.GetClassNameW.restype = INT
+    user32.GetClassNameW.argtypes = [HWND, ctypes.c_wchar_p, INT]
     user32.ShowWindow.restype = BOOL
     user32.ShowWindow.argtypes = [HWND, INT]
     user32.GetWindowRect.restype = BOOL

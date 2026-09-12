@@ -6,7 +6,8 @@ import ctypes.wintypes as wt
 import numpy as np
 
 from _win32 import (user32, gdi32, kernel32, HANDLE, HWND, HDC, HBITMAP,
-                    WPARAM, LPARAM, LRESULT, BOOL, UINT, DWORD, INT)
+                    WPARAM, LPARAM, LRESULT, BOOL, UINT, DWORD, INT, RECT,
+                    hwnd_int)
 
 WS_POPUP = 0x80000000
 WS_EX_LAYERED = 0x00080000
@@ -28,6 +29,23 @@ HWND_TOPMOST = wt.HWND(-1)
 SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
 SWP_NOACTIVATE = 0x0010
+# 不保存/恢复被遮挡处的位图：本窗口内容 100% 由 UpdateLayeredWindow 提供，
+# 让系统去 copy bits 反而会在 z 序变动时翻出无效内容（可见的一帧闪烁）。
+SWP_NOCOPYBITS = 0x0100
+SWP_NOOWNERZORDER = 0x0200
+# GetWindow 的 z 序方向：返回"位于该窗口之上"的邻窗
+GW_HWNDPREV = 3
+
+# 这些窗口即使 IsWindowVisible 为真也从不真正遮住别人（桌面 / 任务栏 / 阴影）。
+# 判"是否被盖住"时必须排除，否则会一直误判成被盖。
+_NON_OCCLUDERS = frozenset((
+    "Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd",
+    "SysShadow", "ForegroundStaging",
+))
+# 构成遮挡所需的最小边长（px）。系统与驱动辅助窗普遍是 0x0 / 1x1（IME、
+# ForegroundStaging、SynTP 触摸板、缩略图 helper），只看可见性会把它们
+# 全算成遮挡 —— 那样每 0.5s 都会触发一次抢顶。
+_OCCLUDER_MIN_PX = 32
 
 
 class POINT(ctypes.Structure):
@@ -138,6 +156,9 @@ class Overlay:
         self.flat = None
         self.u32 = None
         self._stride = np.int32(1)
+        # 控制面板 hwnd。面板是我们自己的窗口，必须从"谁盖住了我"的判定里排除，
+        # 否则 overlay 会跟面板无限互抢 z 序（见 keep_on_top）。
+        self.panel_hwnd = None
 
     def create(self):
         _register_class()
@@ -213,19 +234,76 @@ class Overlay:
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
 
+    def set_panel_hwnd(self, hwnd):
+        """登记控制面板 hwnd（面板创建 / 重建时调用，供 keep_on_top 排除）。"""
+        v = hwnd_int(hwnd)
+        self.panel_hwnd = v or None
+
+    @staticmethod
+    def _is_occluder(h):
+        """该窗口是否构成"真的盖住了我"。
+
+        不能只看 IsWindowVisible：桌面上常驻一堆"可见但零面积"的系统与驱动
+        辅助窗（ForegroundStaging / IME / 触摸板 SynTP / 缩略图 helper），它们
+        就挂在 topmost 组里、位于我们之上，却什么也不画。早先版本用"链上第一个
+        可见窗口"判定 -> 每 0.5s 都判成被盖 -> 每 0.5s 抢一次顶。故要求：
+        可见 + 有实际尺寸 + 类名不在 shell 组件黑名单里。
+        """
+        if not user32.IsWindowVisible(h):
+            return False
+        r = RECT()
+        if not user32.GetWindowRect(h, ctypes.byref(r)):
+            return False
+        if (r.right - r.left) < _OCCLUDER_MIN_PX or \
+                (r.bottom - r.top) < _OCCLUDER_MIN_PX:
+            return False
+        buf = ctypes.create_unicode_buffer(128)
+        user32.GetClassNameW(h, buf, 128)
+        return buf.value not in _NON_OCCLUDERS
+
+    def _covered(self):
+        """本窗口是否被"别人的"可见置顶窗口盖住。
+
+        沿 z 序向上逐个检查（GW_HWNDPREV）：我们是 WS_EX_TOPMOST，链上的窗口
+        必然同属 topmost 组，因此链上出现任何"非自家"的真实窗口即视为被盖。
+        控制面板不算"别人"—— 面板浮在特效之上是预期状态，不是故障。
+        """
+        if not self.hwnd:
+            return False
+        h = user32.GetWindow(self.hwnd, GW_HWNDPREV)
+        guard = 0
+        while h and guard < 64:
+            guard += 1
+            if not (self.panel_hwnd and hwnd_int(h) == self.panel_hwnd):
+                if self._is_occluder(h):
+                    return True
+            h = user32.GetWindow(h, GW_HWNDPREV)
+        return False
+
     def keep_on_top(self):
-        """把叠加层钉回最上层。
+        """把叠加层钉回最上层 —— 但只在真的被盖住时才动手。
 
         窗口创建时虽带 WS_EX_TOPMOST，但只要用户点开一个同样置顶的应用
         （全屏视频 / 画中画 / 悬浮窗 / 部分游戏），对方被激活后就会压过我们。
         topmost 不会因为普通窗口激活而丢失，所以"点击后特效跑到后面"几乎
-        都是被"别的置顶窗口"盖住了 —— 周期调用本方法即可 ≤0.5s 内复位。
-        NOACTIVATE 保证不抢焦点，点击仍 100% 穿透。
+        都是被"别的置顶窗口"盖住了。
+
+        关键：**不能无条件周期调用**。控制面板自己也在做置顶保活，若 overlay
+        每 0.5s 无条件抢一次顶，就会和面板每 2s 的抢顶互相翻转 z 序 —— 表现
+        为"每隔几秒画面闪一下"。所以先判定是否真被盖，未被盖直接返回。
         """
         if not self.hwnd:
-            return
-        user32.SetWindowPos(self.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+            return False
+        if not self._covered():
+            return False
+        # 插到面板之下（两者同属 topmost 组）：既复位又不把面板压掉；
+        # 面板不存在时直接插到 topmost 组顶部。NOCOPYBITS 避免系统去
+        # 保存/恢复被遮挡位图 —— 那会在重排瞬间翻出一帧无效内容。
+        after = HWND(self.panel_hwnd) if self.panel_hwnd else HWND_TOPMOST
+        user32.SetWindowPos(self.hwnd, after, 0, 0, 0, 0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+                            | SWP_NOCOPYBITS | SWP_NOOWNERZORDER)
+        return True
 
     def destroy(self):
         if self._hdc_mem and self._old_bmp:

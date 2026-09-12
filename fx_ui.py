@@ -10,7 +10,7 @@ import json
 import os
 import tkinter as tk
 
-from _win32 import user32, HANDLE, HWND, INT, UINT
+from _win32 import user32, HANDLE, HWND, INT, UINT, hwnd_int
 from _paths import app_root
 
 # ------------------------------------------------------------------ 设计系统
@@ -435,12 +435,17 @@ class ControlPanel:
         self.root.geometry(f"{self.W}x{self.H}+{x}+{y}")
 
     def _hwnd(self):
+        """面板真正的顶层 hwnd。
+
+        tk 的 winfo_id() 返回的是内层子窗口，无边框窗口的真实 hwnd 是它的
+        parent。统一返回 int：ctypes 里"手动构造的 HWND(x)"没有 __int__，
+        直接 int() 会把它当字节串解析并抛 ValueError，跨模块传递迟早踩雷。
+        """
         try:
             hw = self.root.winfo_id()
-            parent = user32.GetParent(HWND(hw))
-            return parent or HWND(hw)
+            return hwnd_int(user32.GetParent(HWND(hw))) or hwnd_int(hw)
         except Exception:
-            return None
+            return 0
 
     def _apply_dwm(self):
         """尝试启用 Win11 圆角 + 亚克力背景；失败时静默回退。"""
@@ -457,8 +462,16 @@ class ControlPanel:
         try:
             h = self._hwnd()
             if h:
-                user32.SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0,
-                                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+                # 把面板 hwnd 交给覆盖层：它做置顶保活时会把面板排除在
+                # "谁盖住了我"之外。否则 overlay 每 0.5s、面板每 2s 各抢一次
+                # topmost 组顶部，互相翻转 z 序 -> 表现为"每隔几秒闪一下"。
+                ov = getattr(self.app, "overlay", None)
+                if ov is not None:
+                    ov.set_panel_hwnd(h)
+                # 已隐藏时无需抢顶（也不该给系统制造无谓的重排）
+                if self.root.state() != "withdrawn":
+                    user32.SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0,
+                                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
         except Exception:
             pass
         self.root.after(2000, self._raise_top)

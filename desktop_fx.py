@@ -501,16 +501,24 @@ class App:
                 continue
 
             try:
+                resized = False
                 if frame % 30 == 0 and ov.resize_if_needed():
                     w, h = ov.w, ov.h
                     scene.resize(w, h)
                     scene.set_origin(ov.x, ov.y)
+                    resized = True
                 frame += 1
 
                 # 周期性把叠加层钉回最上层：被其它置顶窗口（全屏视频/画中画等）
-                # 盖住后，≤0.5s 内自动复位；NOACTIVATE 不抢焦点
+                # 盖住后 ≤0.5s 内自动复位；NOACTIVATE 不抢焦点。
+                # keep_on_top 内部会先判定"是否真被盖"，未被盖是空操作 ——
+                # 无条件抢顶会跟面板的置顶保活互抢，造成周期性 z 序翻转闪烁。
+                # 刚重建过 DIB 的帧要跳过：那一瞬间 _hdc_mem 还挂着占位位图，
+                # 此时再改 z 序容易让 DWM 取到无效内容。
                 now = time.perf_counter()
-                if now - _last_top > 0.5:
+                if resized:
+                    _last_top = now
+                elif now - _last_top > 0.5:
                     _last_top = now
                     ov.keep_on_top()
 
