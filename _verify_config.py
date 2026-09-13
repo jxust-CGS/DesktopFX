@@ -89,8 +89,8 @@ def test_snapshot_consistency():
     app.snapshot = dict(app.cfg)
     app.apply_preset("夜雨（青）")
     assert app.snapshot == app.cfg, "snapshot not in sync after apply_preset"
-    app.set("lightning", True)
-    assert app.snapshot["lightning"] is True, "snapshot not in sync after set"
+    app.set("splash", False)
+    assert app.snapshot["splash"] is False, "snapshot not in sync after set"
     app.set("ripple_opacity", 0.5)
     assert app.snapshot["ripple_opacity"] == 0.5
     print(f"  [OK] snapshot mirrors cfg after apply_preset + set\n")

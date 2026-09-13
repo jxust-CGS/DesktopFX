@@ -31,7 +31,7 @@ def main():
         app.apply_preset("夜雨（青）")          # 整体改为夜雨
         app.set("rain_amount", 555.0)          # 覆盖预设的 340
         app.set("wind", -0.5)                  # 覆盖预设的 +0.2
-        app.set("lightning", True)
+        app.set("splash", False)
         app.set("ripple_opacity", 0.66)
         print("[ok] made 5 config changes, marked dirty")
 
@@ -53,12 +53,12 @@ def main():
             saved = json.load(f)
         assert saved["rain_amount"] == 555.0, saved
         assert saved["wind"] == -0.5
-        assert saved["lightning"] is True
+        assert saved["splash"] is False
         assert saved["ripple_opacity"] == 0.66
         assert saved["rain_color"] == d.PRESETS["夜雨（青）"]["rain_color"]
         print(f"[ok] all 5 changes persisted to disk")
         print(f"     rain_amount={saved['rain_amount']}  wind={saved['wind']}"
-              f"  lightning={saved['lightning']}  ripple_opacity={saved['ripple_opacity']}"
+              f"  splash={saved['splash']}  ripple_opacity={saved['ripple_opacity']}"
               f"  rain_color={saved['rain_color']}")
 
         # 模拟"被强杀"：直接退出，不调用 quit()
@@ -73,7 +73,7 @@ def main():
         app2.load()
         assert app2.cfg["rain_amount"] == 555.0
         assert app2.cfg["wind"] == -0.5
-        assert app2.cfg["lightning"] is True
+        assert app2.cfg["splash"] is False
         assert app2.cfg["ripple_opacity"] == 0.66
         print(f"[ok] after 'crash' + restart: all 5 changes recovered")
 

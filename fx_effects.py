@@ -344,6 +344,13 @@ class RippleField:
 
 # ------------------------------------------------------------------ 闪电
 class Lightning:
+    """随机闪电（**已停用**：用户要求去掉这个功能）。
+
+    类与 `_verify_smoke` / `_verify_stability` 里针对它的测试都保留，但不再接进
+    Scene / DEFAULTS / fx_ui —— 与 `CursorTrailField` 同样的处理方式：
+    功能下线但代码不删，将来想恢复只需重新接线。
+    """
+
     def __init__(self, seed=11):
         self.rng = np.random.default_rng(seed)
         self.next_in = self.rng.uniform(6.0, 20.0)

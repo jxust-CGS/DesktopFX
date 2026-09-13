@@ -1043,6 +1043,8 @@ class ControlPanel:
         self._slider(c, "雨丝长度", "rain_length", 0.3, 2.6, 0.05, "{:.2f} 倍")
         self._slider(c, "风力（左负右正）", "wind", -1.0, 1.0, 0.01, "{:+.2f}")
         self._slider(c, "浓度", "rain_opacity", 0.05, 1.0, 0.01, "{:.0%}")
+        # 溅水花属于下雨本身（它只在雨滴落到底边时触发），从"其它"页搬过来
+        self._toggle(c, "雨滴落地溅水花", "splash")
         self._swatch(c, "雨丝颜色", "rain_color", RAIN_COLORS)
         self._save_bar(c, "下雨")
         self._preset_block(p, "下雨")
@@ -1177,8 +1179,6 @@ class ControlPanel:
         self._page_head(p, "其它")
         c = tk.Frame(p, bg=CARD)
         c.pack(fill="x", padx=16, pady=(0, 8))
-        self._toggle(c, "雨滴落地溅水花", "splash")
-        self._toggle(c, "随机闪电", "lightning")
         self._slider(c, "帧率上限", "fps", 24, 144, 1, "{:.0f} 帧/秒")
         # 开机自启用与其它开关同款的胶囊控件，避免老式 Checkbutton 破坏统一
         row = tk.Frame(c, bg=CARD)

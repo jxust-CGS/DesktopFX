@@ -12,9 +12,9 @@
 """
 import numpy as np
 
-from fx_effects import (RainField, RippleField, Lightning, MeteorField,
-                        MouseProbe, PaintField, PetalField, SnowField,
-                        SpotlightField, WindowProbe, hex_to_bgr)
+from fx_effects import (RainField, RippleField, MeteorField, MouseProbe,
+                        PaintField, PetalField, SnowField, SpotlightField,
+                        WindowProbe, hex_to_bgr)
 
 
 class Scene:
@@ -26,7 +26,6 @@ class Scene:
         self.meteors = MeteorField(w, h, seed=31)       # 流星雨
         self.paint = PaintField(w, h, seed=37)          # 颜料盘
         self.ripples = RippleField()
-        self.bolt = Lightning()
         self.mouse = MouseProbe()
         self.spot = SpotlightField(w, h, seed=17)       # 聚光灯
         self.win = WindowProbe()                        # 窗口枚举（窗口交互地基）
@@ -220,13 +219,9 @@ class Scene:
                               0.95 * float(cfg["ripple_opacity"]),
                               self._ripple_color(), r0=3.0)
 
-        # ---------------- 涟漪 + 闪电
+        # ---------------- 涟漪
         self.ripples.update(dt)
         self.ripples.draw(u32, w, h)
-
-        if cfg.get("lightning", False):
-            if self.bolt.update(dt, True, w, h) > 0.0:
-                self.bolt.draw(u32, w, h)
 
     # ------------------------------------------------------------ 窗口水波
     def _win_ripple_color(self, cfg):

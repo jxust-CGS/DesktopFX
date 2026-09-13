@@ -163,6 +163,30 @@ def main():
     for key, refresh in p._swatches.items():
         assert callable(refresh), key
 
+    # 6b) 分组归属：「雨滴落地溅水花」属于**下雨**页（它只在雨滴落到底边时触发），
+    #     「其它」页不该再有它，也不该再有已下线的「随机闪电」。
+    def _labels(page):
+        out = []
+
+        def walk(wd):
+            for c in wd.winfo_children():
+                try:
+                    if c.winfo_class() in ("Label", "Button"):
+                        out.append(str(c.cget("text")))
+                except Exception:
+                    pass
+                walk(c)
+
+        walk(p._pages[page])
+        return out
+
+    rain_lb = _labels("下雨")
+    other_lb = _labels("其它")
+    assert "雨滴落地溅水花" in rain_lb, ("下雨页缺少溅水花开关", rain_lb)
+    assert "雨滴落地溅水花" not in other_lb, ("其它页还有溅水花", other_lb)
+    assert "随机闪电" not in other_lb, ("其它页还有已下线的随机闪电", other_lb)
+    assert "lightning" not in d.DEFAULTS, "lightning 已下线，不该留在 DEFAULTS 里"
+
     # 7) 屏幕取色的底层读点必须可用且返回合法色值
     from _win32 import screen_pixel
     got = screen_pixel(0, 0)

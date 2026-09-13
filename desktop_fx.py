@@ -57,7 +57,6 @@ DEFAULTS = {
     "ripple_life": 0.95,
     "ripple_color": "#7FE7FF",
     "ripple_opacity": 0.85,
-    "lightning": False,
     "fps": 60.0,
     # ---- 雪（与雨正交的独立特效层）----
     "snow_enabled": False,
@@ -146,15 +145,15 @@ PRESETS = {
     "初雪": dict(rain_enabled=False, snow_enabled=True, snow_amount=180,
               snow_speed=70, snow_size=1.0, snow_drift=0.10,
               snow_wind=12, snow_twinkle=0.40, snow_glow=0.45,
-              snow_color="#EAF2FF", snow_opacity=0.9, lightning=False),
+              snow_color="#EAF2FF", snow_opacity=0.9),
     "暴雪": dict(rain_enabled=False, snow_enabled=True, snow_amount=560,
               snow_speed=130, snow_size=1.2, snow_drift=0.35,
               snow_wind=85, snow_twinkle=0.22, snow_glow=0.65,
-              snow_color="#FFFFFF", snow_opacity=0.95, lightning=False),
+              snow_color="#FFFFFF", snow_opacity=0.95),
     "雪夜": dict(rain_enabled=False, snow_enabled=True, snow_amount=260,
               snow_speed=85, snow_size=1.0, snow_drift=0.12,
               snow_wind=20, snow_twinkle=0.45, snow_glow=0.55,
-              snow_color="#DCEBFF", snow_opacity=0.9, lightning=True),
+              snow_color="#DCEBFF", snow_opacity=0.9),
     # ---- 落樱：樱花瓣飘落，与雨/雪/涟漪自由组合 ----
     "落樱": dict(rain_enabled=False, snow_enabled=False, petal_enabled=True,
               petal_amount=160, petal_speed=55, petal_size=1.0,
@@ -170,7 +169,7 @@ PRESETS = {
               petal_amount=200, petal_speed=62, petal_size=1.0,
               petal_drift=0.10, petal_wind=22, petal_spin=0.9, petal_flutter=0.65,
               petal_color="#F58BB0", petal_edge_color="#FFD9E6",
-              petal_opacity=0.9, lightning=True),
+              petal_opacity=0.9),
     # ---- 流星雨：斜向掠过的彗星（参考 Wallpaper Engine 场景「流星夜」）----
     "流星雨": dict(rain_enabled=False, snow_enabled=False, petal_enabled=False,
                 meteor_enabled=True, meteor_amount=14, meteor_speed=880,
@@ -496,8 +495,12 @@ class App:
             p = getattr(self, "user_presets", {}).get(name)
         if not p:
             return
-        # 下划线开头的键是内部元数据，不要写进 cfg
-        self.cfg.update({k: v for k, v in p.items() if not k.startswith("_")})
+        # 下划线开头的键是内部元数据，不要写进 cfg。
+        # 同时过滤掉 DEFAULTS 里已经不存在的键 —— 老的自定义预设会带着
+        # 已删除功能的配置（例如退役的 lightning），不过滤就会在内存 cfg 里
+        # 留下阴魂不散的残留键。
+        self.cfg.update({k: v for k, v in p.items()
+                         if not k.startswith("_") and k in DEFAULTS})
         self.snapshot = dict(self.cfg)
         self._autosave_dirty = True
 

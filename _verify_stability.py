@@ -32,6 +32,9 @@ def main():
     W, H = 2560, 1440
     cfg = dict(d.DEFAULTS)
     cfg.update(d.PRESETS["中雨"])
+    # lightning 已从 DEFAULTS 移除（功能下线），但 Lightning 类本身还在，
+    # 这里显式打开以便长跑测试仍然覆盖它的分支。
+    cfg["lightning"] = True
 
     rain = RainField(W, H, seed=7)
     rain.set_color(cfg["rain_color"])
