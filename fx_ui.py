@@ -55,6 +55,7 @@ METEOR_TAIL_COLORS = ["#5FB8F0", "#9FC8FF", "#7FD0FF", "#5FE0D0", "#C08FE8",
 # 颜料盘：只取基准色的**色相/饱和度**，实际每团色相再按 paint_hue_spread 抖动，
 # 所以这里给的是"基准色"而不是"唯一色"。
 PAINT_COLORS = ["#FF4D6D", "#7C4DFF", "#20C997", "#FFB020", "#38BDF8", "#F06292"]
+WAVE_COLORS = ["#FFFFFF", "#EAF6FF", "#CFE6FF", "#D8F2FF", "#FFF3E0", "#E8FFE8"]
 
 FONT_LABEL = ("Microsoft YaHei UI", 9)
 FONT_TITLE = ("Microsoft YaHei UI", 10, "bold")   # 顶栏程序名
@@ -377,6 +378,11 @@ class _NavIcon(tk.Canvas):
         elif n == "涟漪":
             ring(9, 8, 3)
             ring(9, 8, 6)
+        elif n == "真实水波":
+            # 三条横向水波线 —— 与「涟漪」的同心圆区分开，一眼能认出是"水面"
+            for yy in (5.4, 9.0, 12.6):
+                line([3, yy, 5.4, yy - 1.7, 7.8, yy, 10.2, yy + 1.7, 12.6, yy,
+                      15, yy - 1.7], width=1.4)
         else:  # 其它 / 设置：三条水平滑块
             for y, x1, x2 in ((5, 3, 9), (9, 6, 12), (13, 4, 10)):
                 line([x1, y, x2, y])
@@ -424,6 +430,10 @@ class _NavIcon(tk.Canvas):
         elif n == "涟漪":
             self.create_oval(6, 5, 12, 11, outline=self.color, width=w)
             self.create_oval(3, 2, 15, 14, outline=self.color, width=w)
+        elif n == "真实水波":
+            for yy in (5.4, 9.0, 12.6):
+                self._legacy_line([3, yy, 5.4, yy - 1.7, 7.8, yy, 10.2, yy + 1.7,
+                                   12.6, yy, 15, yy - 1.7], w)
         else:  # 其它 / 设置
             for y, x1, x2 in ((5, 3, 9), (9, 6, 12), (13, 4, 10)):
                 self._legacy_line([x1, y, x2, y], w)
@@ -588,6 +598,7 @@ class ControlPanel:
             ("聚光灯", "聚光灯"),
             ("窗口水波", "窗口水波"),
             ("涟漪", "涟漪"),
+            ("真实水波", "真实水波"),
             ("其它", "其它"),
         ]
         for label, name in nav_defs:
@@ -652,6 +663,7 @@ class ControlPanel:
         self._pages["聚光灯"] = self._page_spot(inner)
         self._pages["窗口水波"] = self._page_win(inner)
         self._pages["涟漪"] = self._page_ripple(inner)
+        self._pages["真实水波"] = self._page_wave(inner)
         self._pages["其它"] = self._page_other(inner)
         for f in self._pages.values():
             f.pack_forget()
@@ -1172,6 +1184,30 @@ class ControlPanel:
         self._swatch(c, "涟漪颜色", "ripple_color", RIPPLE_COLORS)
         self._save_bar(c, "涟漪")
         self._preset_block(p, "涟漪")
+        return p
+
+    def _page_wave(self, parent):
+        p = tk.Frame(parent, bg=BG)
+        self._page_head(p, "真实水波")
+        c = tk.Frame(p, bg=CARD)
+        c.pack(fill="x", padx=16, pady=(0, 8))
+        self._toggle(c, "启用真实水波", "wave_enabled")
+        self._toggle(c, "跟随鼠标移动", "wave_move")
+        self._toggle(c, "点击时落一大滴", "wave_click")
+        self._slider(c, "波速", "wave_speed", 60, 300, 10, "{:.0f} 像素/秒")
+        self._slider(c, "余波时长", "wave_persist", 0.0, 1.0, 0.05, "{:.0%}")
+        self._slider(c, "落点大小", "wave_size", 8, 60, 2, "{:.0f} 像素")
+        self._slider(c, "落点强度", "wave_strength", 0.02, 0.30, 0.01, "{:.2f}")
+        self._slider(c, "触发间距", "wave_step", 8, 80, 2, "{:.0f} 像素")
+        self._slider(c, "自动落点间隔", "wave_ambient", 0.0, 8.0, 0.2, "{:.1f} 秒")
+        self._slider(c, "光照方向", "wave_light", 0, 350, 10, "{:.0f} 度")
+        self._slider(c, "迎光提亮", "wave_contrast", 0.0, 1.2, 0.05, "{:.0%}")
+        self._slider(c, "背光压暗", "wave_shading", 0.0, 1.0, 0.05, "{:.0%}")
+        self._slider(c, "浪尖高光", "wave_highlight", 0.0, 1.2, 0.05, "{:.0%}")
+        self._slider(c, "浓度", "wave_opacity", 0.05, 1.0, 0.01, "{:.0%}")
+        self._swatch(c, "高光颜色", "wave_color", WAVE_COLORS)
+        self._save_bar(c, "真实水波")
+        self._preset_block(p, "真实水波")
         return p
 
     def _page_other(self, parent):

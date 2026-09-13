@@ -69,7 +69,9 @@ def main():
         seen.append(name)
     # 顺序必须与 nav_defs 一致（可读性检查：侧栏点哪一项，右侧就得有对应页）
     assert seen == ["下雨", "下雪", "落樱", "流星雨", "颜料盘", "聚光灯",
-                    "窗口水波", "涟漪", "其它"], seen
+                    "窗口水波", "涟漪", "真实水波", "其它"], seen
+
+
     # 侧栏导航不再有「预设」独立页，预设方案已下沉到各特效页
     assert "预设" not in p._pages, "预设 page should be removed"
 
@@ -186,6 +188,23 @@ def main():
     assert "雨滴落地溅水花" not in other_lb, ("其它页还有溅水花", other_lb)
     assert "随机闪电" not in other_lb, ("其它页还有已下线的随机闪电", other_lb)
     assert "lightning" not in d.DEFAULTS, "lightning 已下线，不该留在 DEFAULTS 里"
+
+    # 6c) 「涟漪」与「真实水波」是**两套独立实现**，配置项必须各归各页、互不串台。
+    #     这两套是并存供用户挑选的（不是替代关系），任何一边的键跑到另一边都说明接错了。
+    ripple_lb = _labels("涟漪")
+    wave_lb = _labels("真实水波")
+    assert "涟漪颜色" in ripple_lb and "跟随鼠标移动" in ripple_lb, ripple_lb
+    assert "高光颜色" in wave_lb, ("真实水波页缺少高光颜色", wave_lb)
+    for lab in ("迎光提亮", "背光压暗", "浪尖高光", "光照方向", "余波时长"):
+        assert lab in wave_lb, (f"真实水波页缺少「{lab}」", wave_lb)
+    assert "涟漪颜色" not in wave_lb, ("真实水波页混进了涟漪的控件", wave_lb)
+    assert "迎光提亮" not in ripple_lb, ("涟漪页混进了水波的控件", ripple_lb)
+    # 两套的配置键集合不能有交集（前缀不同），否则 apply_preset 会互相踩
+    rk = {k for k in d.DEFAULTS if k.startswith("ripple_")}
+    wk = {k for k in d.DEFAULTS if k.startswith("wave_")}
+    assert rk and wk and not (rk & wk), (rk & wk)
+    assert "wave_enabled" in d.DEFAULTS and d.DEFAULTS["wave_enabled"] is False, \
+        "真实水波必须默认关闭（与颜料盘一样，需用户手动打开）"
 
     # 7) 屏幕取色的底层读点必须可用且返回合法色值
     from _win32 import screen_pixel

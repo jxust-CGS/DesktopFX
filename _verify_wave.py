@@ -22,17 +22,17 @@ import os
 os.environ.setdefault("DESKTOP_FX_NOWINDOW", "1")
 
 import numpy as np
+
+import desktop_fx as d
 from fx_effects import WaterRippleField
+from fx_scene import Scene
 
 W, H = 1920, 1080
 
 
 def wav_cfg(**over):
-    """默认就是类的兜底值 —— 等接进 desktop_fx 后改成读 d.DEFAULTS。"""
-    c = {"wave_speed": WaterRippleField._SPEED_REF,
-         "wave_persist": WaterRippleField._PERSIST_DEF,
-         "wave_size": 22.0,
-         "wave_strength": WaterRippleField._STRENGTH_REF}
+    """默认值一律从产品代码真实导入，保证测的就是用户会拿到的那一份。"""
+    c = {k: v for k, v in d.DEFAULTS.items() if k.startswith("wave_")}
     c.update(over)
     return c
 
@@ -413,6 +413,297 @@ def test_resize_rebuilds():
                   f"3840x1200 {r_big:.0f}px（{r_big / max(r_small, 1e-9):.2f}×）")
 
 
+# ------------------------------------------------------------------ 上屏渲染
+def _buf(w=W, h=H):
+    b = np.zeros((h, w, 4), np.uint8)
+    return b, b.view(np.uint32).reshape(-1)
+
+
+def _render(wf, cfg, w=W, h=H):
+    b, u32 = _buf(w, h)
+    wf.draw(u32, w, h, cfg)
+    return b
+
+
+def _lit_stats(buf):
+    """反预乘后的统计。**颜色通道必须反预乘回 0~255 再看** —— 缓冲区是预乘的，
+    软边像素的 RGB 会被 alpha 压小（落樱、颜料盘都在这里栽过）。"""
+    a = buf[..., 3].astype(np.float32)
+    rgb = buf[..., :3].astype(np.float32)[..., ::-1]
+    lit = a > 0
+    bright = lit & (rgb.max(axis=2) > 0)
+    return dict(cov=float(lit.mean()), amax=float(a.max()),
+                amean=float(a[lit].mean()) if lit.any() else 0.0,
+                bright=int(bright.sum()), dark=int((lit & ~bright).sum()))
+
+
+def test_render_writes_pixels():
+    """点击之后必须真的画到屏幕上。"""
+    wf = WaterRippleField(W, H, seed=5)
+    cfg = wav_cfg()
+    wf.splash(960.0, 540.0, cfg, big=True)
+    for _ in range(30):
+        wf.update(1.0 / 60.0, cfg)
+    s = _lit_stats(_render(wf, cfg))
+    if s["cov"] < 0.003:
+        return False, f"点击后几乎没有像素：覆盖 {s['cov'] * 100:.3f}%"
+    return True, (f"点击后 0.5s：覆盖 {s['cov'] * 100:.2f}%、"
+                  f"alpha 均 {s['amean']:.1f}、峰 {s['amax']:.0f}")
+
+
+def test_render_idle_blank():
+    """空闲时必须**一步不推进、一个像素不写**（这是它敢常开的前提）。"""
+    wf = WaterRippleField(W, H, seed=5)
+    cfg = wav_cfg()
+    b, u32 = _buf()
+    steps = 0
+    for _ in range(300):
+        u32[:] = 0
+        steps += wf.update(1.0 / 60.0, cfg)
+        wf.draw(u32, W, H, cfg)
+    n = int((b[..., 3] > 0).sum())
+    if steps != 0 or n != 0:
+        return False, f"空闲还在动：推进 {steps} 步、写了 {n} 个像素"
+    return True, "空闲 300 帧：0 步推进、0 像素"
+
+
+def test_bright_and_dark_pixels():
+    """提亮与压暗必须**同时**出现 —— 只有亮环就是发光圈，只有暗环就是墨渍。"""
+    wf = WaterRippleField(W, H, seed=5)
+    cfg = wav_cfg(wave_opacity=1.0, wave_highlight=0.0)
+    wf.splash(960.0, 540.0, cfg, big=True)
+    for _ in range(30):
+        wf.update(1.0 / 60.0, cfg)
+    s = _lit_stats(_render(wf, cfg))
+    if s["bright"] < 500 or s["dark"] < 500:
+        return False, (f"提亮 {s['bright']} 个 / 压暗 {s['dark']} 个 —— 缺一侧，"
+                       f"看起来就不是水面")
+    return True, f"同一圈的两侧：提亮 {s['bright']} 像素、压暗 {s['dark']} 像素"
+
+
+def test_light_direction_orientates_shading():
+    """`wave_light` 必须真的改**明暗方位**：亮部方位角要跟滑条值对上。
+
+    **这条抓到过一个真 bug**：`dep = ∇h·L` 一开始直接用了 `(cos, sin)`，
+    结果把光设成"从右边来"、亮部却出现在**反**方向 180° 处，滑条完全名不副实。
+    """
+    got, bad = {}, []
+    for deg in (0.0, 90.0, 180.0, 270.0):
+        wf = WaterRippleField(W, H, seed=5)
+        cfg = wav_cfg(wave_light=deg)
+        wf.splash(960.0, 540.0, cfg, big=True)
+        for _ in range(30):
+            wf.update(1.0 / 60.0, cfg)
+        dep = wf.shade(cfg)
+        ys, xs = np.mgrid[0:wf.gh, 0:wf.gw]
+        dx = (xs - 960.0 / wf.cell) * wf.cell
+        dy = (ys - 540.0 / wf.cell) * wf.cell
+        m = (np.abs(dep) > 0.1) & (np.hypot(dx, dy) > 30.0)
+        if int(m.sum()) < 200:
+            return False, "前置条件不成立：着色的格太少"
+        pos = dep > 0
+        a = float(np.degrees(np.arctan2(dy[m & pos].mean(), dx[m & pos].mean())) % 360.0)
+        got[deg] = a
+        err = abs((a - deg + 180.0) % 360.0 - 180.0)
+        if err > 12.0:
+            bad.append((deg, a, err))
+    if bad:
+        return False, ("亮部方位没跟着光照走：" +
+                       "、".join(f"light={x:.0f}->{y:.0f}(差{e:.0f}°)" for x, y, e in bad))
+    return True, "亮部方位 " + "、".join(f"{k:.0f}->{got[k]:.0f}" for k in sorted(got))
+
+
+def test_color_tints_highlight():
+    """颜色语义：提亮像素反预乘后必须真的是那个色（红、蓝各验一次）。"""
+    res = {}
+    for name, hexs in (("红", "#FF0000"), ("蓝", "#0000FF")):
+        wf = WaterRippleField(W, H, seed=5)
+        cfg = wav_cfg(wave_color=hexs, wave_opacity=1.0)
+        wf.set_color(hexs)
+        wf.splash(960.0, 540.0, cfg, big=True)
+        for _ in range(30):
+            wf.update(1.0 / 60.0, cfg)
+        b = _render(wf, cfg)
+        a = b[..., 3].astype(np.float32)
+        rgb = b[..., :3].astype(np.float32)[..., ::-1]
+        m = (a > 60) & (rgb.max(axis=2) > 0)
+        if int(m.sum()) < 200:
+            return False, f"{name}：提亮像素太少（{int(m.sum())}）"
+        res[name] = (rgb[m] / np.maximum(a[m], 1.0)[..., None] * 255.0).mean(axis=0)
+    if not (res["红"][0] > res["红"][1] * 1.8 and res["红"][0] > res["红"][2] * 1.8):
+        return False, f"红色没生效：反预乘均值(R,G,B) {np.round(res['红'], 1)}"
+    if not (res["蓝"][2] > res["蓝"][0] * 1.8 and res["蓝"][2] > res["蓝"][1] * 1.8):
+        return False, f"蓝色没生效：反预乘均值(R,G,B) {np.round(res['蓝'], 1)}"
+    return True, ("反预乘均值(R,G,B) 红 " + str(np.round(res["红"], 0))
+                  + " / 蓝 " + str(np.round(res["蓝"], 0)))
+
+
+def test_render_knob_differentials():
+    """四个着色旋钮的「关掉 vs 打开」差分（每条都测**含义**，不是"有变化"）。"""
+    def stat(**over):
+        wf = WaterRippleField(W, H, seed=5)
+        cfg = wav_cfg(**over)
+        wf.splash(960.0, 540.0, cfg, big=True)
+        for _ in range(30):
+            wf.update(1.0 / 60.0, cfg)
+        return _lit_stats(_render(wf, cfg))
+
+    base = stat()
+    off = stat(wave_opacity=0.0)
+    if off["cov"] != 0.0:
+        return False, f"浓度=0 还在画：覆盖 {off['cov'] * 100:.2f}%"
+    c0 = stat(wave_contrast=0.0, wave_highlight=0.0)
+    if c0["bright"] > base["bright"] * 0.02:
+        return False, (f"迎光提亮=0（连高光也关）还剩 {c0['bright']} 个亮像素"
+                       f"（原本 {base['bright']}）")
+    s0 = stat(wave_shading=0.0)
+    if s0["dark"] > base["dark"] * 0.2:
+        return False, f"背光压暗=0 没削掉暗部：{base['dark']} -> {s0['dark']}"
+    h0 = stat(wave_highlight=0.0)
+    if h0["amax"] > base["amax"] * 0.95:
+        return False, f"浪尖高光=0 没压低峰值：{base['amax']:.0f} -> {h0['amax']:.0f}"
+    return True, (f"浓度=0 -> 0 像素；提亮关 {base['bright']}->{c0['bright']}、"
+                  f"压暗关 {base['dark']}->{s0['dark']}、"
+                  f"高光关峰值 {base['amax']:.0f}->{h0['amax']:.0f}")
+
+
+def test_render_crop_is_lossless():
+    """包围盒裁剪必须无损：把 box 强行撑到整块网格重画一遍，两者要**逐像素一致**。
+
+    这里有个容易漏的坑：包围盒按"还有没有波"（高度阈值）划，可上屏画的是**坡度**，
+    两个都低于阈值的相邻格之间照样能有可观的坡度差。绘制阈值因此用的是
+    `_render_h()` 而不是 `_EPS`（见那里的推导）。
+    """
+    for age in (30, 120, 400):
+        wf = WaterRippleField(W, H, seed=5)
+        cfg = wav_cfg()
+        wf.splash(960.0, 540.0, cfg, big=True)
+        for _ in range(age):
+            wf.update(1.0 / 60.0, cfg)
+        a = _render(wf, cfg)
+        orig = WaterRippleField.active_box
+
+        def full(self, pad=3, thr=None):
+            return (0, 0, self.gh, self.gw)
+
+        WaterRippleField.active_box = full
+        try:
+            b2 = _render(wf, cfg)
+        finally:
+            WaterRippleField.active_box = orig
+        diff = int((a.view(np.uint32) != b2.view(np.uint32)).sum())
+        if diff:
+            return False, f"波龄 {age / 60.0:.1f}s：裁剪版差 {diff} 个像素（切掉了可见的波）"
+    if WaterRippleField(W, H)._render_h() >= WaterRippleField._EPS:
+        return False, "绘制阈值没有比存活阈值更严 —— 盒子外会有可见的波被裁掉"
+    return True, ("波龄 0.5 / 2.0 / 6.7s 三档，裁剪版与整块网格版逐像素完全一致"
+                  f"（绘制阈值 {WaterRippleField(W, H)._render_h():.1e} "
+                  f"< 存活阈值 {WaterRippleField._EPS:.1e}）")
+
+
+# ------------------------------------------------------------------ 接线
+def _scene(cfg, w=W, h=H):
+    sc = Scene(w, h)
+    sc.cfg = cfg
+    # Scene.step 会真的去读鼠标；测试里换成固定行程的桩，才能自己控制轨迹
+    sc.mouse.update = lambda *a, **k: 8.0
+    return sc
+
+
+def test_scene_wiring():
+    """Scene 接线：开水波要真的画出像素；关掉要立刻清场（不留残波）。"""
+    cfg = dict(d.DEFAULTS)
+    cfg["wave_enabled"] = True
+    sc = _scene(cfg)
+    buf = np.zeros((H, W, 4), np.uint8)
+    u32 = buf.view(np.uint32).reshape(-1)
+    peak = 0
+    for i in range(120):
+        u32[:] = 0
+        sc.mouse.mx = 300.0 + i * 9.0
+        sc.mouse.my = 540.0 + 90.0 * np.sin(i / 15.0)
+        sc.mouse.clicked = 1 if i == 80 else 0
+        sc.step(1.0 / 60.0, u32, W, H)
+        peak = max(peak, int((buf[..., 3] > 0).sum()))
+    if peak < 500:
+        return False, f"跑了 120 帧，单帧最多只点亮 {peak} 个像素（接线断了）"
+    if not sc.wave._alive:
+        return False, "Scene 里水波根本没活起来"
+    sc.cfg = dict(cfg, wave_enabled=False)
+    u32[:] = 0
+    sc.step(1.0 / 60.0, u32, W, H)
+    if sc.wave._alive or sc.wave.energy() != 0.0:
+        return False, "关闭水波后没清场（残留的波会在重新打开时冒出来）"
+    return True, f"120 帧拖动+点击，单帧最多 {peak} 像素；关闭后立即清场"
+
+
+def test_scene_both_ripples_at_once():
+    """两套涟漪必须能**同时开**并各自出图 —— 它们本来就是并存供用户挑的。"""
+    cfg = dict(d.DEFAULTS, wave_enabled=True, ripple_move=True, ripple_click=True)
+    sc = _scene(cfg)
+    buf = np.zeros((H, W, 4), np.uint8)
+    u32 = buf.view(np.uint32).reshape(-1)
+    hit = 0
+    for i in range(90):
+        u32[:] = 0
+        sc.mouse.mx = 300.0 + i * 9.0
+        sc.mouse.my = 540.0
+        sc.step(1.0 / 60.0, u32, W, H)
+        hit = max(hit, int((buf[..., 3] > 0).sum()))
+    rings = int(sc.ripples.active.sum())
+    wenv = sc.wave.energy()
+    if rings <= 0:
+        return False, "彩色涟漪没被触发（接线断了）"
+    if wenv <= 0.0:
+        return False, "真实水波没被触发（接线断了）"
+    if hit <= 0:
+        return False, "两套同开时一个像素都没画出来"
+    # 关掉水波之后，涟漪必须不受影响（否则就是两套互相踩了）
+    sc.cfg = dict(cfg, wave_enabled=False)
+    sc.wave.reset()
+    for i in range(20):
+        u32[:] = 0
+        sc.mouse.mx = 800.0 + i * 9.0
+        sc.mouse.my = 540.0
+        sc.step(1.0 / 60.0, u32, W, H)
+    if int(sc.ripples.active.sum()) <= 0 or sc.wave.energy() != 0.0:
+        return False, "关掉水波后涟漪跟着没了（两套互相踩）"
+    return True, f"同开：涟漪活跃 {rings} 环、水波能量 {wenv:.3g}；关水波后涟漪照常"
+
+
+def test_presets_valid():
+    """「真实水波」预设：键都在 DEFAULTS 里、都真的开了水波、且能被 Scene 跑通。"""
+    names = [n for n in d.PRESET_GROUPS.get("真实水波", []) if n in d.PRESETS]
+    if len(names) < 3:
+        return False, f"「真实水波」分组只有 {len(names)} 个预设"
+    for n in names:
+        bad = [k for k in d.PRESETS[n] if k not in d.DEFAULTS]
+        if bad:
+            return False, f"预设 {n} 有非法键 {bad}"
+        if not d.PRESETS[n].get("wave_enabled"):
+            return False, f"预设 {n} 没打开 wave_enabled"
+    if d.DEFAULTS.get("wave_enabled") is not False:
+        return False, "真实水波必须默认关闭"
+    hit = {}
+    for n in names:
+        cfg = dict(d.DEFAULTS)
+        cfg.update(d.PRESETS[n])
+        w, h = 960, 540
+        sc = _scene(cfg, w, h)
+        bb = np.zeros((h, w, 4), np.uint8)
+        uu = bb.view(np.uint32).reshape(-1)
+        for i in range(90):
+            uu[:] = 0
+            sc.mouse.mx = 200.0 + i * 7.0
+            sc.mouse.my = 270.0 + 60.0 * np.sin(i / 12.0)
+            sc.step(1.0 / 60.0, uu, w, h)
+        hit[n] = int((bb[..., 3] > 0).sum())
+    dead = [n for n, v in hit.items() if v < 200]
+    if dead:
+        return False, f"预设跑 90 帧没出图：{dead}"
+    return True, "、".join(f"{n} {hit[n]}px" for n in names)
+
+
 def main():
     tests = [
         test_wave_front_travels,
@@ -430,6 +721,16 @@ def main():
         test_never_blows_up,
         test_steady_state_is_bounded,
         test_resize_rebuilds,
+        test_render_writes_pixels,
+        test_render_idle_blank,
+        test_bright_and_dark_pixels,
+        test_light_direction_orientates_shading,
+        test_color_tints_highlight,
+        test_render_knob_differentials,
+        test_render_crop_is_lossless,
+        test_scene_wiring,
+        test_scene_both_ripples_at_once,
+        test_presets_valid,
     ]
     ok_all = True
     for fn in tests:

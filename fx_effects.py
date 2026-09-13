@@ -386,10 +386,21 @@ class WaterRippleField:
                                     # （2.0 会被连续拖动顶到，钳位把波峰削平）
     _IDLE_CHECK = 24                # 每多少步做一次"场上还有没有波"的全场扫描
 
+    # ---- 上屏着色（见 draw / shade）----
+    _KNEE_PER_PX = 5.2e-4           # 软饱和拐点：每像素高度变化多少算"满对比度"
+    _KS_DEF = 0.85                  # 迎光提亮峰值
+    _KD_DEF = 0.55                  # 背光压暗峰值
+    _KSP_DEF = 0.90                 # 浪尖高光峰值
+    _LIGHT_DEF = 225.0              # 光照来自左上（0=右 90=下 180=左 270=上）
+    _OPACITY_REF = 0.85
+    _BRIGHT_E = 1.30                # 迎光侧的亮度曲线指数
+    _RENDER_EPS = 0.03              # 判定"这一格要画"的幅度阈值
+
     # ---------------------------------------------------------- 生命周期
     def __init__(self, w, h, seed=0):
         self._rng = np.random.RandomState(seed)
         self._t = 0.0
+        self._tint = (1.0, 1.0, 1.0)      # 高光染色 **(b, g, r)**，归一化到 0~1，默认纯白
         self.resize(w, h)
 
     def resize(self, w, h):
@@ -497,10 +508,159 @@ class WaterRippleField:
                     self.reset()
         return n
 
+    # ---------------------------------------------------------- 上屏
+    def shade(self, cfg, box=None):
+        """算出明暗调制量 `dep ∈ [-1, 1]`：正 = 迎光（提亮），负 = 背光（压暗）。
+
+        对比度照抄参考的 `|offset| = |grad| / sqrt(|grad|² + delta²)` —— 一条**软饱和**
+        曲线：坡度小于拐点时按比例减弱、大于拐点后封顶到 1。**不能直接拿坡度当亮度**，
+        否则波一衰减整片就糊掉（实测 2 秒后峰值只剩 0.0036，而参考那时还很清楚）；
+        也不能简单地把梯度归一化，那样连噪声都会被放大成满对比度条纹。
+
+        拐点取 `_KNEE_PER_PX × 格边长`，即"每像素高度变化 5.2e-4"——与参考的
+        `delta = 1/res`（res=800、格 2.4px）等价，所以两边观感的浓淡是对齐的。
+
+        **化简**：原式 `amp × (∇h/|∇h| · L)` 里的 `|∇h|` 会约掉 ——
+
+            |∇h|/√(|∇h|²+k²) × (∇h·L)/|∇h|  ==  (∇h·L) / √(|∇h|²+k²)
+
+        于是不用算 `|∇h|`、不用 `where` 兜零除、也不会有 0/0 的 NaN（分母恒 ≥ k > 0）。
+        实测这一步就省掉近一半的运算量。
+
+        `box` 给定时只算那一块（带一圈邻居供差分），这是上屏路径的用法 ——
+        波只占屏幕一小片时，成本随波的大小走而不是随屏幕走。
+        """
+        ang = np.radians(float(cfg.get("wave_light", self._LIGHT_DEF)))
+        # **取负**：`wave_light` 说的是"光从屏幕哪个方向打过来"，而
+        # `dep = (∇h·L)` 的 L 是"指向光源"的向量。实测不取负的话，把光设成
+        # 从右边来，亮部反而出现在左边 —— 滑条会完全名不副实。
+        lx, ly = np.float32(-np.cos(ang)), np.float32(-np.sin(ang))
+        knee2 = np.float32((self._KNEE_PER_PX * self.cell) ** 2)
+        if box is None:
+            hx, hy = self.slope()
+        else:
+            hx, hy = self.slope(box)
+        return (hx * lx + hy * ly) / np.sqrt(hx * hx + hy * hy + knee2)
+
+    def draw(self, u32, w, h, cfg):
+        """把波面画成**迎光提亮 / 背光压暗**的亮暗条纹。
+
+        参考的第三段是 `tex(背景, uv + offset * perturbance)` —— 真折射。我们拿不到
+        桌面像素，改成把坡度方向当法线的水平分量：迎光的一侧提亮、背光的一侧压暗，
+        再在浪尖叠一道高光。亮 = 白色预乘像素（把桌面提亮），暗 = 黑色预乘像素
+        （把桌面压暗）——`UpdateLayeredWindow` 走的是 ULW_ALPHA + 预乘，
+        两者都成立（聚光灯的全屏压暗早就在用这个能力）。
+        """
+        if not self._alive:
+            return
+        op = float(np.clip(cfg.get("wave_opacity", self._OPACITY_REF), 0.0, 1.0))
+        if op <= 0.0:
+            return
+
+        # 用"场上还有没有波"的范围当绘制范围：着色只在有波的地方非零，
+        # pad 留 3 格（波前推进 1 格/帧，不会跑出这个余量）。
+        box = self.active_box(pad=3, thr=self._render_h())
+        if box is None:
+            return
+        ry0, rx0, ry1, rx1 = box
+        sub = self.shade(cfg, box=box)
+        if float(np.abs(sub).max()) <= self._RENDER_EPS:
+            return
+
+        pos = np.clip(sub, 0.0, 1.0)
+        neg = np.clip(-sub, 0.0, 1.0)
+        k_s = float(np.clip(cfg.get("wave_contrast", self._KS_DEF), 0.0, 1.5))
+        k_d = float(np.clip(cfg.get("wave_shading", self._KD_DEF), 0.0, 1.0))
+        k_sp = float(np.clip(cfg.get("wave_highlight", self._KSP_DEF), 0.0, 1.5))
+        bright = np.clip(pos ** np.float32(self._BRIGHT_E) * np.float32(k_s)
+                         + pos ** np.float32(4.0) * np.float32(k_sp), 0.0, 1.0)
+        dark = neg * np.float32(k_d)
+
+        sb = bright * np.float32(op)
+        sd = dark * np.float32(op)
+        ab = np.rint((sb + sd) * np.float32(255.0)).astype(np.uint32)
+        # 染色是 0~1 的倍数，必须乘回 255 才是预乘的通道值
+        # （hex_to_bgr 给的是 0~255，set_color 里已经除过）。
+        # **顺序是 (b, g, r)** —— `_premul_pack` 收的就是 bgr，存成 rgb 会红蓝互换
+        # （第一版就是这么错的：设 #FF0000 画出来是蓝的）。
+        srgb = sb * np.float32(255.0)
+        cb, cg, cr = self._tint
+        small = _premul_pack(
+            np.rint(np.float32(cb) * srgb).astype(np.uint32),
+            np.rint(np.float32(cg) * srgb).astype(np.uint32),
+            np.rint(np.float32(cr) * srgb).astype(np.uint32), ab)
+
+        # 上屏：先 x 后 y（结果才是 C 连续，见 PaintField 的踩坑），
+        # 且**只覆盖非零像素**，别把别层画好的东西整片抹掉。
+        py0 = max(0, int(np.floor(ry0 * self.cell)))
+        px0 = max(0, int(np.floor(rx0 * self.cell)))
+        py1 = min(int(h), int(np.ceil(ry1 * self.cell)))
+        px1 = min(int(w), int(np.ceil(rx1 * self.cell)))
+        if py1 <= py0 or px1 <= px0:
+            return
+        bh, bw = small.shape
+        iy = np.clip((np.arange(py0, py1, dtype=np.float32) / self.cell).astype(np.int32) - ry0,
+                     0, bh - 1)
+        ix = np.clip((np.arange(px0, px1, dtype=np.float32) / self.cell).astype(np.int32) - rx0,
+                     0, bw - 1)
+        big = small[:, ix][iy]
+        dst = u32.reshape(int(h), int(w))[py0:py1, px0:px1]
+        np.copyto(dst, big, where=big != 0)
+
+    def slope(self, box=None):
+        """**前向差分**坡度（每格）。和参考的 cross(dy, dx) 用的是同一对量。
+
+        边界格留 0 —— 那里没有"外面的格子"，坡度当 0 正好等于"没有倾斜、不着色"。
+        `box` 给定时只算 `(y0, x0, y1, x1)` 那一块，并且会多取一圈邻居，
+        免得块的边界被当成"外面的格子"而留着 0（那样会在波里面切出一道假的黑边）。
+        """
+        h = self.height
+        if box is None:
+            hx = np.zeros_like(h)
+            hy = np.zeros_like(h)
+            hx[:, :-1] = h[:, 1:] - h[:, :-1]
+            hy[:-1, :] = h[1:, :] - h[:-1, :]
+            return hx, hy
+        y0, x0, y1, x1 = box
+        py0, px0 = max(0, y0 - 1), max(0, x0 - 1)
+        py1, px1 = min(self.gh, y1 + 1), min(self.gw, x1 + 1)
+        sl = h[py0:py1, px0:px1]
+        fx = np.zeros_like(sl)
+        fy = np.zeros_like(sl)
+        fx[:, :-1] = sl[:, 1:] - sl[:, :-1]
+        fy[:-1, :] = sl[1:, :] - sl[:-1, :]
+        oy, ox = y0 - py0, x0 - px0
+        return (fx[oy:oy + (y1 - y0), ox:ox + (x1 - x0)].copy(),
+                fy[oy:oy + (y1 - y0), ox:ox + (x1 - x0)].copy())
+
+    def set_color(self, hex_str):
+        """高光的染色（暗面恒为黑，压暗本来就该是无彩的）。"""
+        bb, gg, rr = hex_to_bgr(hex_str)          # hex_to_bgr 给的是 0~255
+        # 保持 **BGR** 存（与 _premul_pack 的入参一致），别顺手改成 RGB
+        self._tint = (float(bb) / 255.0, float(gg) / 255.0, float(rr) / 255.0)
+        return self._tint
+
     # ---------------------------------------------------------- 查询
-    def active_box(self, pad=3):
-        """还有波的格范围 `(y0, x0, y1, x1)`；空场返回 None。"""
-        m = (np.abs(self.height) > self._EPS) | (np.abs(self.vel) > self._EPS)
+    def _render_h(self):
+        """绘制包围盒该用的高度阈值。
+
+        **不能直接用 `_EPS`**：包围盒是按"还有没有波"（高度）划的，可上屏画的是
+        **坡度**。两个都低于阈值的相邻格之间照样能有 `2 × 阈值` 的高度差，换算成
+        明暗就是 `2 × 阈值 / 拐点` —— 拿 `_EPS=3e-4` 去算会到 0.33，远大于
+        `_RENDER_EPS=0.03`，于是盒子外面**有可见的波被裁掉**。
+        反解一下：想让漏掉的明暗都 < `_RENDER_EPS`，高度阈值就得取
+        `_RENDER_EPS × 拐点 / 2`。
+        """
+        return self._RENDER_EPS * (self._KNEE_PER_PX * self.cell) * 0.5
+
+    def active_box(self, pad=3, thr=None):
+        """还有波的格范围 `(y0, x0, y1, x1)`；空场返回 None。
+
+        `thr` 默认用 `_EPS`（判"活没活着"）；上屏要用 `_render_h()`，见那里的说明。
+        """
+        if thr is None:
+            thr = self._EPS
+        m = (np.abs(self.height) > thr) | (np.abs(self.vel) > thr)
         rows = np.flatnonzero(m.any(axis=1))
         if rows.size == 0:
             return None

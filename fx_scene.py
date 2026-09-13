@@ -14,7 +14,7 @@ import numpy as np
 
 from fx_effects import (RainField, RippleField, MeteorField, MouseProbe,
                         PaintField, PetalField, SnowField, SpotlightField,
-                        WindowProbe, hex_to_bgr)
+                        WaterRippleField, WindowProbe, hex_to_bgr)
 
 
 class Scene:
@@ -26,6 +26,9 @@ class Scene:
         self.meteors = MeteorField(w, h, seed=31)       # 流星雨
         self.paint = PaintField(w, h, seed=37)          # 颜料盘
         self.ripples = RippleField()
+        # 「真实水波」是**另一套独立实现**（二维波动方程 + 迎光/背光条纹），
+        # 和上面的彩色圆环 `RippleField` 并存 —— 用户要开哪个自己选，两边可以同时开。
+        self.wave = WaterRippleField(w, h, seed=41)
         self.mouse = MouseProbe()
         self.spot = SpotlightField(w, h, seed=17)       # 聚光灯
         self.win = WindowProbe()                        # 窗口枚举（窗口交互地基）
@@ -49,6 +52,11 @@ class Scene:
         self._last_ripple_color = None
         self._ripple_color_cache = hex_to_bgr("#7FE7FF")
 
+        # 真实水波的跨帧状态
+        self._last_wave_color = None
+        self._wave_acc = 0.0            # 鼠标行程累加（按间距落点）
+        self._wave_amb = 0.0            # 环境自动滴落的计时
+
         # 窗口水波跨帧状态
         self._win_moving = False
         self._win_move_t = 0.0          # 距上次 move 事件的累计时间
@@ -68,6 +76,7 @@ class Scene:
         self.petals.resize(w, h)
         self.meteors.resize(w, h)
         self.paint.resize(w, h)
+        self.wave.resize(w, h)
         self.spot.resize(w, h)
 
     def _ripple_color(self):
@@ -222,6 +231,56 @@ class Scene:
         # ---------------- 涟漪
         self.ripples.update(dt)
         self.ripples.draw(u32, w, h)
+
+        # ---------------- 真实水波（独立开关，与上面的彩色涟漪正交）
+        # 排在最后 = 最上层：它写的是半透明**暗**像素（波谷），被别层压住就看不出来了。
+        if cfg.get("wave_enabled", False):
+            if self._last_wave_color != cfg["wave_color"]:
+                self.wave.set_color(cfg["wave_color"])
+                self._last_wave_color = cfg["wave_color"]
+            self._wave_trigger(cfg, dist, w, h, dt)
+            self.wave.update(dt, cfg)
+            self.wave.draw(u32, w, h, cfg)
+        elif self.wave._alive:
+            # 关闭时清场：否则重新打开时会冒出上一次留下的波
+            self.wave.reset()
+            self._wave_acc = 0.0
+            self._wave_amb = 0.0
+
+    # ------------------------------------------------------------ 真实水波
+    def _wave_trigger(self, cfg, dist, w, h, dt):
+        """给真实水波喂触发源：移动（按行程）/ 点击 / 环境自动滴落。
+
+        移动走的是**按行程落点**而不是"每帧一滴"：帧率高的机器上每帧落点会让
+        陡坡那一侧积成一片，而"每走 N 像素落一滴"才是"手划过水面"的物理图像。
+        """
+        mx, my = float(self.mouse.mx), float(self.mouse.my)
+
+        if cfg.get("wave_move", True) and dist > 0.0:
+            self._wave_acc += float(dist)
+            step_w = max(6.0, float(cfg["wave_step"]))
+            cnt = 0
+            while self._wave_acc >= step_w and cnt < 3:
+                self._wave_acc -= step_w
+                cnt += 1
+                self.wave.splash(mx, my, cfg)
+            if self._wave_acc > step_w * 4:
+                self._wave_acc = 0.0        # 瞬移保护：别攒出一长串待落的点
+        else:
+            self._wave_acc *= 0.90
+
+        if cfg.get("wave_click", True) and self.mouse.clicked:
+            self.wave.splash(mx, my, cfg, big=True)
+
+        amb = float(cfg.get("wave_ambient", 0.0))
+        if amb > 0.0:
+            self._wave_amb += float(dt)
+            if self._wave_amb >= amb:
+                self._wave_amb = 0.0
+                self.wave.splash(float(np.random.uniform(0.0, w)),
+                                 float(np.random.uniform(0.0, h)), cfg, big=True)
+        else:
+            self._wave_amb = 0.0
 
     # ------------------------------------------------------------ 窗口水波
     def _win_ripple_color(self, cfg):

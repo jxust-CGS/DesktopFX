@@ -57,6 +57,24 @@ DEFAULTS = {
     "ripple_life": 0.95,
     "ripple_color": "#7FE7FF",
     "ripple_opacity": 0.85,
+    # ---- 真实水波（二维波动方程 + 迎光/背光条纹）----
+    # 与上面的「涟漪」是**两套独立实现**：涟漪是解析彩色圆环，真实水波是真波动方程。
+    # 默认关闭 —— 两套并存，用哪套（或都不开）由用户决定。
+    "wave_enabled": False,
+    "wave_speed": 180.0,          # 波的相速度 px/s（实测可见波前 ≈ 0.6×，即 ~108px/s）
+    "wave_persist": 0.45,         # 余波长短：0 = 很快平复，1 = 久久不散
+    "wave_size": 22.0,            # 落点半径 px
+    "wave_strength": 0.08,        # 落点强度（参考壁纸：移动 0.002 / 点击 0.15）
+    "wave_step": 26.0,            # 鼠标每走多少 px 落一个点
+    "wave_move": True,            # 鼠标滑过搅动
+    "wave_click": True,           # 点击落一大滴
+    "wave_ambient": 0.0,          # 每隔多少秒自动滴一滴（0 = 关）
+    "wave_light": 225.0,          # 光照来自屏幕哪一侧（0=右 90=下 180=左 270=上）
+    "wave_contrast": 0.85,        # 迎光面提亮
+    "wave_shading": 0.55,         # 背光面压暗
+    "wave_highlight": 0.90,       # 浪尖高光
+    "wave_color": "#FFFFFF",      # 高光染色（暗面恒为黑）
+    "wave_opacity": 0.85,
     "fps": 60.0,
     # ---- 雪（与雨正交的独立特效层）----
     "snow_enabled": False,
@@ -216,6 +234,25 @@ PRESETS = {
                 spotlight_enabled=True, spotlight_radius=200,
                 spotlight_dim=0.70, spotlight_color="#04060A"),
     # ---- 窗口水波：桌面像水面，拖动/收起窗口荡开涟漪 ----
+    # ---- 真实水波：与「水面」那套彩色圆环是不同实现，可以两边都开来对比 ----
+    "真实水波": dict(rain_enabled=False, snow_enabled=False, petal_enabled=False,
+                 meteor_enabled=False, wave_enabled=True,
+                 wave_speed=180, wave_persist=0.45, wave_size=22, wave_strength=0.08,
+                 wave_step=26, wave_move=True, wave_click=True, wave_ambient=0.0,
+                 wave_light=225, wave_contrast=0.85, wave_shading=0.55,
+                 wave_highlight=0.90, wave_color="#FFFFFF", wave_opacity=0.85),
+    "月下湖面": dict(rain_enabled=False, snow_enabled=False, petal_enabled=False,
+                 meteor_enabled=False, wave_enabled=True,
+                 wave_speed=120, wave_persist=0.85, wave_size=30, wave_strength=0.05,
+                 wave_step=34, wave_move=True, wave_click=True, wave_ambient=4.0,
+                 wave_light=205, wave_contrast=0.55, wave_shading=0.38,
+                 wave_highlight=0.55, wave_color="#CFE6FF", wave_opacity=0.72),
+    "暴雨打点": dict(rain_enabled=False, snow_enabled=False, petal_enabled=False,
+                 meteor_enabled=False, wave_enabled=True,
+                 wave_speed=240, wave_persist=0.25, wave_size=26, wave_strength=0.14,
+                 wave_step=18, wave_move=True, wave_click=True, wave_ambient=1.2,
+                 wave_light=200, wave_contrast=1.00, wave_shading=0.75,
+                 wave_highlight=1.10, wave_color="#FFFFFF", wave_opacity=0.95),
     "水面": dict(rain_enabled=False, snow_enabled=False,
               win_ripple_enabled=True, win_ripple_size=1.2,
               win_ripple_life=1.1, win_ripple_strength=0.8,
@@ -233,6 +270,7 @@ PRESET_GROUPS = {
     "流星雨": ["流星雨", "流星夜", "双子座流星雨"],
     "颜料盘": ["颜料盘", "霓虹流体", "水墨"],
     "聚光灯": ["聚光灯", "舞台光"],
+    "真实水波": ["真实水波", "月下湖面", "暴雨打点"],
     "窗口水波": ["水面"],
 }
 
