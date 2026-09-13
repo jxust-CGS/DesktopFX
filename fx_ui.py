@@ -438,6 +438,8 @@ class _NavIcon(tk.Canvas):
 # ------------------------------------------------------------------ 面板
 class ControlPanel:
     W, H = 564, 742
+    _MIN_H = 520            # 窗口最小高度（内容再少也别比这矮）
+    _SCREEN_FRAC = 0.92     # 窗口最高不超过屏幕高度的这个比例
 
     def __init__(self, app):
         self.app = app
@@ -462,6 +464,7 @@ class ControlPanel:
 
         self._center()
         self._build()
+        self._fit_height()
         self._apply_dwm()
         self._raise_top()
         self._poll()
@@ -629,7 +632,7 @@ class ControlPanel:
                    lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind("<Configure>",
                     lambda e: (canvas.itemconfig(win, width=e.width),
-                               canvas.configure(scrollregion=canvas.bbox("all"))))
+                               self._sync_scroll()))
         # 滚轮只绑在 canvas / inner 上是**不够**的：Tk 把滚轮事件发给光标正下方
         # 那个控件，不会冒泡到父容器 —— 鼠标停在页面里的卡片、滑块上时毫无反应，
         # 配置项一多，下面的"预设方案"就永远滚不到（颜料盘页踩过）。
@@ -697,12 +700,95 @@ class ControlPanel:
 
     def _on_wheel(self, e):
         """内容区滚轮。挂在 bind_all 上接收，但要判断事件来自哪 ——
-        否则"保存为预设"对话框里滚动会把背后的页面一起滚走。"""
+        否则"保存为预设"对话框里滚动会把背后的页面一起滚走。
+
+        内容装得下时**直接不滚**：这时候滚起来只能把顶部拉走、露出下面一片空白。
+        （用户报过："下雨界面这些要素较少的，不要把顶部往下拉"。）
+        """
         w = e.widget
         while w is not None:
             if w is self._canvas:
-                return self._canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+                break
             w = getattr(w, "master", None)
+        else:
+            return
+        if not self._need_scroll():
+            self._canvas.yview_moveto(0)
+            return
+        self._canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+
+    def _view_h(self):
+        """内容区可用高度 = 窗口高 − chrome（标题栏 + 底部提示条）。
+
+        **不要直接读 `canvas.winfo_height()`**：窗口尺寸变化后，canvas 的实际
+        高度要等 Tk 处理完下一次 Configure 才跟上，在那之前读到的是旧值 ——
+        自适应算窗口高度、判断要不要滚动时都会用错。
+        """
+        return max(0, int(self.root.winfo_height())
+                   - getattr(self, "_chrome", 74))
+
+    def _need_scroll(self):
+        """当前页装不下、真的需要滚动吗？
+
+        用**页面自身的请求高度**判断，而不是 canvas 的 scrollregion：切页那一
+        瞬间 scrollregion 可能还是上一页（更高的那页）留下的旧值，会让"下雨"
+        这种一屏放得下的页面也能被拉走。
+        """
+        f = self._pages.get(self._active)
+        if f is None:
+            return False
+        return int(f.winfo_reqheight()) > self._view_h()
+
+    def _sync_scroll(self):
+        """重算滚动区域。装得下时把区域收成**视口高度**，滚轮就彻底动不了。"""
+        bb = self._canvas.bbox("all")
+        if not bb:
+            return
+        vh = self._view_h()
+        top, bottom = int(bb[1]), int(bb[3])
+        if bottom - top <= vh:
+            self._canvas.configure(scrollregion=(bb[0], top, bb[2], top + vh))
+            self._canvas.yview_moveto(0)
+        else:
+            self._canvas.configure(scrollregion=(bb[0], top, bb[2], bottom))
+
+    def _fit_height(self):
+        """按内容把窗口调高到"最长的那个页面刚好装得下"，上限为屏幕的 92%。
+
+        窗口尺寸本来写死 564x742，而各页内容高度差很大（下雨 ~594、颜料盘
+        ~717）。只要系统缩放不是 100%（字体按 DPI 放大、控件整体变高）或者
+        用户多存了几个自定义预设，连"下雨"这种要素很少的页面都会溢出 ——
+        滚轮于是能把顶部拉走，看着莫名其妙。让窗口跟着内容长高（不超出屏幕）
+        能从根上避免；真的装不下（屏幕不够高）时才滚动。
+        """
+        hs = {}
+        for name, f in self._pages.items():
+            for g in self._pages.values():
+                g.pack_forget()
+            f.pack(fill="x")
+            self._canvas.update_idletasks()
+            hs[name] = int(f.winfo_reqheight())
+        self._show_page(self._active)              # 恢复当前页（顺带复位滚动）
+        # chrome = 窗口高 - 内容区高（标题栏 42 + 底部提示条 + 间距）。
+        # **只在第一次实测、之后复用缓存**：窗口被外部改过尺寸后，canvas 的
+        # winfo_height() 不一定及时跟着变（update_idletasks/update 都不保险），
+        # 再测会得到负数 —— 窗口于是少了一整条标题栏的高度。而首次调用时窗口
+        # 刚建好、布局已稳定，那一次是准的。
+        if getattr(self, "_chrome", None) is None:
+            self.root.update_idletasks()
+            self._chrome = max(42, self.root.winfo_height()
+                               - self._canvas.winfo_height())
+        chrome = self._chrome
+        content = max(hs.values()) if hs else 0
+        self._content_h = content
+        cap = int(self.root.winfo_screenheight() * self._SCREEN_FRAC)
+        h = max(self._MIN_H, min(content + chrome, cap))
+        # 不能只在 `h != self.H` 时才应用：窗口高度可能被外部改过（测试里压矮
+        # 造溢出、将来若支持拖拽缩放），而 H 没变 -> 就恢复不回来了。
+        if h != self.H or int(self.root.winfo_height()) != h:
+            self.H = h
+            self._center()
+            self.root.update_idletasks()
 
     def _show_page(self, name):
         for n, f in self._pages.items():
@@ -726,8 +812,8 @@ class ControlPanel:
                 info["icon"].config(bg=SIDEBAR_BG)
                 info["icon"].set_color(SUB)
         self._canvas.update_idletasks()
-        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
         self._canvas.yview_moveto(0)
+        self._sync_scroll()
 
     def _load_last_page(self):
         try:

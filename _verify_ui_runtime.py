@@ -31,7 +31,12 @@ class _StubApp:
         return list(d.PRESETS.keys())
 
     def presets_for_page(self, page):
-        return [n for n in d.PRESET_GROUPS.get(page, []) if n in d.PRESETS]
+        built = [n for n in d.PRESET_GROUPS.get(page, []) if n in d.PRESETS]
+        # 模拟"用户在下雨页存过自定义预设"：预设区会多一格，页面变高 ——
+        # 这正是用户报"下雨页也被往下拉"时的实际状态，窗口自适应必须算进去。
+        if page == "下雨":
+            built = built + ["我的自定义预设"]
+        return built
 
     def is_user_preset(self, name):
         return False
@@ -91,13 +96,25 @@ def main():
     # 4) 「记忆上次」持久化：切页后 _load_last_page 应回读为「下雨」
     assert p._load_last_page() == "下雨", p._load_last_page()
 
-    # 5) 滚轮必须对页面内的**子控件**也生效。
-    #    只把 <MouseWheel> 绑在 canvas / inner 上是抓不到的：Tk 把滚轮事件发给
-    #    光标正下方那个控件，并不会冒泡给父容器 —— 鼠标停在卡片、滑块上滚时
-    #    完全没反应。颜料盘页配置项最多，之前就是它下面的"预设方案"永远滚不到。
-    p._show_page("颜料盘")
+    # 5) 窗口高度会**按内容自适应**（这样"下雨"这种要素少的页面才不需要滚）
+    assert p.root.winfo_height() >= p._content_h, (
+        p.root.winfo_height(), p._content_h)
+    p._show_page("下雨")
     p.root.update_idletasks()
-    p._canvas.yview_moveto(0.0)
+    assert not p._need_scroll(), \
+        f"下雨页不该需要滚动：内容 {p._pages['下雨'].winfo_reqheight()} " \
+        f"视口 {p._canvas.winfo_height()}"
+
+    # 5a) 滚轮必须对页面内的**子控件**也生效 —— 但只在内容真的超出时。
+    #     只把 <MouseWheel> 绑在 canvas / inner 上是抓不到的：Tk 把滚轮事件发给
+    #     光标正下方那个控件、不会冒泡给父容器，鼠标停在卡片/滑块上滚时完全没
+    #     反应，配置项一多，下面的"预设方案"就永远滚不到。
+    #     正常状态下所有页面都装得下（窗口自适应），所以这里**人为把窗口压矮**
+    #     制造溢出，才能验到"绑对了"这件事。
+    p._show_page("颜料盘")
+    p.root.geometry(f"{p.W}x620")
+    p.root.update_idletasks()
+    assert p._need_scroll(), "压矮窗口后颜料盘页应当需要滚动"
     deep = p._pages["颜料盘"]
     for _ in range(6):
         kids = deep.winfo_children()
@@ -105,11 +122,27 @@ def main():
             break
         deep = kids[0]
     assert "all" in deep.bindtags(), ("滚轮没挂到全局绑定上", deep.bindtags())
+    p._canvas.yview_moveto(0.0)
     before = p._canvas.yview()[0]
     deep.event_generate("<MouseWheel>", delta=-120)
     p.root.update()
     assert p._canvas.yview()[0] > before, (
         f"滚轮在子控件上没生效：yview {before} -> {p._canvas.yview()[0]}")
+
+    # 5b) 内容装得下时滚轮必须**完全无效**：这时候滚起来只能把顶部拉走、
+    #     露出下面一片空白（用户报过："下雨界面这些要素较少的，不要把顶部往下拉"）。
+    p._fit_height()
+    p.root.update_idletasks()
+    assert not p._need_scroll(), "窗口恢复自适应后颜料盘页又需要滚动了"
+    p._canvas.yview_moveto(0)
+    deep.event_generate("<MouseWheel>", delta=-120)
+    p.root.update()
+    assert p._canvas.yview()[0] == 0.0, (
+        f"装得下的页面被滚轮拉动了：yview={p._canvas.yview()}")
+    deep.event_generate("<MouseWheel>", delta=120)
+    p.root.update()
+    assert p._canvas.yview()[0] == 0.0, (
+        f"反方向也拉动了：yview={p._canvas.yview()}")
 
     # 6) 每个颜色项都要有"调色"（系统调色板）与"取色"（屏幕吸管）两个入口
     btns = set()
