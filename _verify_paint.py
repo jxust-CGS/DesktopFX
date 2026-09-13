@@ -28,6 +28,9 @@
     -> test_bbox_crop_is_lossless 拿关掉裁剪的结果逐像素比。
   * **指针位置过期**：特效关着时不喂指针，重新启用后第一帧会拉出一条横贯屏幕的
     长笔触 -> test_teleport_no_stroke。
+  * **固定偏移**：x/y 两个轴的格尺寸不相等，落色与上屏若混用同一个换算，颜料会
+    被整体显示在 `px * cellx/celly` 处（3840 宽上斜率 -1.37%/px、屏幕右端差 40px）。
+    这个偏移与**运动方向无关**，却会被当成"往某一边滑有滞后" -> test_no_screen_offset。
 """
 import os
 os.environ.setdefault("DESKTOP_FX_NOWINDOW", "1")
@@ -318,7 +321,10 @@ def test_click_expands():
     peak1, _, _, r1 = _blob(p)
     if r1 < r0 * 1.35:
         return False, f"点击后没有扩散：半径 {r0:.1f} -> {r1:.1f} 格（应 >1.35×）"
-    if r_mid < r0 * 1.15 or r1 < r_mid * 1.05:
+    # 阈值 1.02 而不是 1.05：指针注入挪到平流之前后，冲击**当帧**就参与搬运，
+    # 扩散在头 0.25s 内完成大部分（实测 13.3 -> 17.6 -> 18.4），后段只剩 4.5%。
+    # 判据仍然要求"继续长大"，只是不再要求后段还有 5% 的幅度。
+    if r_mid < r0 * 1.15 or r1 < r_mid * 1.02:
         return False, (f"扩散不是持续长大：{r0:.1f} -> {r_mid:.1f} -> {r1:.1f} 格")
     if peak1 > peak0:
         return False, f"扩散后峰值反而升高（{peak0:.3f} -> {peak1:.3f}）"
@@ -356,6 +362,55 @@ def test_no_burst_without_click():
     if p.dye.max() != 0.0:
         return False, f"没点击却在原地留下了颜料（峰值 {p.dye.max():.4f}）"
     return True, "指针静止 200 帧且从不点击：场里干干净净"
+
+
+def test_no_screen_offset():
+    """屏幕上的颜料质心必须落在鼠标处 —— 不允许存在"固定偏移"。
+
+    这是本效果最隐蔽的一类 bug：落色时用 `px / cell` 换算成格，上屏时又按
+    `w / gw` 换算回来，而两个轴的格尺寸**并不相等**（gw / gh 各自取整、还各自
+    取偶）。混用后颜料会被整体显示在 `px * cellx / celly` 处 —— 一个**与运动
+    方向无关**的固定横向偏移（3840x1200 上屏幕右端能到 35px，1080p 只有 2px）。
+
+    人眼对这种偏移的误读非常一致："往左滑时鼠标会追进颜色区、觉得跟手；
+    往右滑就被甩开、觉得滞后" —— 于是它会被当成"方向性滞后"报上来，而按
+    运动方向去找是找不到的。
+
+    判据取**偏移随屏幕位置的斜率**（即比例误差），不是某个单点的绝对偏移：
+    比例误差在屏幕中心只有零点几像素、到右端才放大，只看中心那一处必然漏掉。
+    实测把 x 方向换算退回用 cell（即修复前的写法），斜率立刻变成 -1.37%/px、
+    三点偏移 -13.9 / -26.4 / -40.2px。
+    """
+    W, H = 3840, 1200
+    cfg = paint_cfg(paint_swirl=0.0, paint_glow=0.0, paint_diffusion=0.0,
+                    paint_click=0.3)
+    xs = [W * 0.25, W * 0.5, W * 0.75]
+    offs = []
+    cell = float(H) / float(PaintField(W, H, seed=1).gh)
+    for px_ in xs:
+        p = _new(W, H, cfg)
+        buf, u32 = _fresh(W, H)
+        _drive(p, cfg, 40, _const(px_, H * 0.5), click_at=(0,))
+        u32[:] = 0
+        p.draw(u32, W, H, cfg)
+        a = buf[..., 3].astype(np.float32)
+        m = float(a.sum())
+        if m <= 0.0:
+            return False, f"x={px_:.0f} 处点击后屏幕上没有任何像素"
+        bx = float((a.sum(axis=0) * np.arange(W)).sum() / m)
+        offs.append(bx - px_)
+    xs = np.asarray(xs, np.float64)
+    offs = np.asarray(offs, np.float64)
+    slope = float(np.polyfit(xs, offs, 1)[0])
+    if abs(slope) > 0.004:
+        return False, ("屏幕上的颜料有比例性偏移："
+                       f"斜率 {slope * 100:+.3f}%/px（应 <0.4%），"
+                       f"三点偏移 {', '.join('%+.1f' % v for v in offs)}px")
+    if float(np.abs(offs).max()) > 0.5 * cell:
+        return False, (f"颜料偏离鼠标过多：{', '.join('%+.1f' % v for v in offs)}px"
+                       f"（半格 = {0.5 * cell:.1f}px）")
+    return True, (f"三点偏移 {', '.join('%+.1f' % v for v in offs)}px，"
+                  f"斜率 {slope * 100:+.3f}%/px（半格 {0.5 * cell:.1f}px）")
 
 
 def test_core_follows_cursor():
@@ -915,6 +970,7 @@ def main():
         test_click_expands,
         test_click_knob,
         test_no_burst_without_click,
+        test_no_screen_offset,
         test_core_follows_cursor,
         test_brush_scales_stroke,
         test_flow_scales_density,

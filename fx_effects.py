@@ -1598,7 +1598,15 @@ class PaintField:
         gh -= gh % 2
         self.w, self.h = w, h
         self.gh, self.gw = gh, gw
-        self.cell = float(h) / float(gh)                    # 方格：w/gw == h/gh
+        # 格尺寸**必须分轴算**：gw/gh 是各自取整（还取偶）出来的，
+        # `w/gw` 和 `h/gh` 并不严格相等。1080p 差 0.23%、3840x1200 差 1.4%
+        # （3840 宽屏上屏幕右端能差出 ~49px）。
+        # 只用 cell 换算 x 的话，颜料会被整体显示在 `px * cellx/celly` 处
+        # —— 一个与运动方向无关的**固定横向偏移**（1080p 偏左 2px、
+        # 3840x1200 偏左 26px）。人眼在"往左滑"时鼠标会追进颜色区、觉得跟手，
+        # 往右滑就被甩开、觉得"滞后"，正是这个固定偏移造成的假象。
+        self.cell = float(h) / float(gh)                    # y 向格尺寸
+        self.cellx = float(w) / float(gw)                   # x 向格尺寸
         self.r_base = max(1.5, self._R_NORM * float(min(w, h)) / max(self.cell, 1e-6))
         self.dye = np.zeros((gh, gw, 3), np.float32)
         self._dye2 = np.zeros((gh, gw, 3), np.float32)   # 平流双缓冲，免每帧分配
@@ -1612,8 +1620,13 @@ class PaintField:
         self._dh, self._dw = dh, dw
         # 上屏放大用的索引（最近邻）。放大的两步必须"先 x 后 y"，
         # 见 draw() 里的说明。
-        self._iy = (np.arange(h, dtype=np.int32) * dh // h)
-        self._ix = (np.arange(w, dtype=np.int32) * dw // w)
+        #
+        # **用四舍五入，不要整除（floor）**：显示格 t 代表的是屏幕区间中心
+        # `t*w/dw` 处的值（_rs_table 也是按"目标像素中心 -> 源坐标"取的），
+        # floor 会把屏幕 x 归到区间左端，两者口径差半格 —— 实测这个半格带来
+        # +2.6px 的固定偏移（1080p），四舍五入后收到 +0.9px，且与 _rs_table 口径一致。
+        self._iy = (np.arange(h, dtype=np.int32) * dh + h // 2) // h
+        self._ix = (np.arange(w, dtype=np.int32) * dw + w // 2) // w
         self._rsy = _rs_table(gh, self.up)
         self._rsx = _rs_table(gw, self.up)
         self._bu, self._bv = self._make_basis(gh, gw)
@@ -1743,13 +1756,17 @@ class PaintField:
                     radial=self._CLICK_PUSH * click)
 
     def _pointer(self, dt, cfg):
-        """把这一帧的光标轨迹翻译成"落色 + 推流"。"""
+        """把这一帧的光标轨迹翻译成"落色 + 推流"。
+
+        x 与 y 分别用 `cellx` / `cell` 换算成格 —— 两个轴的格尺寸并不相等
+        （见 _build 里的说明），混用会让颜料在屏幕上偏移固定的几个像素。
+        """
         ptr = self._in
         if ptr is None:
             return
         px, py, clicked = ptr
         self._in = None                       # 一个位置只消费一次
-        gx = px / self.cell
+        gx = px / self.cellx
         gy = py / self.cell
         gw, gh = self.gw, self.gh
 
@@ -1865,7 +1882,25 @@ class PaintField:
         gh, gw = self.gh, self.gw
         swirl = float(np.clip(cfg.get("paint_swirl", 1.0), 0.0, 3.0))
 
-        # 1) 时间权重混合出本帧的基流（每帧只此一笔，三角函数早已烘好）
+        # 1) 色相相位随**时间**缓慢自转：手停着不动，颜色也会慢慢飘
+        spread = float(np.clip(cfg.get("paint_hue_spread", 0.5), 0.0, 1.0))
+        self._hue_ph = (self._hue_ph + dt * self._HUE_HZ * spread) % 1.0
+
+        # 2) 指针冲量场：先按固定时间常数衰减 + 轻微扩散（把"手"的运动抹开一点）
+        decay = float(np.exp(-dt / self._IMP_TAU))
+        self._iu *= np.float32(decay)
+        self._iv *= np.float32(decay)
+        _smooth5(self._iu, 0.22, 1)
+        _smooth5(self._iv, 0.22, 1)
+        self._imp_k = 1.0 - decay
+
+        # 3) 指针注入（染料 + 冲量）。**必须在平流之前**：放到最后的话本帧
+        #    落下的颜料与本帧的冲量都要等下一帧才生效，凭空多出一帧延迟 ——
+        #    600px/s 下是 10px、2400px/s 下是 40px 的"落后"，而且是纯延迟。
+        self._pointer(dt, cfg)
+
+        # 4) 时间权重混合出本帧的基流（每帧只此一笔，三角函数早已烘好），
+        #    再叠加刚注入的指针冲量
         wt = 0.5 + 0.5 * np.sin(TAU * np.float32(self._t) * self._om + self._phase)
         bu, bv = self._bu, self._bv
         u = bu[0] * wt[0]
@@ -1875,18 +1910,10 @@ class PaintField:
             v += bv[i] * wt[i]
         u *= np.float32(swirl * self._FLOW)
         v *= np.float32(swirl * self._FLOW)
-
-        # 2) 指针冲量场：按固定时间常数衰减 + 轻微扩散（把"手"的运动抹开一点）
-        decay = float(np.exp(-dt / self._IMP_TAU))
-        self._iu *= np.float32(decay)
-        self._iv *= np.float32(decay)
-        _smooth5(self._iu, 0.22, 1)
-        _smooth5(self._iv, 0.22, 1)
-        self._imp_k = 1.0 - decay
         u += self._iu
         v += self._iv
 
-        # 3) 平流 -> 颜料被拉出丝（流体的灵魂，不能省）
+        # 5) 平流 -> 颜料被拉出丝（流体的灵魂，不能省）
         #    只算"有颜料的格子"那块：本帧速度决定了颜料最远能搬多远，那就是余量。
         #    画面干净时 box 为 None -> 整段跳过，空闲帧几乎不花钱。
         pad = 2 + int(np.ceil(max(float(np.abs(u).max()) * gw,
@@ -1899,7 +1926,7 @@ class PaintField:
         # 那一份上 —— 新数组永不衰减，颜料会无限堆积（踩过）。
         dye = self.dye
 
-        # 4) 晕染 + 消隐。两者都必须按 dt 缩放：写成"每帧固定糊一下 / 减一点"
+        # 6) 晕染 + 消隐。两者都必须按 dt 缩放：写成"每帧固定糊一下 / 减一点"
         #    的话，60fps 下等于每秒 60 次，十几秒后颜料摊成整屏均匀色糊。
         diff = float(np.clip(cfg.get("paint_diffusion", 0.35), 0.0, 1.0))
         if diff > 0.0:
@@ -1909,12 +1936,6 @@ class PaintField:
         dye *= np.float32(np.exp(-fade * dt))
         np.clip(dye, 0.0, self._DYE_CLAMP, out=dye)
 
-        # 5) 色相随**时间**缓慢自转：手停着不动，颜色也会慢慢飘
-        spread = float(np.clip(cfg.get("paint_hue_spread", 0.5), 0.0, 1.0))
-        self._hue_ph = (self._hue_ph + dt * self._HUE_HZ * spread) % 1.0
-
-        # 6) 光标注入放在最后：本帧刚落的颜料不该再被本帧的消隐/晕染打折
-        self._pointer(dt, cfg)
 
     # ------------------------------------------------------------ 绘制
     def _bloom(self, d):

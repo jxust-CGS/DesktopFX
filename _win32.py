@@ -153,6 +153,9 @@ def patch_libs():
     gdi32.CreateDIBSection.restype = HBITMAP
     gdi32.CreateDIBSection.argtypes = [HDC, ctypes.c_void_p, UINT,
                                        ctypes.c_void_p, HANDLE, DWORD]
+    # GetPixel 返回 COLORREF(0x00BBGGRR)，失败给 CLR_INVALID=0xFFFFFFFF
+    gdi32.GetPixel.restype = UINT
+    gdi32.GetPixel.argtypes = [HDC, INT, INT]
     # ---------- USER32
     user32.GetSystemMetrics.restype = INT
     user32.GetSystemMetrics.argtypes = [INT]
@@ -256,3 +259,28 @@ def patch_libs():
 
 
 user32, gdi32, shell32, kernel32 = patch_libs()
+
+
+def screen_pixel(x, y):
+    """读屏幕上某点的颜色，返回 (r, g, b)；读不到返回 None。
+
+    - `GetDC(NULL)` 拿到的是**整个虚拟桌面**的 DC（所有显示器都在内），
+      坐标与 `GetCursorPos` 同一套物理像素（进程声明了 PER_MONITOR_AWARE_V2）。
+    - 返回值是 COLORREF = `0x00BBGGRR`，**BGR 序** —— 按 RGB 解会把红蓝弄反。
+    - 这是"屏幕取色器"的底层：读的是 DWM 合成后**真正显示在屏幕上**的颜色，
+      所以覆盖层、壁纸、任何窗口的颜色都能取到。
+    """
+    if user32 is None or gdi32 is None:
+        return None
+    hdc = user32.GetDC(None)
+    if not hdc:
+        return None
+    try:
+        v = int(gdi32.GetPixel(hdc, int(x), int(y)))
+    except Exception:
+        return None
+    finally:
+        user32.ReleaseDC(None, hdc)
+    if v == 0xFFFFFFFF:
+        return None
+    return (v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF)

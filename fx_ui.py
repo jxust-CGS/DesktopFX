@@ -10,7 +10,7 @@ import json
 import os
 import tkinter as tk
 
-from _win32 import user32, HANDLE, HWND, INT, UINT, hwnd_int
+from _win32 import user32, HANDLE, HWND, INT, UINT, hwnd_int, screen_pixel
 from _paths import app_root
 
 # ------------------------------------------------------------------ 设计系统
@@ -630,9 +630,13 @@ class ControlPanel:
         canvas.bind("<Configure>",
                     lambda e: (canvas.itemconfig(win, width=e.width),
                                canvas.configure(scrollregion=canvas.bbox("all"))))
-        _on_wheel = lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
-        canvas.bind("<MouseWheel>", _on_wheel)
-        inner.bind("<MouseWheel>", _on_wheel)
+        # 滚轮只绑在 canvas / inner 上是**不够**的：Tk 把滚轮事件发给光标正下方
+        # 那个控件，不会冒泡到父容器 —— 鼠标停在页面里的卡片、滑块上时毫无反应，
+        # 配置项一多，下面的"预设方案"就永远滚不到（颜料盘页踩过）。
+        # 改成 bind_all + 归属判断：只有事件来自内容区才滚，对话框不受影响。
+        canvas.bind("<MouseWheel>", self._on_wheel)
+        inner.bind("<MouseWheel>", self._on_wheel)
+        root.bind_all("<MouseWheel>", self._on_wheel)
         self._canvas = canvas
         self._inner = inner
 
@@ -690,6 +694,15 @@ class ControlPanel:
             w.bind("<Enter>", _enter)
             w.bind("<Leave>", _leave)
         self._nav[name] = {"frame": b, "label": txt, "line": line, "icon": icon}
+
+    def _on_wheel(self, e):
+        """内容区滚轮。挂在 bind_all 上接收，但要判断事件来自哪 ——
+        否则"保存为预设"对话框里滚动会把背后的页面一起滚走。"""
+        w = e.widget
+        while w is not None:
+            if w is self._canvas:
+                return self._canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+            w = getattr(w, "master", None)
 
     def _show_page(self, name):
         for n, f in self._pages.items():
@@ -1011,10 +1024,6 @@ class ControlPanel:
     def _page_paint(self, parent):
         p = tk.Frame(parent, bg=BG)
         self._page_head(p, "颜料盘")
-        tk.Label(p, text="鼠标滑过处搅动颜料，点击炸开一圈扩散；\n"
-                         "停手后颜料自行涡旋、消散，屏幕重新变干净。",
-                 bg=BG, fg=SUB, font=FONT_SMALL, justify="left",
-                 anchor="w").pack(fill="x", padx=16, pady=(0, 8))
         c = tk.Frame(p, bg=CARD)
         c.pack(fill="x", padx=16, pady=(0, 8))
         self._toggle(c, "启用颜料盘", "paint_enabled")
@@ -1123,7 +1132,6 @@ class ControlPanel:
             val.config(text=fmt.format(v))
 
         val = tk.Label(f, text="", bg=CARD, fg=ACCENT, font=FONT_NUM)
-        val = tk.Label(f, text="", bg=CARD, fg=ACCENT, font=FONT_NUM)
         _Slider(f, lo, hi, res, var, command=on,
                 width=120).grid(row=0, column=1, sticky="ew", padx=(14, 10))
         val.grid(row=0, column=2, sticky="e")
@@ -1147,6 +1155,18 @@ class ControlPanel:
                          bd=2 if sel else 0,
                          fg=ACCENT if sel else TEXT)
 
+        # 预设色块之外再给两个入口：取色（吸管，抓屏幕上任意一点）与
+        # 调色（系统调色板，任意 RGB）。放在最右，色块顺势左移。
+        for txt, cmd in (("调色", lambda k=key: self._choose_color(k)),
+                         ("取色", lambda k=key: self._pick_screen_color(k))):
+            bb = tk.Button(f, text=txt, width=3, height=1, bd=0, relief="flat",
+                           bg=BTN, fg=SUB, font=FONT_SMALL, cursor="hand2",
+                           activebackground=BTN_H, activeforeground=TEXT,
+                           command=cmd)
+            bb.pack(side="right", padx=(6, 0))
+            bb.bind("<Enter>", lambda e, w=bb: w.config(bg=BTN_H, fg=TEXT))
+            bb.bind("<Leave>", lambda e, w=bb: w.config(bg=BTN, fg=SUB))
+
         for c in colors:
             b = tk.Button(f, bg=c, width=2, height=1, bd=0, relief="flat",
                           cursor="hand2",
@@ -1156,6 +1176,51 @@ class ControlPanel:
             btns.append(b)
         refresh()
         self._swatches[key] = refresh
+
+    def _choose_color(self, key):
+        """系统调色板：任意 RGB 都能选（预设色块只有 6 个，覆盖不到）。"""
+        from tkinter import colorchooser
+        cur = str(self.app.cfg.get(key, "#FFFFFF"))
+        _rgb_t, hexs = colorchooser.askcolor(color=cur, title="选择颜色",
+                                             parent=self.root)
+        if hexs:
+            self.app.set(key, hexs.upper())
+            self._sync_from_cfg()
+
+    def _pick_screen_color(self, key):
+        """屏幕取色器：藏起面板 -> 3 秒后读光标处的像素 -> 回填。
+
+        必须先 `hide()`：面板自己就压在屏幕上，不藏起来读到的是面板的颜色。
+        留 3 秒是给用户把鼠标移到目标颜色的时间，到点轻响一声再取。
+        """
+        if getattr(self, "_picking", False):
+            return
+        self._picking = True
+        self.hide()
+
+        def _beep():
+            try:
+                import winsound
+                winsound.Beep(1000, 70)
+            except Exception:
+                pass
+
+        def _grab():
+            try:
+                pt = wt.POINT()
+                if user32.GetCursorPos(ctypes.byref(pt)):
+                    got = screen_pixel(pt.x, pt.y)
+                    if got:
+                        self.app.set(key, "#%02X%02X%02X" % got)
+            except Exception:
+                pass
+            finally:
+                self._picking = False
+                self.show()
+                self._sync_from_cfg()
+
+        self.root.after(2600, _beep)
+        self.root.after(3000, _grab)
 
     # ------------------------------------------------------------ 交互
     def _preset(self, name):

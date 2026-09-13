@@ -91,9 +91,50 @@ def main():
     # 4) 「记忆上次」持久化：切页后 _load_last_page 应回读为「下雨」
     assert p._load_last_page() == "下雨", p._load_last_page()
 
-    # 4) 滚动区域存在且滚动命令可用
-    p._canvas.yview_scroll(1, "units")
-    p._canvas.yview_moveto(0)
+    # 5) 滚轮必须对页面内的**子控件**也生效。
+    #    只把 <MouseWheel> 绑在 canvas / inner 上是抓不到的：Tk 把滚轮事件发给
+    #    光标正下方那个控件，并不会冒泡给父容器 —— 鼠标停在卡片、滑块上滚时
+    #    完全没反应。颜料盘页配置项最多，之前就是它下面的"预设方案"永远滚不到。
+    p._show_page("颜料盘")
+    p.root.update_idletasks()
+    p._canvas.yview_moveto(0.0)
+    deep = p._pages["颜料盘"]
+    for _ in range(6):
+        kids = deep.winfo_children()
+        if not kids:
+            break
+        deep = kids[0]
+    assert "all" in deep.bindtags(), ("滚轮没挂到全局绑定上", deep.bindtags())
+    before = p._canvas.yview()[0]
+    deep.event_generate("<MouseWheel>", delta=-120)
+    p.root.update()
+    assert p._canvas.yview()[0] > before, (
+        f"滚轮在子控件上没生效：yview {before} -> {p._canvas.yview()[0]}")
+
+    # 6) 每个颜色项都要有"调色"（系统调色板）与"取色"（屏幕吸管）两个入口
+    btns = set()
+
+    def _walk(w):
+        for c in w.winfo_children():
+            try:
+                if c.winfo_class() == "Button":
+                    btns.add(c.cget("text"))
+            except Exception:
+                pass
+            _walk(c)
+
+    _walk(p._pages["颜料盘"])
+    for txt in ("调色", "取色"):
+        assert txt in btns, (f"颜料盘页缺少「{txt}」按钮", sorted(btns))
+    assert p._swatches, "一个颜色项都没注册"
+    for key, refresh in p._swatches.items():
+        assert callable(refresh), key
+
+    # 7) 屏幕取色的底层读点必须可用且返回合法色值
+    from _win32 import screen_pixel
+    got = screen_pixel(0, 0)
+    assert got is None or (len(got) == 3 and all(0 <= v <= 255 for v in got)), got
+    assert screen_pixel(-4, -4) is None, "越界坐标应当返回 None"
 
     p.root.destroy()
     # 清理测试写出的 UI 状态文件，避免污染实机默认页
