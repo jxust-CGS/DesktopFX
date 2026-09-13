@@ -145,6 +145,31 @@ def _hues(r, g, b):
                                          b[i] / 255.0)[0] for i in range(r.size)])
 
 
+def _cell_variation(buf, p):
+    """一个**模拟格**内部的像素标准差（全部格子取平均）。
+
+    这是"方格纸"最直接的判据：最近邻上屏时，同一模拟格映射出的所有屏幕像素
+    必然是同一个值（标准差恒为 0）；做过双线性放大之后，格内就有了渐变。
+
+    不要用"格子边界处的梯度集中度"来判 —— 双线性插值出来的曲面本身就是分段
+    线性的，梯度同样是逐格跳跃，那个指标对两种做法都"报警"，分不开。
+    """
+    a = buf[..., 3].astype(np.float32)
+    gh, gw, f = p.gh, p.gw, p.up
+    ry = (p._iy // f).astype(np.int64)
+    rx = (p._ix // f).astype(np.int64)
+    cid = (ry[:, None] * gw + rx[None, :]).reshape(-1)
+    v = a.reshape(-1)
+    n = np.bincount(cid, minlength=gh * gw).astype(np.float64)
+    s1 = np.bincount(cid, weights=v, minlength=gh * gw)
+    s2 = np.bincount(cid, weights=v * v, minlength=gh * gw)
+    ok = n > 4
+    if not ok.any():
+        return float("nan")
+    var = np.maximum(s2[ok] / n[ok] - (s1[ok] / n[ok]) ** 2, 0.0)
+    return float(np.sqrt(var).mean())
+
+
 def _circ_span(h):
     """色相的环形跨度（0~1）。"""
     if h.size < 2:
@@ -553,6 +578,75 @@ def test_shading_modulates_brightness():
                   f"（{int(m.sum())} 像素，均值 {a0[m].mean():.0f} -> {a1[m].mean():.0f}）")
 
 
+def test_no_grid_artifact():
+    """上屏不能出现"方格纸"。
+
+    模拟网格短边只有 ~110（格子 ~10px @1080p），直接最近邻铺到屏幕上就是满屏
+    10px 硬方块。现在先在模拟网格上做**双线性**放大到"显示网格"再铺屏。
+
+    判据：同一模拟格内部的像素标准差。最近邻必然恒为 0（整格同色 = 方块），
+    双线性则会有明显渐变。测试必须带**对照组**（_BLOCK_PX 顶到天上逼出 up=1
+    走旧的最近邻路径），确认判据在那条路径上确实读到 0 —— 否则判据是聋的。
+    """
+    W, H = 1920, 1080
+    # 用默认的浓度/落色量：把浓度压低反而会让整片颜料都很平，格内差异被抹掉，
+    # 判据变得没信号（实测 0.08 vs 0.58）。
+    base = paint_cfg(paint_glow=0.0, paint_shading=0.0)
+    saved = PaintField._BLOCK_PX
+    out = {}
+    try:
+        for tag, bp in (("nearest", 1.0e9), ("smooth", saved)):
+            PaintField._BLOCK_PX = bp
+            p = _new(W, H, base)
+            _drive(p, base, 80, _line(200.0, 400.0, 1700.0, 640.0, 80))
+            _drive(p, base, 4, _const(1700.0, 640.0))
+            buf, _ = _draw(p, base, W, H)
+            out[tag] = (_cell_variation(buf, p), p.up, H / float(p._dh))
+    finally:
+        PaintField._BLOCK_PX = saved
+    if not (out["nearest"][0] < 0.05):
+        return False, (f"对照组（最近邻）的格内方差不是 0：{out['nearest'][0]:.3f}"
+                       f" —— 判据不成立，不能用来宣称「已修好」")
+    if out["smooth"][0] < 0.30:
+        return False, (f"格内仍然近乎恒定（{out['smooth'][0]:.3f}），方格症状还在："
+                       f"最近邻对照组 {out['nearest'][0]:.3f}")
+    return True, (f"一个模拟格内的像素标准差：最近邻 up=1 {out['nearest'][0]:.3f}"
+                  f"（整格同色 = 方块）-> 双线性 up={out['smooth'][1]} "
+                  f"{out['smooth'][0]:.3f}（格边长 "
+                  f"{out['nearest'][2]:.1f}px -> {out['smooth'][2]:.1f}px）")
+
+
+def test_cost_scales_with_area():
+    """draw 的成本必须随颜料面积走 —— 这是包围盒裁剪存在的理由。"""
+    W, H = 1920, 1080
+    cfg = paint_cfg()
+    tiny = _new(W, H, cfg)
+    _drive(tiny, cfg, 20, _line(300.0, 540.0, 520.0, 560.0, 20))
+    full = _new(W, H, cfg)
+    for i in range(90):
+        full.set_pointer(120.0 + i * 20.0, 540.0 + 300.0 * np.sin(i / 9.0), 0)
+        full.update(1.0 / 60.0, cfg)
+    for _ in range(6):
+        full.set_pointer(960.0, 540.0, 0)
+        full.update(1.0 / 60.0, cfg)
+    u32 = _fresh(W, H)[1]
+
+    def bench(p, n=25):
+        for _ in range(5):
+            p.draw(u32, W, H, cfg)
+        t0 = time.perf_counter()
+        for _ in range(n):
+            p.draw(u32, W, H, cfg)
+        return (time.perf_counter() - t0) / n * 1000.0
+
+    a = bench(tiny)
+    b = bench(full)
+    if a > b * 0.5:
+        return False, (f"小笔触的 draw({a:.2f}ms) 相对满屏({b:.2f}ms) 没有明显便宜，"
+                       f"包围盒可能失效")
+    return True, (f"一小笔 {a:.2f} ms vs 满屏 {b:.2f} ms（便宜 {b / max(a, 1e-6):.1f}×）")
+
+
 def test_resize():
     cfg = paint_cfg()
     p = _new(1280, 720, cfg)
@@ -718,11 +812,13 @@ def test_perf_budget():
     # 硬门槛：空场必须是免费档（"颜料稀疏"是整个改动的前提）
     if idle > 1.0:
         return False, f"空场 draw 仍要 {idle:.2f} ms（应该≈0，说明裁剪没生效）"
-    # 满屏颜料是最坏情况；它随机器当前负载波动很大（本机 8MB memcpy 在
-    # 0.5~5ms 之间跳），所以只设一个"明显病态"的硬上限 + 常规档位给警告。
-    if busy > 60.0:
-        return False, f"拖动中 {busy:.1f} ms/帧（病态，超过 60ms 硬上限）"
-    note = "" if busy <= 26.0 else "  [WARN] 高于 26ms 常规预算（当前机器负载偏高）"
+    # 满屏颜料是最坏情况（双线性放大把上屏成本抬了约 3 倍，换来的是没有方格纸）。
+    # 这个数字随机器当前负载波动极大（本机 8MB memcpy 在 0.5~5ms 之间跳），
+    # 所以只设一个"明显病态"的硬上限 + 常规档位给警告；真正的硬断言是上面
+    # 的"空场 draw ≈ 0"和 test_cost_scales_with_area 的"随面积缩放"。
+    if busy > 110.0:
+        return False, f"拖动中 {busy:.1f} ms/帧（病态，超过 110ms 硬上限）"
+    note = "" if busy <= 40.0 else "  [WARN] 高于 40ms 常规预算（当前机器负载偏高）"
     return True, (f"拖动中 update+draw {busy:.1f} ms/帧、空场 draw {idle:.3f} ms"
                   f"（1080p 单层）{note}")
 
@@ -750,7 +846,9 @@ def main():
         test_glow_widens_halo,
         test_shading_modulates_brightness,
         test_resize,
+        test_no_grid_artifact,
         test_grid_budget,
+        test_cost_scales_with_area,
         test_spotlight_composite,
         test_scene_step,
         test_combo_with_rain_snow,

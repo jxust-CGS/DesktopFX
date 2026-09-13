@@ -73,6 +73,28 @@ def _smooth5(a, k, passes=1):
                           + a[1:-1, :-2] + a[1:-1, 2:]) - c)
 
 
+def _rs_table(g, f):
+    """整数倍双线性放大的取样表：把长度 g 的轴放大 f 倍。
+
+    返回 (i0, i1, w)，于是 `out = a[i0] + (a[i1] - a[i0]) * w` 就是双线性插值。
+    权值以 f 为周期重复，所以整张表只在建网格时算一次，每帧只做两次 take。
+
+    为什么必须有这一步：上屏是**最近邻**采样，模拟网格（短边 ~110、格子 ~10px）
+    直接铺到屏幕上，每个格子就是一块 10px 的硬方块 —— 满屏"方格纸"。
+    参考实例（WebGL Fluid）的染料纹理是 1024 宽（约半个屏宽）所以丝滑；CPU 上把
+    模拟网格提到那个量级要付出 20 倍平流开销，不划算。改成先在**模拟网格上**做
+    双线性放大到"显示网格"，再由最近邻铺屏：插值后的曲面是连续的，硬边消失，
+    残留的只是格子边界处的一阶不连续（肉眼几乎不可见）。
+    """
+    t = np.arange(g * f, dtype=np.float32)
+    u = (t + 0.5) / float(f) - 0.5          # 目标像素中心 -> 源坐标
+    i0 = np.floor(u)
+    np.clip(i0, 0.0, float(g - 1), out=i0)
+    i1 = np.minimum(i0 + 1.0, float(g - 1))
+    w = np.clip(u - i0, 0.0, 1.0)
+    return (i0.astype(np.int32), i1.astype(np.int32), w.astype(np.float32))
+
+
 def _hsv_to_rgb(h, s, v):
     """向量化 HSV->RGB（h/s/v ∈ [0,1]，任意同形状数组）。返回 (r, g, b)。"""
     h = np.mod(h, 1.0) * 6.0
@@ -1529,6 +1551,9 @@ class PaintField:
     _IMP_TAU = 0.22              # 指针/点击冲量场的时间常数（秒）
     _FOLLOW = 0.55               # 稳态下"流场跟随指针"的比例（见 _pointer 的推导）
     _FADE_MIN, _FADE_MAX = 0.15, 1.10   # 消隐速率 1/s（对应 paint_fade 0~1）
+    _BLOCK_PX = 4.0              # 上屏后允许的最大格子边长；显示网格 = 模拟网格 × up
+    _HUE_HZ = 0.5                # 色相自转（圈/秒）× paint_hue_spread
+    _HUE_PER_SCREEN = 1.1        # 指针划过一屏宽推进的色相（圈）× paint_hue_spread
     _R_NORM = 0.042              # 笔刷半径基准（屏幕短边比例），乘 paint_brush
     _AMP = 0.18                  # 单团峰值浓度基准，乘 paint_flow
     _CLICK_PUSH = 6.00           # 点击径向冲量峰值（屏宽/秒），乘 paint_click
@@ -1547,6 +1572,7 @@ class PaintField:
         self._imp_k = 0.1            # 本帧的冲量注入系数（update 里按 dt 算）
         self._hue = 0.96             # 基准色相（#FF4D6D 的 hsv.h）
         self._sat = 0.70
+        self._hue_ph = 0.0           # 色相漂移相位（时间 + 指针行程共同推进）
         self._hue_src = None
         self._om = np.array((0.0105, 0.0172, 0.0251), np.float32)
         self._in = None              # 本帧指针（覆盖层屏幕坐标）
@@ -1577,13 +1603,20 @@ class PaintField:
         self._iv = np.zeros((gh, gw), np.float32)
         self._ys = np.arange(gh, dtype=np.float32)[:, None]
         self._xs = np.arange(gw, dtype=np.float32)[None, :]
+        # 显示网格 = 模拟网格 × up（up 倍双线性放大后再上屏，见 _rs_table）
+        self.up = int(np.clip(np.ceil(self.cell / self._BLOCK_PX), 1, 3))
+        dh, dw = gh * self.up, gw * self.up
+        self._dh, self._dw = dh, dw
         # 上屏放大用的索引（最近邻）。放大的两步必须"先 x 后 y"，
         # 见 draw() 里的说明。
-        self._iy = (np.arange(h, dtype=np.int64) * gh // h)
-        self._ix = (np.arange(w, dtype=np.int64) * gw // w)
+        self._iy = (np.arange(h, dtype=np.int32) * dh // h)
+        self._ix = (np.arange(w, dtype=np.int32) * dw // w)
+        self._rsy = _rs_table(gh, self.up)
+        self._rsx = _rs_table(gw, self.up)
         self._bu, self._bv = self._make_basis(gh, gw)
         self._phase = self.rng.uniform(0.0, TAU, self._BASIS).astype(np.float32)
         self._t = 0.0
+        self._hue_ph = 0.0
         self._in = None
         self._ouse = None
         self._dirty = False
@@ -1650,13 +1683,16 @@ class PaintField:
         self._in = (float(x), float(y), int(clicked))
 
     # ------------------------------------------------------------ 落笔
-    def _stroke_color(self, cfg):
-        """落笔颜色：基准色相 ± hue_spread/2。每帧重掷一次，一笔里自然变色。"""
-        spread = float(np.clip(cfg.get("paint_hue_spread", 0.5), 0.0, 1.0)) * 0.5
-        h = self._hue + spread * float(self.rng.uniform(-1.0, 1.0))
-        s = float(min(1.0, self._sat * self.rng.uniform(0.85, 1.12)))
-        r, g, b = _hsv_to_rgb(np.array([h], np.float32),
-                              np.array([s], np.float32),
+    def _stroke_color(self):
+        """当前落笔颜色：基准色相 + `_hue_ph` 的**连续**漂移。
+
+        刻意不用"每帧掷一次随机色相"：相邻帧的互补色相叠加起来会互相抵消，
+        整片颜料变成灰白噪声，看着是"颜色在抖"而不是"颜色在流动"。改成一个连续
+        推进的相位后，一笔拖过去就是一条色相渐变的彩带，停手时颜色也还在缓慢
+        转 —— 这才是"颜色飘动"。（参考实例是每 1/10 秒整体换一次满饱和色。）
+        """
+        r, g, b = _hsv_to_rgb(np.array([self._hue + self._hue_ph], np.float32),
+                              np.array([self._sat], np.float32),
                               np.ones(1, np.float32))
         return np.array((float(r[0]), float(g[0]), float(b[0])), np.float32)
 
@@ -1698,7 +1734,7 @@ class PaintField:
         if click <= 0.0:
             return
         self._splat(gx, gy, r * 2.0, self._AMP * 2.4 * flow,
-                    self._stroke_color(cfg),
+                    self._stroke_color(),
                     radial=self._CLICK_PUSH * click)
 
     def _pointer(self, dt, cfg):
@@ -1734,6 +1770,11 @@ class PaintField:
         if dist > float(np.hypot(gw, gh)) * self._TELEPORT:
             return                            # 光标瞬移：只重新对位，不拉一条长线
 
+        # 色相随行程推进：拖得越远颜色走得越远 -> 一笔就是一条渐变彩带
+        spread = float(np.clip(cfg.get("paint_hue_spread", 0.5), 0.0, 1.0))
+        self._hue_ph = (self._hue_ph
+                        + (dist / float(gw)) * self._HUE_PER_SCREEN * spread) % 1.0
+
         # 沿轨迹按间距采样，连成笔触（和流星拖尾同一个套路：间距 < 直径）
         span = max(0.5, r * self._SPAN)
         k = int(min(self._MAX_STEPS, max(1, np.ceil(dist / span))))
@@ -1751,7 +1792,7 @@ class PaintField:
         vx = dx / float(gw) * inv_dt * a
         vy = dy / float(gh) * inv_dt * a
         amp = self._AMP * flow
-        col = self._stroke_color(cfg)
+        col = self._stroke_color()
         for i in range(k):
             self._splat(float(cx[i]), float(cy[i]), r, amp, col, push=(vx, vy))
 
@@ -1863,7 +1904,11 @@ class PaintField:
         dye *= np.float32(np.exp(-fade * dt))
         np.clip(dye, 0.0, self._DYE_CLAMP, out=dye)
 
-        # 5) 光标注入放在最后：本帧刚落的颜料不该再被本帧的消隐/晕染打折
+        # 5) 色相随**时间**缓慢自转：手停着不动，颜色也会慢慢飘
+        spread = float(np.clip(cfg.get("paint_hue_spread", 0.5), 0.0, 1.0))
+        self._hue_ph = (self._hue_ph + dt * self._HUE_HZ * spread) % 1.0
+
+        # 6) 光标注入放在最后：本帧刚落的颜料不该再被本帧的消隐/晕染打折
         self._pointer(dt, cfg)
 
     # ------------------------------------------------------------ 绘制
@@ -1914,44 +1959,67 @@ class PaintField:
         # 颜料是稀疏的（鼠标划到哪才有），空闲时这里直接返回，整帧零成本。
         # 阈值 1e-3：打包时 a01*255 要四舍五入到 1 需要 a01 ≥ 0.002，
         # 低于阈值的格子渲染出来必然是 0，裁掉不会丢任何可见像素。
+        # 留 2 格余量给双线性（目标格 g 会用源格 g-1）。
         rows = np.flatnonzero(lum.max(axis=1) > self._BBOX_EPS)
         if rows.size == 0:
             return
         cols = np.flatnonzero(lum.max(axis=0) > self._BBOX_EPS)
-        gy0 = max(0, int(rows[0]) - 1)
-        gy1 = min(self.gh, int(rows[-1]) + 2)
-        gx0 = max(0, int(cols[0]) - 1)
-        gx1 = min(self.gw, int(cols[-1]) + 2)
-        # 格子 -> 屏幕：反查 _iy / _ix（单调不减，searchsorted 精确且便宜）
-        y0 = int(np.searchsorted(self._iy, gy0, "left"))
-        y1 = int(np.searchsorted(self._iy, gy1 - 1, "right"))
-        x0 = int(np.searchsorted(self._ix, gx0, "left"))
-        x1 = int(np.searchsorted(self._ix, gx1 - 1, "right"))
-        if y1 <= y0 or x1 <= x0:
-            return
+        gy0 = max(0, int(rows[0]) - 2)
+        gy1 = min(self.gh, int(rows[-1]) + 3)
+        gx0 = max(0, int(cols[0]) - 2)
+        gx1 = min(self.gw, int(cols[-1]) + 3)
 
-        # alpha = 亮度，RGB = 归一化后的色相 -> 颜料像"发光"的而不是一块死色
-        a01 = np.clip(lum, 0.0, 1.0) * op
-        rgb = d / np.maximum(lum, np.float32(1e-5))[..., None]
+        f = self.up
+        if f > 1:
+            # 模拟网格 -> 显示网格（双线性）。两个轴各取两个抽样点按权值线性
+            # 混合；**先 x 后 y** 的理由同下面的上屏放大（结果要保持 C 连续）。
+            # 只对包围盒里的子块做 —— 这也让插值开销随颜料面积走。
+            sy = slice(gy0 * f, gy1 * f)
+            sx = slice(gx0 * f, gx1 * f)
+            qh, qw = gy1 - gy0, gx1 - gx0
+            i0y = np.clip(self._rsy[0][sy] - gy0, 0, qh - 1)
+            i1y = np.clip(self._rsy[1][sy] - gy0, 0, qh - 1)
+            wy = self._rsy[2][sy][:, None, None]
+            i0x = np.clip(self._rsx[0][sx] - gx0, 0, qw - 1)
+            i1x = np.clip(self._rsx[1][sx] - gx0, 0, qw - 1)
+            wx = self._rsx[2][sx][None, :, None]
+            sub = d[gy0:gy1, gx0:gx1]
+            t = np.take(sub, i0x, axis=1)
+            t += (np.take(sub, i1x, axis=1) - t) * wx
+            p3 = np.take(t, i0y, axis=0)
+            p3 += (np.take(t, i1y, axis=0) - p3) * wy
+        else:
+            p3 = d[gy0:gy1, gx0:gx1]
+
+        # 亮通道直接由插值后的颜色取 max：着色是逐通道同一系数，所以
+        # max(插值后的 d) 就是插值后的亮度，还顺带保证 rgb = d/lum ≤ 1。
+        lum2 = np.maximum(np.maximum(p3[..., 0], p3[..., 1]), p3[..., 2])
+        a01 = np.clip(lum2, 0.0, 1.0) * op
+        rgb = p3 / np.maximum(lum2, np.float32(1e-5))[..., None]
         np.clip(rgb, 0.0, 1.0, out=rgb)
         sc = a01 * 255.0
-        ab = np.rint(sc).astype(np.uint32)
-        rb = np.rint(rgb[..., 0] * sc).astype(np.uint32)
-        gb = np.rint(rgb[..., 1] * sc).astype(np.uint32)
-        bb = np.rint(rgb[..., 2] * sc).astype(np.uint32)
+        # +0.5 再 astype 截断 == rint，省掉 4 遍 rint
+        ab = (sc + 0.5).astype(np.uint32)
+        rb = (rgb[..., 0] * sc + 0.5).astype(np.uint32)
+        gb = (rgb[..., 1] * sc + 0.5).astype(np.uint32)
+        bb = (rgb[..., 2] * sc + 0.5).astype(np.uint32)
         small = _premul_pack(bb, gb, rb, ab)
 
+        # ---- 显示网格 -> 屏幕（最近邻）----
         # 上屏放大：**必须先 x 后 y**。
         # numpy 的高级索引会把被索引的那个轴放到结果的最内层，于是
         #   `small[iy][:, ix]` -> 结果按 (W, H) 排布 = Fortran 连续，
         # 赋给 C 连续的 dst 会走"转置拷贝"慢路径（1080p 14.3ms）。
         # 换成先 x 后 y，结果就是 C 连续，赋值只要 1.1ms。
-        # 两步都用 `take` 又比裸 fancy-index 快一截：
-        #   1080p 5.4 -> 4.7ms，3840×1200 15.8 -> 9.8ms。
-        # 这里先按包围盒裁出 sub，再放大 —— 空闲 / 只有一小片颜料时几乎免费。
-        sub = small[gy0:gy1, gx0:gx1]
-        big = np.take(sub, self._ix[x0:x1] - gx0, axis=1)[self._iy[y0:y1] - gy0]
-        dst = u32.reshape(h, w)[y0:y1, x0:x1]
+        dy0 = int(np.searchsorted(self._iy, gy0 * f, "left"))
+        dy1 = int(np.searchsorted(self._iy, gy1 * f - 1, "right"))
+        dx0 = int(np.searchsorted(self._ix, gx0 * f, "left"))
+        dx1 = int(np.searchsorted(self._ix, gx1 * f - 1, "right"))
+        if dy1 <= dy0 or dx1 <= dx0:
+            return
+        big = np.take(small, self._ix[dx0:dx1] - gx0 * f, axis=1)
+        big = big[self._iy[dy0:dy1] - gy0 * f]
+        dst = u32.reshape(h, w)[dy0:dy1, dx0:dx1]
         if cfg.get("spotlight_enabled", False):
             # 聚光灯是整屏图层，不能整片覆盖写 —— 只写真有颜料的像素
             np.copyto(dst, big, where=big != 0)
