@@ -70,17 +70,17 @@ DEFAULTS = {
     "wave_click": True,           # 点击落一大滴
     "wave_ambient": 0.0,          # 每隔多少秒自动滴一滴（0 = 关）
     "wave_light": 225.0,          # 光照来自屏幕哪一侧（0=右 90=下 180=左 270=上）
-    # 下面四项默认取"轻"档：它是一条**叠在桌面上的半透明明暗条纹**，
-    # 提亮/压暗的峰值就是"桌面被改动多少"。旧默认 0.85/0.55/0.90/0.85 会让
-    # 大量像素顶到 0.85 的不透明度（峰 217、p95 也是 217，曲线都被削平了），
-    # 桌面被盖得看不清 —— 用户反馈"对整个桌面观看影响比较大"。
-    # 现在峰值 118 / 均值 21（旧的是 217 / 61），只有原来的 1/3。
-    # 想要更弱或更强，预设里有「微风拂面」到「惊涛」五档可比。
+    # 它是一条**叠在桌面上的半透明明暗条纹**，浓度 = "桌面被盖住多少"。
+    # **浓度硬上限 0.20**（用户要求"浓度限制在 20 以内"，面板滑块也卡在这个上限）——
+    # 旧默认 0.85 时大量像素顶到 0.85 的不透明度（峰 217、p95 也是 217，曲线被削平），
+    # 桌面被盖得看不清。现在默认档 0.14 -> 峰 36 / 均 6。
+    # 想要更弱或更强，预设里有「微风拂面」到「惊涛」五档可比（靠对比度与波的行为拉开，
+    # 浓度一律 ≤ 0.20）。
     "wave_contrast": 0.45,        # 迎光面提亮
-    "wave_shading": 0.26,         # 背光面压暗
-    "wave_highlight": 0.42,       # 浪尖高光
+    "wave_shading": 0.28,         # 背光面压暗
+    "wave_highlight": 0.45,       # 浪尖高光
     "wave_color": "#FFFFFF",      # 高光染色（暗面恒为黑）
-    "wave_opacity": 0.55,
+    "wave_opacity": 0.14,
     "fps": 60.0,
     # ---- 雪（与雨正交的独立特效层）----
     "snow_enabled": False,
@@ -242,42 +242,43 @@ PRESETS = {
     # ---- 窗口水波：桌面像水面，拖动/收起窗口荡开涟漪 ----
     # ---- 真实水波：与「水面」那套彩色圆环是不同实现，可以两边都开来对比。
     # 五档从"几乎看不见"到"明显"，方便直接对比哪一档的干扰程度可以接受。
-    # 括号里是实测的 alpha 峰值 / 均值（255 制）与满屏时的覆盖率。
-    # 1) 「真实水波」= 默认档（峰 118 / 均 21 / 覆盖 26.6%）
+    # **浓度（wave_opacity）一律 ≤ 0.20**（硬上限，见 DEFAULTS 的说明）；档位差距靠
+    # 迎光提亮 / 背光压暗 / 浪尖高光 + 波的行为（速度 / 余波 / 落点密度）来拉。
+    # 1) 「真实水波」= 默认档
     "真实水波": dict(rain_enabled=False, snow_enabled=False, petal_enabled=False,
                  meteor_enabled=False, wave_enabled=True,
                  wave_speed=180, wave_persist=0.45, wave_size=22, wave_strength=0.08,
                  wave_step=26, wave_move=True, wave_click=True, wave_ambient=0.0,
-                 wave_light=225, wave_contrast=0.45, wave_shading=0.26,
-                 wave_highlight=0.42, wave_color="#FFFFFF", wave_opacity=0.55),
-    # 2) 最轻：只在最陡的波峰上留一道痕（峰 43 / 均 8），基本不打扰桌面
+                 wave_light=225, wave_contrast=0.45, wave_shading=0.28,
+                 wave_highlight=0.45, wave_color="#FFFFFF", wave_opacity=0.14),
+    # 2) 最轻：只在最陡的波峰上留一道痕，基本不打扰桌面
     "微风拂面": dict(rain_enabled=False, snow_enabled=False, petal_enabled=False,
                  meteor_enabled=False, wave_enabled=True,
-                 wave_speed=150, wave_persist=0.35, wave_size=26, wave_strength=0.06,
-                 wave_step=30, wave_move=True, wave_click=True, wave_ambient=0.0,
-                 wave_light=225, wave_contrast=0.26, wave_shading=0.14,
-                 wave_highlight=0.24, wave_color="#FFFFFF", wave_opacity=0.35),
+                 wave_speed=150, wave_persist=0.32, wave_size=26, wave_strength=0.06,
+                 wave_step=32, wave_move=True, wave_click=True, wave_ambient=0.0,
+                 wave_light=225, wave_contrast=0.20, wave_shading=0.12,
+                 wave_highlight=0.20, wave_color="#FFFFFF", wave_opacity=0.06),
     # 3) 慢而久：波传得慢、余波长，落点大而轻；外加每 4.5 秒一滴环境涟漪
     "月下湖面": dict(rain_enabled=False, snow_enabled=False, petal_enabled=False,
                  meteor_enabled=False, wave_enabled=True,
                  wave_speed=115, wave_persist=0.88, wave_size=32, wave_strength=0.05,
                  wave_step=36, wave_move=True, wave_click=True, wave_ambient=4.5,
-                 wave_light=205, wave_contrast=0.40, wave_shading=0.24,
-                 wave_highlight=0.40, wave_color="#CFE6FF", wave_opacity=0.48),
+                 wave_light=205, wave_contrast=0.32, wave_shading=0.20,
+                 wave_highlight=0.32, wave_color="#CFE6FF", wave_opacity=0.10),
     # 4) 中等：雨点密集、波短促，看得清但不刺眼
     "暴雨打点": dict(rain_enabled=False, snow_enabled=False, petal_enabled=False,
                  meteor_enabled=False, wave_enabled=True,
-                 wave_speed=240, wave_persist=0.25, wave_size=26, wave_strength=0.12,
-                 wave_step=18, wave_move=True, wave_click=True, wave_ambient=1.2,
-                 wave_light=200, wave_contrast=0.65, wave_shading=0.40,
-                 wave_highlight=0.62, wave_color="#FFFFFF", wave_opacity=0.70),
+                 wave_speed=240, wave_persist=0.25, wave_size=24, wave_strength=0.11,
+                 wave_step=24, wave_move=True, wave_click=True, wave_ambient=1.6,
+                 wave_light=200, wave_contrast=0.60, wave_shading=0.38,
+                 wave_highlight=0.58, wave_color="#FFFFFF", wave_opacity=0.16),
     # 5) 最强（= 改之前的旧默认）：对比用，会明显盖住桌面
     "惊涛": dict(rain_enabled=False, snow_enabled=False, petal_enabled=False,
               meteor_enabled=False, wave_enabled=True,
-              wave_speed=200, wave_persist=0.55, wave_size=26, wave_strength=0.11,
-              wave_step=22, wave_move=True, wave_click=True, wave_ambient=2.0,
-              wave_light=225, wave_contrast=0.85, wave_shading=0.55,
-              wave_highlight=0.90, wave_color="#FFFFFF", wave_opacity=0.85),
+              wave_speed=200, wave_persist=0.62, wave_size=28, wave_strength=0.13,
+              wave_step=14, wave_move=True, wave_click=True, wave_ambient=0.9,
+              wave_light=225, wave_contrast=0.70, wave_shading=0.44,
+              wave_highlight=0.68, wave_color="#FFFFFF", wave_opacity=0.20),
     "水面": dict(rain_enabled=False, snow_enabled=False,
               win_ripple_enabled=True, win_ripple_size=1.2,
               win_ripple_life=1.1, win_ripple_strength=0.8,

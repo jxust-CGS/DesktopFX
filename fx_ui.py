@@ -1204,7 +1204,9 @@ class ControlPanel:
         self._slider(c, "迎光提亮", "wave_contrast", 0.0, 1.2, 0.05, "{:.0%}")
         self._slider(c, "背光压暗", "wave_shading", 0.0, 1.0, 0.05, "{:.0%}")
         self._slider(c, "浪尖高光", "wave_highlight", 0.0, 1.2, 0.05, "{:.0%}")
-        self._slider(c, "浓度", "wave_opacity", 0.05, 1.0, 0.01, "{:.0%}")
+        # 上限 20%：用户要求"浓度限制在 20 以内"。它是一层叠在桌面上的半透明条纹，
+        # 浓度 = "桌面被盖住多少"，超过 20% 就开始影响看桌面了。
+        self._slider(c, "浓度", "wave_opacity", 0.02, 0.20, 0.01, "{:.0%}")
         self._swatch(c, "高光颜色", "wave_color", WAVE_COLORS)
         self._save_bar(c, "真实水波")
         self._preset_block(p, "真实水波")

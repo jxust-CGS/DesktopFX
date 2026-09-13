@@ -388,11 +388,15 @@ class WaterRippleField:
 
     # ---- 上屏着色（见 draw / shade）----
     _KNEE_PER_PX = 5.2e-4           # 软饱和拐点：每像素高度变化多少算"满对比度"
-    _KS_DEF = 0.85                  # 迎光提亮峰值
-    _KD_DEF = 0.55                  # 背光压暗峰值
-    _KSP_DEF = 0.90                 # 浪尖高光峰值
+    _KS_DEF = 0.45                  # 迎光提亮峰值
+    _KD_DEF = 0.28                  # 背光压暗峰值
+    _KSP_DEF = 0.45                 # 浪尖高光峰值
     _LIGHT_DEF = 225.0              # 光照来自左上（0=右 90=下 180=左 270=上）
-    _OPACITY_REF = 0.85
+    _OPACITY_REF = 0.14             # 兜底浓度
+    _OPACITY_MAX = 0.20             # **硬上限**：用户要求"浓度限制在 20% 以内"。
+                                    # 面板滑块的上限也是它，改这里要同步 fx_ui。
+                                    # 它是一层叠在桌面上的半透明条纹，浓度就是
+                                    # "桌面被盖住多少"，0.20 已经能看清波纹了。
     _BRIGHT_E = 1.50                # 迎光侧的亮度曲线指数（用 sqrt 实现，见 draw）
     _RENDER_EPS = 0.03              # 判定"这一格要画"的幅度阈值
     _BLOCK_PX = 2.2                 # 显示网格的格子边长上限（px）
@@ -562,7 +566,8 @@ class WaterRippleField:
         """
         if not self._alive:
             return
-        op = float(np.clip(cfg.get("wave_opacity", self._OPACITY_REF), 0.0, 1.0))
+        op = float(np.clip(cfg.get("wave_opacity", self._OPACITY_REF),
+                          0.0, self._OPACITY_MAX))
         if op <= 0.0:
             return
 

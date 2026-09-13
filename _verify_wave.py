@@ -526,7 +526,9 @@ def test_color_tints_highlight():
         b = _render(wf, cfg)
         a = b[..., 3].astype(np.float32)
         rgb = b[..., :3].astype(np.float32)[..., ::-1]
-        m = (a > 60) & (rgb.max(axis=2) > 0)
+        # 门槛按**浓度上限 20%** 的尺度取：那时提亮像素的 alpha 峰只有 44，
+        # 沿用旧默认（0.85 -> 峰 217）时代的 60 会一个像素都选不出来。
+        m = (a > 10) & (rgb.max(axis=2) > 0)
         if int(m.sum()) < 200:
             return False, f"{name}：提亮像素太少（{int(m.sum())}）"
         res[name] = (rgb[m] / np.maximum(a[m], 1.0)[..., None] * 255.0).mean(axis=0)
@@ -612,6 +614,10 @@ def _cell_variation(buf, wf):
     **分组相位必须跟 draw 里上屏的映射一致**（`round((p+0.5)/cell − 0.5)`）——
     差半个像素就会把相邻两格混进一组、读出一个假的非零值（第一版就栽在这）。
 
+    **返回的是归一化值**（格内 σ ÷ 有波像素的平均 alpha）：原始 σ 正比于浓度，
+    浓度一改判据就失配（浓度从 0.55 压到 0.14 后 σ 从 2.8 掉到 0.75，看起来像
+    "方块回来了"）。归一化之后它与浓度无关：最近邻恒 0.000、双线性恒 0.11~0.13。
+
     性能说明：不用"格子边界处的梯度集中度"。双线性出来的曲面本身是分段线性的，
     梯度同样逐格跳跃，那个指标对两种做法都报警、根本分不开（颜料盘试过）。
     """
@@ -631,7 +637,8 @@ def _cell_variation(buf, wf):
     keep = (ends - starts) >= 3
     if keep.sum() < 30:
         return 0.0
-    return float(np.mean([v[s:e].std() for s, e in zip(starts[keep], ends[keep])]))
+    sd = float(np.mean([v[s:e].std() for s, e in zip(starts[keep], ends[keep])]))
+    return sd / max(float(v.mean()), 1e-6)
 
 
 def _drag(wf, cfg, secs=2.2, click_at=1.2, w=W, h=H):
@@ -671,36 +678,49 @@ def test_no_grid_artifact():
         WaterRippleField._BLOCK_PX = saved
     if ctrl_up != 1:
         return False, f"对照组没退到最近邻（up={ctrl_up}），这条测不出来"
-    if ctrl > 0.5:
+    if ctrl > 0.02:
         return False, f"对照组（最近邻）本该读到 ~0，实测 {ctrl:.3f} —— 判据不灵敏"
-    if got < 2.0:
+    if got < 0.05:
         return False, (f"放大后格内仍然几乎没变化（σ={got:.3f}）—— 方格纸还在；"
                        f"对照组 {ctrl:.3f}")
-    return True, (f"格内 σ：最近邻 up={ctrl_up} -> {ctrl:.3f}（整格一块方块），"
+    return True, (f"归一化格内 σ：最近邻 up={ctrl_up} -> {ctrl:.3f}（整格一块方块），"
                   f"双线性 up={new_up} -> {got:.3f}（显示格 "
                   f"{wf2.cell / new_up:.2f}px）")
 
 
 def test_intensity_is_restrained():
-    """默认档对桌面的**干扰程度**必须被压住。
+    """默认档对桌面的**干扰程度**必须被压住，而**浓度有 20% 的硬上限**。
 
     这是一条防回退的断言：它叠在桌面上是一层半透明明暗条纹，峰值就是"桌面被改动了
     多少"。旧默认 0.85/0.55/0.90/0.85 让大量像素顶到 0.85 的不透明度
-    （峰 217、p95 也是 217 —— 曲线都被削平了），用户反馈"对整个桌面观看影响比较大"。
+    （峰 217、p95 也是 217 —— 曲线都被削平了），用户先反馈"影响桌面观看"，
+    随后直接要求"浓度限制在 20 以内"。
     """
-    wf, cfg = WaterRippleField(W, H, seed=5), wav_cfg()
+    if not (0.0 < WaterRippleField._OPACITY_MAX <= 0.20):
+        return False, f"浓度硬上限没卡在 20%：{WaterRippleField._OPACITY_MAX}"
+    if d.DEFAULTS["wave_opacity"] > WaterRippleField._OPACITY_MAX:
+        return False, (f"默认浓度 {d.DEFAULTS['wave_opacity']} 超过硬上限 "
+                       f"{WaterRippleField._OPACITY_MAX}")
+    over = {n: p["wave_opacity"] for n, p in d.PRESETS.items()
+            if "wave_opacity" in p and p["wave_opacity"] > WaterRippleField._OPACITY_MAX}
+    if over:
+        return False, f"这些预设的浓度超过 20% 上限：{over}"
+
+    # 把浓度直接推到上限（其余走默认），确认渲染层真的夹住了它 —— 光看配置不算数。
+    wf, cfg = WaterRippleField(W, H, seed=5), wav_cfg(wave_opacity=0.9)
     buf = _drag(wf, cfg)
     s = _lit_stats(buf)
     a = buf[..., 3].astype(np.float32)
     lit = a > 0
     p95 = float(np.percentile(a[lit], 95)) if lit.any() else 0.0
     means = float(a[lit].mean()) if lit.any() else 0.0
-    if s["amax"] > 150 or p95 > 110 or means > 32:
-        return False, (f"默认档太重：峰 {s['amax']:.0f} / p95 {p95:.0f} / 均 {means:.1f}"
-                       f"（上限 150 / 110 / 32）")
-    if s["amax"] < 40:
+    if s["amax"] > 60 or p95 > 40 or means > 12:
+        return False, (f"浓度顶到上限时仍然太重：峰 {s['amax']:.0f} / p95 {p95:.0f} / "
+                       f"均 {means:.1f}（上限 60 / 40 / 12）")
+    if s["amax"] < 12:
         return False, f"默认档轻到看不见了：峰 {s['amax']:.0f}"
-    return True, (f"默认档 alpha 峰 {s['amax']:.0f} / p95 {p95:.0f} / 均 {means:.1f} / "
+    return True, (f"硬上限 {WaterRippleField._OPACITY_MAX:.0%}；把浓度推到 0.9 实测 "
+                  f"峰 {s['amax']:.0f} / p95 {p95:.0f} / 均 {means:.1f} / "
                   f"覆盖 {s['cov'] * 100:.1f}%")
 
 
