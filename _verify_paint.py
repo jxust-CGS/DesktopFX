@@ -228,27 +228,51 @@ def test_drag_leaves_local_stroke():
                   f"{rows[0]}~{rows[-1]} = 全高 {span * 100:.0f}%")
 
 
-def test_pointer_direction_pushes_paint():
-    """往哪边划，颜料就被往哪边推 —— 左拖与右拖的漂移必须反向。
+def test_pointer_pushes_paint_forward():
+    """拖拽必须把颜料**推着一起走** —— 量质心越过路径中点的距离。
 
-    基流对左右两次是同一份（同 seed），所以取**差值**就把基流差分掉了。
+    旧版 `_splat` 把推流乘了一次 `amp`（单团浓度 0.18），实际推力只有设计值的
+    1/5.5，流场几乎推不动颜料：`paint_swirl=1` 时质心只比 `swirl=0` 的基线多走
+    8px（+40 vs +32）。修掉之后是 +134 vs +32（4.2×）。
+
+    必须在**拖动过程中**量，不能等停手后看残余漂移 —— 停手后是基流的旋度在
+    主导，方向已经不代表"手推的方向"了（实测会反向）。
     """
     W, H = 1280, 720
-    cfg = paint_cfg(paint_glow=0.0, paint_diffusion=0.0)
-    out = {}
-    for name, (xa, xb) in (("right", (300.0, 900.0)), ("left", (900.0, 300.0))):
-        p = _new(W, H, cfg)
-        _drive(p, cfg, 12, _line(xa, 360.0, xb, 360.0, 12))
-        _, cx0, _, _ = _blob(p)
-        _drive(p, cfg, 20, _const(xb, 360.0))       # 手停了，看惯性
-        _, cx1, _, _ = _blob(p)
-        out[name] = cx1 - cx0
-    diff = out["right"] - out["left"]
-    if diff < 1.5:
-        return False, (f"拖拽方向没有把颜料推开：右拖漂移 {out['right']:+.2f} 格、"
-                       f"左拖 {out['left']:+.2f} 格（差值应 >1.5）")
-    return True, (f"右拖漂移 {out['right']:+.2f} 格、左拖 {out['left']:+.2f} 格，"
-                  f"差值 {diff:.2f} 格 = 颜料跟着手走")
+    cfg = paint_cfg()
+
+    def fwd(xa, xb, swirl, follow=None):
+        saved = PaintField._FOLLOW
+        if follow is not None:
+            PaintField._FOLLOW = follow
+        try:
+            c = dict(cfg, paint_swirl=swirl)
+            p = _new(W, H, c)
+            for i in range(20):
+                t_ = (i + 1) / 20.0
+                p.set_pointer(xa + (xb - xa) * t_, 360.0, 0)
+                p.update(1.0 / 60.0, c)
+            g = _lum(p)
+            m = float(g.sum())
+            ys, xs = np.mgrid[0:p.gh, 0:p.gw]
+            cx = float((g * xs).sum() / m) * p.cell
+            sign = 1.0 if xb > xa else -1.0
+            return (cx - (xa + xb) / 2.0) * sign
+        finally:
+            PaintField._FOLLOW = saved
+
+    base = fwd(300.0, 900.0, 0.0)
+    right = fwd(300.0, 900.0, 1.0)
+    left = fwd(900.0, 300.0, 1.0)
+    ctrl = fwd(300.0, 900.0, 1.0, 0.55)
+    if right < base * 2.0 or left < base * 2.0:
+        return False, (f"颜料没被手推着走：基线 +{base:.0f}px、"
+                       f"右拖 +{right:.0f}px / 左拖 +{left:.0f}px（应 > 基线 2 倍）")
+    if ctrl > right * 0.6:
+        return False, (f"对照组（_FOLLOW=0.55，旧的弱推力）本该明显更弱，实测 "
+                       f"+{ctrl:.0f}px vs +{right:.0f}px —— 判据不灵敏")
+    return True, (f"质心越过路径中点：基线 +{base:.0f}px、右拖 +{right:.0f}px、"
+                  f"左拖 +{left:.0f}px（对称）；弱推力对照组只有 +{ctrl:.0f}px")
 
 
 def test_swirl_knob_moves_paint():
@@ -332,6 +356,64 @@ def test_no_burst_without_click():
     if p.dye.max() != 0.0:
         return False, f"没点击却在原地留下了颜料（峰值 {p.dye.max():.4f}）"
     return True, "指针静止 200 帧且从不点击：场里干干净净"
+
+
+def test_core_follows_cursor():
+    """鼠标必须落在颜料**最亮处**的正下方 —— 亮心不能拖在鼠标后面。
+
+    判据用**峰值**而不是质心：一条拖尾本来就该留在身后（那是"搅动"的余韵），
+    质心必然偏后，拿它当判据等于要求这个特效不许有拖尾。真正决定"颜色在不在
+    鼠标底下"的是最亮的那一块。
+
+    历史：`_FOLLOW` 只有 0.55（"流场只以指针一半的速度跟随"），稳态拖动时亮心
+    落在鼠标后 129px，而刷子半径才 45px —— 肉眼就是"颜色跑在鼠标左上"。
+    改成 2.5 后各速度都压进 ±30px。
+    """
+    W, H = 1920, 1080
+    cfg = paint_cfg()
+
+    def bright_off(speed, follow=None):
+        """亮部（亮度 > 峰值一半）的质心相对鼠标的偏移。
+
+        不用"最亮那一格"：跟随不够时亮部是一整条几百像素的平台，最亮格的位置
+        本身不稳定、也不代表人眼看到的"颜色在哪"。
+        """
+        saved = PaintField._FOLLOW
+        if follow is not None:
+            PaintField._FOLLOW = follow
+        try:
+            p = _new(W, H, cfg)
+            # 直线要一直留在屏内，否则高速那档会"跑出屏幕"导致不再落色、
+            # 读数停在边界上（实测 1200px/s 跑 2 秒就出屏了，读出来 -1082px）。
+            step = speed / 60.0
+            n = int(min(140, (W - 300.0) / step))
+            x = 150.0
+            for _ in range(n):
+                x += step
+                p.set_pointer(x, 540.0, 0)
+                p.update(1.0 / 60.0, cfg)
+            col = _lum(p).max(axis=0)
+            w = np.maximum(col - 0.5 * col.max(), 0.0)
+            if w.sum() <= 0.0:
+                return float("nan")
+            return float((w * np.arange(col.size)).sum() / w.sum()) * p.cell - x
+        finally:
+            PaintField._FOLLOW = saved
+
+    brush = PaintField._R_NORM * min(W, H)
+    offs = {sp: bright_off(sp) for sp in (300.0, 600.0, 1200.0)}
+    ctrl = bright_off(600.0, 0.55)
+    if abs(ctrl) < brush * 2.0:
+        return False, (f"对照组（_FOLLOW=0.55）本该把亮部甩在身后，实测只偏 "
+                       f"{ctrl:+.0f}px —— 判据不灵敏，不能用")
+    bad = {k: v for k, v in offs.items() if abs(v) > brush * (2.0 if k > 900 else 1.0)}
+    if bad:
+        return False, ("亮部拖在鼠标后面：" +
+                       "、".join(f"{int(k)}px/s {v:+.0f}px" for k, v in bad.items()) +
+                       f"（刷子半径 {brush:.0f}px）")
+    return True, ("亮部质心相对鼠标 " +
+                  "、".join(f"{int(k)}px/s {v:+.0f}px" for k, v in offs.items()) +
+                  f"（刷子半径 {brush:.0f}px）；对照组 _FOLLOW=0.55 是 {ctrl:+.0f}px")
 
 
 def test_brush_scales_stroke():
@@ -828,11 +910,12 @@ def main():
         test_render_60_frames,
         test_idle_is_transparent,
         test_drag_leaves_local_stroke,
-        test_pointer_direction_pushes_paint,
+        test_pointer_pushes_paint_forward,
         test_swirl_knob_moves_paint,
         test_click_expands,
         test_click_knob,
         test_no_burst_without_click,
+        test_core_follows_cursor,
         test_brush_scales_stroke,
         test_flow_scales_density,
         test_fade_clears_screen,

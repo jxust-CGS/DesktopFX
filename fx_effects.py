@@ -1549,7 +1549,10 @@ class PaintField:
     _WAVES = 5                   # 每条基流叠加的正弦列数
     _FLOW = 0.075                # 基流速度基准（屏宽/秒），乘 paint_swirl
     _IMP_TAU = 0.22              # 指针/点击冲量场的时间常数（秒）
-    _FOLLOW = 0.55               # 稳态下"流场跟随指针"的比例（见 _pointer 的推导）
+    _FOLLOW = 4.00               # 稳态下"流场跟随指针"的倍率（见 _pointer 的推导）
+                                 # 必须 >>1。=1 只是"跟手同速"，颜料仍然整条拖在身后；
+                                 # 实测亮部质心相对鼠标：0.55 -> -146px、1.5 -> -86px、
+                                 # 2.5 -> -37px、4.0 -> 0px（600px/s，刷子半径 45px）
     _FADE_MIN, _FADE_MAX = 0.15, 1.10   # 消隐速率 1/s（对应 paint_fade 0~1）
     _BLOCK_PX = 4.0              # 上屏后允许的最大格子边长；显示网格 = 模拟网格 × up
     _HUE_HZ = 0.5                # 色相自转（圈/秒）× paint_hue_spread
@@ -1723,9 +1726,11 @@ class PaintField:
             self._iu[y0:y1, x0:x1] += gg * (xs * inv)
             self._iv[y0:y1, x0:x1] += gg * (ys * inv)
         elif push[0] != 0.0 or push[1] != 0.0:
-            ga = gg * np.float32(amp)
-            self._iu[y0:y1, x0:x1] += ga * np.float32(push[0])
-            self._iv[y0:y1, x0:x1] += ga * np.float32(push[1])
+            # 只用 gg，**不要**再乘 amp：推流强度应当只由指针速度决定，
+            # 不该跟着"落色量"变（乘上 amp=0.18 时实际推力只有设计值的 1/5.5，
+            # 流场跟不上手，颜料就整条拖在鼠标后面）。
+            self._iu[y0:y1, x0:x1] += gg * np.float32(push[0])
+            self._iv[y0:y1, x0:x1] += gg * np.float32(push[1])
         self._dirty = True
 
     def _burst(self, gx, gy, r, flow, cfg):
