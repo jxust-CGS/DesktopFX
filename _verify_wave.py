@@ -601,6 +601,135 @@ def test_render_crop_is_lossless():
                   f"< 存活阈值 {WaterRippleField._EPS:.1e}）")
 
 
+# ------------------------------------------------------------------ 观感
+def _cell_variation(buf, wf):
+    """**同一个模拟格内部的像素标准差**。
+
+    上屏是最近邻，所以每个"显示格"内部恒定；而一个模拟格被切成 up² 个显示格：
+    最近邻时它们同值（σ = 0，整格就是一块硬方块），双线性之后它们各不相同
+    （σ > 0，格内就有渐变）。这个判据简单、无周期依赖、物理意义直接。
+
+    **分组相位必须跟 draw 里上屏的映射一致**（`round((p+0.5)/cell − 0.5)`）——
+    差半个像素就会把相邻两格混进一组、读出一个假的非零值（第一版就栽在这）。
+
+    性能说明：不用"格子边界处的梯度集中度"。双线性出来的曲面本身是分段线性的，
+    梯度同样逐格跳跃，那个指标对两种做法都报警、根本分不开（颜料盘试过）。
+    """
+    a = buf[..., 3].astype(np.float32)
+    ys, xs = np.nonzero(a > 4)
+    if ys.size < 2000:
+        return 0.0
+    gy = np.rint((ys + 0.5) / wf.cell - 0.5).astype(np.int64)
+    gx = np.rint((xs + 0.5) / wf.cell - 0.5).astype(np.int64)
+    k = np.unique(gy * np.int64(1 << 20) + gx, return_inverse=True)[1]
+    key = (k // 64) * np.int64(64) + (k % 64)
+    order = np.argsort(key, kind="stable")
+    key, v = key[order], a[ys, xs][order]
+    edges = np.flatnonzero(np.diff(key)) + 1
+    starts = np.concatenate(([0], edges))
+    ends = np.concatenate((edges, [key.size]))
+    keep = (ends - starts) >= 3
+    if keep.sum() < 30:
+        return 0.0
+    return float(np.mean([v[s:e].std() for s, e in zip(starts[keep], ends[keep])]))
+
+
+def _drag(wf, cfg, secs=2.2, click_at=1.2, w=W, h=H):
+    """拖一段 + 中途点一下，返回最后一帧的缓冲区（每帧清空，只看"此刻的波"）。"""
+    buf, u32 = _buf(w, h)
+    n = int(secs * 60)
+    for i in range(1, n + 1):
+        u32[:] = 0
+        x = 200.0 + (i * 14.4) % (w - 400.0)
+        y = h * 0.5 + h * 0.16 * np.sin(i / 17.0)
+        if i % 3 == 0:
+            wf.splash(x, y, cfg)
+        if abs(i - click_at * 60) < 0.5:
+            wf.splash(x, y, cfg, big=True)
+        wf.update(1.0 / 60.0, cfg)
+        wf.draw(u32, w, h, cfg)
+    return buf
+
+
+def test_no_grid_artifact():
+    """不许有"方格纸"：同一模拟格内部的像素必须有渐变（σ > 0）。
+
+    **带对照组**：把 `_BLOCK_PX` 顶到天上逼出 up=1（走最近邻老路径），确认这个
+    判据在那条路上读到 0 —— 否则判据是聋的，修没修好都读不出来。
+    """
+    saved = WaterRippleField._BLOCK_PX
+    try:
+        WaterRippleField._BLOCK_PX = 1e9
+        wf, cfg = WaterRippleField(W, H, seed=5), wav_cfg()
+        ctrl = _cell_variation(_drag(wf, cfg), wf)
+        ctrl_up = wf._up
+        WaterRippleField._BLOCK_PX = saved
+        wf2, cfg2 = WaterRippleField(W, H, seed=5), wav_cfg()
+        got = _cell_variation(_drag(wf2, cfg2), wf2)
+        new_up = wf2._up
+    finally:
+        WaterRippleField._BLOCK_PX = saved
+    if ctrl_up != 1:
+        return False, f"对照组没退到最近邻（up={ctrl_up}），这条测不出来"
+    if ctrl > 0.5:
+        return False, f"对照组（最近邻）本该读到 ~0，实测 {ctrl:.3f} —— 判据不灵敏"
+    if got < 2.0:
+        return False, (f"放大后格内仍然几乎没变化（σ={got:.3f}）—— 方格纸还在；"
+                       f"对照组 {ctrl:.3f}")
+    return True, (f"格内 σ：最近邻 up={ctrl_up} -> {ctrl:.3f}（整格一块方块），"
+                  f"双线性 up={new_up} -> {got:.3f}（显示格 "
+                  f"{wf2.cell / new_up:.2f}px）")
+
+
+def test_intensity_is_restrained():
+    """默认档对桌面的**干扰程度**必须被压住。
+
+    这是一条防回退的断言：它叠在桌面上是一层半透明明暗条纹，峰值就是"桌面被改动了
+    多少"。旧默认 0.85/0.55/0.90/0.85 让大量像素顶到 0.85 的不透明度
+    （峰 217、p95 也是 217 —— 曲线都被削平了），用户反馈"对整个桌面观看影响比较大"。
+    """
+    wf, cfg = WaterRippleField(W, H, seed=5), wav_cfg()
+    buf = _drag(wf, cfg)
+    s = _lit_stats(buf)
+    a = buf[..., 3].astype(np.float32)
+    lit = a > 0
+    p95 = float(np.percentile(a[lit], 95)) if lit.any() else 0.0
+    means = float(a[lit].mean()) if lit.any() else 0.0
+    if s["amax"] > 150 or p95 > 110 or means > 32:
+        return False, (f"默认档太重：峰 {s['amax']:.0f} / p95 {p95:.0f} / 均 {means:.1f}"
+                       f"（上限 150 / 110 / 32）")
+    if s["amax"] < 40:
+        return False, f"默认档轻到看不见了：峰 {s['amax']:.0f}"
+    return True, (f"默认档 alpha 峰 {s['amax']:.0f} / p95 {p95:.0f} / 均 {means:.1f} / "
+                  f"覆盖 {s['cov'] * 100:.1f}%")
+
+
+def test_preset_ladder_is_ordered():
+    """五档预设的强度必须**单调递增**（用户就是拿它们对比的）。
+
+    量的是"屏幕像素被改动的总量" `Σ alpha` —— 比只看峰值稳，因为它同时反映
+    强度与覆盖。相邻两档必须差 25% 以上，否则用户根本分不出哪档是哪个。
+    """
+    names = [n for n in d.PRESET_GROUPS.get("真实水波", []) if n in d.PRESETS]
+    if len(names) < 5:
+        return False, f"「真实水波」分组只有 {len(names)} 个预设（要 5 档）"
+    tot = {}
+    for n in names:
+        cfg = dict(d.DEFAULTS)
+        cfg.update(d.PRESETS[n])
+        wf = WaterRippleField(W, H, seed=5)
+        buf = _drag(wf, cfg)
+        a = buf[..., 3].astype(np.float64)
+        tot[n] = float(a.sum())
+    seq = [tot[n] for n in names]
+    bad = [i for i in range(1, len(seq)) if seq[i] <= seq[i - 1] * 1.25]
+    if bad:
+        return False, ("档位强度没拉开："
+                       + "、".join(f"{names[i-1]} {seq[i-1]:.3g} >= {names[i]} {seq[i]:.3g}"
+                                   for i in bad))
+    return True, "、".join(f"{n} {tot[n] / tot[names[-1]] * 100:.0f}%" for n in names) +         "（最强档 = 100%）"
+
+
 # ------------------------------------------------------------------ 接线
 def _scene(cfg, w=W, h=H):
     sc = Scene(w, h)
@@ -728,6 +857,9 @@ def main():
         test_color_tints_highlight,
         test_render_knob_differentials,
         test_render_crop_is_lossless,
+        test_no_grid_artifact,
+        test_intensity_is_restrained,
+        test_preset_ladder_is_ordered,
         test_scene_wiring,
         test_scene_both_ripples_at_once,
         test_presets_valid,

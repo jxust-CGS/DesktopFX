@@ -393,8 +393,11 @@ class WaterRippleField:
     _KSP_DEF = 0.90                 # 浪尖高光峰值
     _LIGHT_DEF = 225.0              # 光照来自左上（0=右 90=下 180=左 270=上）
     _OPACITY_REF = 0.85
-    _BRIGHT_E = 1.30                # 迎光侧的亮度曲线指数
+    _BRIGHT_E = 1.50                # 迎光侧的亮度曲线指数（用 sqrt 实现，见 draw）
     _RENDER_EPS = 0.03              # 判定"这一格要画"的幅度阈值
+    _BLOCK_PX = 2.2                 # 显示网格的格子边长上限（px）
+    _UP_MAX = 2                     # 双线性放大倍数上限
+    _PAD = 3                        # 绘制包围盒往外留的格数
 
     # ---------------------------------------------------------- 生命周期
     def __init__(self, w, h, seed=0):
@@ -417,6 +420,12 @@ class WaterRippleField:
         self._since_check = 0
         self.k = self._coef(self._SPEED_REF)
         self.damp = self._damp_step(self._PERSIST_DEF)
+        # 显示网格 = 模拟网格 × up。上屏是**最近邻**采样，模拟格 2.4~5px 直接铺屏
+        # 就是一块块硬方块 —— 水波画的是**高频亮暗条纹**，方块化比颜料盘更扎眼。
+        # 先在模拟网格上做双线性放大到"显示网格"（格 ≤ 1.6px），硬边就消失了。
+        self._up = int(np.clip(np.ceil(self.cell / self._BLOCK_PX), 1, self._UP_MAX))
+        self._rsy = _rs_table(self.gh, self._up)
+        self._rsx = _rs_table(self.gw, self._up)
 
     def reset(self):
         self.height[:] = 0.0
@@ -558,37 +567,93 @@ class WaterRippleField:
             return
 
         # 用"场上还有没有波"的范围当绘制范围：着色只在有波的地方非零，
-        # pad 留 3 格（波前推进 1 格/帧，不会跑出这个余量）。
-        box = self.active_box(pad=3, thr=self._render_h())
+        # pad 留 _PAD 格（波前每帧推进 ~1 格，不会跑出这个余量）。
+        box = self.active_box(pad=self._PAD, thr=self._render_h())
         if box is None:
             return
         ry0, rx0, ry1, rx1 = box
-        sub = self.shade(cfg, box=box)
-        if float(np.abs(sub).max()) <= self._RENDER_EPS:
+
+        # 双线性要邻居，所以 dep 块比输出范围各多一圈。**必须真的多取到那一圈**，
+        # 不能在块边缘用 clamp 顶替 —— 否则"裁剪版"与"整块网格版"会在边缘处
+        # 用不同的值插值，差出几个 alpha 台阶（无损性测试会当场抓到）。
+        ey0, ex0 = max(0, ry0 - 1), max(0, rx0 - 1)
+        ey1, ex1 = min(self.gh, ry1 + 1), min(self.gw, rx1 + 1)
+        dep = self.shade(cfg, box=(ey0, ex0, ey1, ex1))
+        if float(np.abs(dep).max()) <= self._RENDER_EPS:
             return
 
-        pos = np.clip(sub, 0.0, 1.0)
-        neg = np.clip(-sub, 0.0, 1.0)
+        # 模拟网格 -> 显示网格（双线性）。插值的是 **dep 这个标量场** 而不是
+        # 打包后的像素：`_premul_pack` 出来的 uint32 是位域，做加权平均会把
+        # 通道串位。也不能先算 bright/dark 再插值 —— 那两条曲线带指数，
+        # 先插值再映射才是"把波面形状平滑化"，物理上也更自然。
+        f = self._up
+        if f > 1:
+            sy = slice(ry0 * f, ry1 * f)
+            sx = slice(rx0 * f, rx1 * f)
+            i0y = self._rsy[0][sy] - ey0
+            i1y = self._rsy[1][sy] - ey0
+            wy = self._rsy[2][sy]
+            i0x = self._rsx[0][sx] - ex0
+            i1x = self._rsx[1][sx] - ex0
+            wx = self._rsx[2][sx]
+            # **先 x 后 y**：numpy 的高级索引把被索引轴放到最内层，反过来得到的是
+            # Fortran 连续数组，后续运算会走转置慢路径（颜料盘的 14.3ms -> 1.1ms）。
+            #
+            # 混合一律走 `out=` 原地：`X + (Y - X) * w` 这种写法会连开三个同尺寸临时
+            # 数组，实测 **原地比临时快 2.4 倍**（9.2ms -> 3.8ms @1.4M 元素）。
+            t = np.take(dep, i0x, axis=1)
+            mid = np.take(dep, i1x, axis=1)
+            np.subtract(mid, t, out=mid)
+            np.multiply(mid, wx, out=mid)
+            np.add(t, mid, out=t)
+            dep = np.take(t, i0y, axis=0)
+            mid = np.take(t, i1y, axis=0)
+            np.subtract(mid, dep, out=mid)
+            np.multiply(mid, wy[:, None], out=mid)
+            np.add(dep, mid, out=dep)
+        qh, qw = dep.shape
+
+        # `pos = clip(dep, 0, 1)`、`neg = clip(-dep, 0, 1)`，而二者必有一个是 0，
+        # 所以 `neg == pos - dep` —— 省掉一次 clip。
+        pos = np.clip(dep, 0.0, 1.0)
+        neg = pos - dep
         k_s = float(np.clip(cfg.get("wave_contrast", self._KS_DEF), 0.0, 1.5))
         k_d = float(np.clip(cfg.get("wave_shading", self._KD_DEF), 0.0, 1.0))
         k_sp = float(np.clip(cfg.get("wave_highlight", self._KSP_DEF), 0.0, 1.5))
-        bright = np.clip(pos ** np.float32(self._BRIGHT_E) * np.float32(k_s)
-                         + pos ** np.float32(4.0) * np.float32(k_sp), 0.0, 1.0)
-        dark = neg * np.float32(k_d)
 
-        sb = bright * np.float32(op)
-        sd = dark * np.float32(op)
-        ab = np.rint((sb + sd) * np.float32(255.0)).astype(np.uint32)
+        # **绝不能用 `pos ** 1.3` / `pos ** 4`**：float32 的 np.power 实测
+        # 25ns/元素（1080p 满屏两次要 80ms），是全流程最贵的一项。
+        # 换成 `pos * sqrt(pos)`（= pos^1.5）与 `(pos²)²` 后只要 1/8 的时间。
+        # 指数从 1.3 提到 1.5 的观感差别很小（pos=0.5 处 0.406 -> 0.354），
+        # 亮条纹会稍细一点 —— 反而更像水面的高光。
+        sq = np.sqrt(pos)
+        sq *= pos
+        p2 = pos * pos
+        p2 *= p2
+        sq *= np.float32(k_s)
+        p2 *= np.float32(k_sp)
+        np.add(sq, p2, out=sq)
+        np.clip(sq, 0.0, 1.0, out=sq)          # sq = bright
+        neg *= np.float32(k_d)                 # neg = dark
+
+        # dark 用完即弃，直接拿它当 (bright + dark) 的容器 —— 两者互斥。
+        # 之后 sq 是"提亮量 0~255"、neg 是"alpha 0~255"。
+        np.add(sq, neg, out=neg)
+        neg *= np.float32(255.0 * op)
+        np.clip(neg, 0.0, 255.0, out=neg)
+        sq *= np.float32(255.0 * op)
+
+        ab = (neg + 0.5).astype(np.uint32)
         # 染色是 0~1 的倍数，必须乘回 255 才是预乘的通道值
         # （hex_to_bgr 给的是 0~255，set_color 里已经除过）。
         # **顺序是 (b, g, r)** —— `_premul_pack` 收的就是 bgr，存成 rgb 会红蓝互换
         # （第一版就是这么错的：设 #FF0000 画出来是蓝的）。
-        srgb = sb * np.float32(255.0)
+        # 色是常量，`sq` 是已经乘好 255·op 的提亮量，所以这里只剩一次乘法。
         cb, cg, cr = self._tint
         small = _premul_pack(
-            np.rint(np.float32(cb) * srgb).astype(np.uint32),
-            np.rint(np.float32(cg) * srgb).astype(np.uint32),
-            np.rint(np.float32(cr) * srgb).astype(np.uint32), ab)
+            (sq * np.float32(cb) + 0.5).astype(np.uint32),
+            (sq * np.float32(cg) + 0.5).astype(np.uint32),
+            (sq * np.float32(cr) + 0.5).astype(np.uint32), ab)
 
         # 上屏：先 x 后 y（结果才是 C 连续，见 PaintField 的踩坑），
         # 且**只覆盖非零像素**，别把别层画好的东西整片抹掉。
@@ -598,11 +663,16 @@ class WaterRippleField:
         px1 = min(int(w), int(np.ceil(rx1 * self.cell)))
         if py1 <= py0 or px1 <= px0:
             return
-        bh, bw = small.shape
-        iy = np.clip((np.arange(py0, py1, dtype=np.float32) / self.cell).astype(np.int32) - ry0,
-                     0, bh - 1)
-        ix = np.clip((np.arange(px0, px1, dtype=np.float32) / self.cell).astype(np.int32) - rx0,
-                     0, bw - 1)
+        # 屏幕像素 -> 显示格：取**最近的**显示格（round 不是 floor）。
+        # 显示格 T 覆盖屏幕区间 [T·cell/f, (T+1)·cell/f)、中心在 (T+0.5)·cell/f，
+        # 所以 T = round((py+0.5)·f/cell − 0.5)。用 floor 会归到区间左端，
+        # 凭空叠上半格固定偏移（颜料盘踩过：+2.6px @1080p）。
+        iy = np.rint((np.arange(py0, py1, dtype=np.float32) + 0.5)
+                     * np.float32(f / self.cell) - 0.5).astype(np.int32) - ry0 * f
+        ix = np.rint((np.arange(px0, px1, dtype=np.float32) + 0.5)
+                     * np.float32(f / self.cell) - 0.5).astype(np.int32) - rx0 * f
+        np.clip(iy, 0, qh - 1, out=iy)
+        np.clip(ix, 0, qw - 1, out=ix)
         big = small[:, ix][iy]
         dst = u32.reshape(int(h), int(w))[py0:py1, px0:px1]
         np.copyto(dst, big, where=big != 0)
