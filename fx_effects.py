@@ -342,6 +342,181 @@ class RippleField:
             u32[iy * np.int32(w) + ix] = packed
 
 
+# ------------------------------------------------------------------ 真实水波
+class WaterRippleField:
+    """真实水波：二维波动方程（高度场 + 速度场双缓冲），画成迎光/背光的亮暗条纹。
+
+    和 `RippleField`（解析彩色圆环）是**两个完全独立的特效**，可以同时开启对比。
+
+    物理照抄参考壁纸 `workshop/431960/1431073750`（jQuery Ripples / sirxemic）的着色器：
+
+        drop   : h += (0.5 - cos(clamp(1 - d/r, 0, 1) * PI) * 0.5) * strength
+        update : g += (avg4(h) - h) * K;    g *= damp;    h += g
+
+    这两行是**真的波**：向外传播、相互干涉、撞到边界反射，而且能撑好几秒
+    （参考实测波前 108 px/s，4 秒才传遍屏幕；阻尼 0.995/步 ≈ 0.74/秒）。
+
+    参考的第三段（采样背景图做 UV 折射）我们**做不了** —— 透明 overlay 拿不到
+    桌面像素（`WaveField` 就是因为这个被删的）。改成把波面坡度当法线、按固定
+    光向做迎光提亮 / 背光压暗，再叠一道浪尖高光。对任何桌面底色都成立。
+
+    ### 两条与参考不同的设计（都是为了让"旋钮"变成物理量）
+
+    1. **仿真频率固定 60Hz，波速靠拉普拉斯系数 K 调**。
+       这个差分格式的相速度是 `c = sqrt(K)` 格/步，所以
+       `K = (波速 / (60 × 格边长))²`。好处是无论网格多粗，波**每帧只推进
+       `c` 格（约 2~3px）**，永远不会出现"格子太粗、波一帧跳 6px"的踏步感。
+       （一开始按 `hz = 波速/格边长` 做，粗网格要降到 18~24Hz，波会有明显抖动。）
+       `c` 必须 ≤ `_C_MAX`，超过这个差分格式会发散 —— 波速旋钮因此有上限。
+    2. **阻尼按秒折算**：`damp_step = 每秒保留比例 ** (1/60)`。
+       直接写每步常数的话，改分辨率会连波寿命一起改掉。
+    """
+
+    _CELL_TARGET = 560.0            # 长边目标格数（成本预算）
+    _CELL_MIN, _CELL_MAX = 2.4, 5.0
+    _HZ = 60.0                      # 固定仿真频率（与参考一致；帧率靠累加器解耦）
+    _C_MAX = 1.25                   # 每步位移上限（格）；这个差分格式 K<=2 才稳定，留余量
+    _MAX_STEPS_PER_FRAME = 3        # 卡顿时不追帧，避免雪崩
+    _SPEED_REF = 180.0              # 默认波速 px/s（相速度；实测可见波前 ≈ 0.6× 它）
+    _PERSIST_DEF = 0.45             # 默认衰减档位（≈ 每秒保留 0.72，与参考的 0.74 相当）
+    _DAMP_MIN, _DAMP_MAX = 0.55, 0.93   # 每秒的振幅保留比例
+    _EPS = 3.0e-4                   # "这里还有波"的高度阈值
+    _STRENGTH_REF = 0.08            # 默认落点强度（参考：移动 0.002 / 点击 0.15）
+    _H_MAX = 8.0                    # |h| / |g| 上限，纯粹防跑飞 —— 正常用不到
+                                    # （2.0 会被连续拖动顶到，钳位把波峰削平）
+    _IDLE_CHECK = 24                # 每多少步做一次"场上还有没有波"的全场扫描
+
+    # ---------------------------------------------------------- 生命周期
+    def __init__(self, w, h, seed=0):
+        self._rng = np.random.RandomState(seed)
+        self._t = 0.0
+        self.resize(w, h)
+
+    def resize(self, w, h):
+        """网格跟着分辨率走，但长边格数压在 `_CELL_TARGET` 附近 —— 成本有上界。"""
+        self.w, self.h = int(w), int(h)
+        self.cell = float(np.clip(max(w, h) / self._CELL_TARGET,
+                                  self._CELL_MIN, self._CELL_MAX))
+        self.gw = max(4, int(round(w / self.cell)))
+        self.gh = max(4, int(round(h / self.cell)))
+        self.height = np.zeros((self.gh, self.gw), np.float32)
+        self.vel = np.zeros((self.gh, self.gw), np.float32)
+        self._acc = 0.0
+        self._alive = False
+        self._since_check = 0
+        self.k = self._coef(self._SPEED_REF)
+        self.damp = self._damp_step(self._PERSIST_DEF)
+
+    def reset(self):
+        self.height[:] = 0.0
+        self.vel[:] = 0.0
+        self._acc = 0.0
+        self._alive = False
+        self._since_check = 0
+
+    # ---------------------------------------------------------- 参数换算
+    def _coef(self, speed):
+        """波速(px/s) -> 拉普拉斯系数 K。相速度 c = sqrt(K) 格/步，所以 K = c²。"""
+        c = float(speed) / (self._HZ * self.cell)
+        c = float(np.clip(c, 0.02, self._C_MAX))
+        return c * c
+
+    def _damp_step(self, persist):
+        """wave_persist 0..1 -> 每秒保留比例 -> 每步保留比例。"""
+        p = float(np.clip(persist, 0.0, 1.0))
+        per_sec = self._DAMP_MIN + (self._DAMP_MAX - self._DAMP_MIN) * p
+        return float(per_sec ** (1.0 / self._HZ))
+
+    # ---------------------------------------------------------- 落点
+    def drop(self, cx, cy, radius_px, strength):
+        """一个落点：余弦软包（与参考一致 —— 缓升缓降，没有硬边，不会激起网格噪声）。"""
+        if strength == 0.0 or radius_px <= 0.0:
+            return False
+        c = self.cell
+        gx, gy = float(cx) / c, float(cy) / c
+        spr = max(float(radius_px) / c, 0.75)
+        x0 = max(0, int(np.floor(gx - spr)))
+        x1 = min(self.gw, int(np.ceil(gx + spr)) + 1)
+        y0 = max(0, int(np.floor(gy - spr)))
+        y1 = min(self.gh, int(np.ceil(gy + spr)) + 1)
+        if x1 <= x0 or y1 <= y0:
+            return False
+        ys = np.arange(y0, y1, dtype=np.float32)[:, None] - np.float32(gy)
+        xs = np.arange(x0, x1, dtype=np.float32)[None, :] - np.float32(gx)
+        d = np.sqrt(ys * ys + xs * xs)
+        t = np.clip(1.0 - d / np.float32(spr), 0.0, 1.0)
+        self.height[y0:y1, x0:x1] += (0.5 - np.cos(t * np.pi) * 0.5) * np.float32(strength)
+        self._alive = True
+        return True
+
+    def splash(self, cx, cy, cfg, big=False):
+        """按 cfg 落一个点。big=True 用于点击（半径 ×1.5、强度 ×2.2，与参考的 0.002/0.15 同比例）。"""
+        r = float(cfg.get("wave_size", 22.0)) * (1.5 if big else 1.0)
+        s = float(cfg.get("wave_strength", self._STRENGTH_REF)) * (2.2 if big else 1.0)
+        return self.drop(cx, cy, r, s)
+
+    # ---------------------------------------------------------- 推进
+    def step(self, k, damp):
+        """一步波动方程。边界格恒为 0，等于一堵墙 —— 波撞上去会反射（参考也是反射）。"""
+        h, g = self.height, self.vel
+        if h.shape[0] < 3 or h.shape[1] < 3:
+            return
+        avg = (h[:-2, 1:-1] + h[2:, 1:-1] + h[1:-1, :-2] + h[1:-1, 2:]) * np.float32(0.25)
+        g[1:-1, 1:-1] += (avg - h[1:-1, 1:-1]) * np.float32(k)
+        g *= np.float32(damp)
+        h += g
+        np.clip(h, -self._H_MAX, self._H_MAX, out=h)
+        np.clip(g, -self._H_MAX, self._H_MAX, out=g)
+
+    def update(self, dt, cfg):
+        """按累加器推进若干步。返回本帧实际推进的步数（0 = 这帧没动）。"""
+        dt = float(dt)
+        self._t += dt
+        if not self._alive:
+            # 空场：不推进也不累加，免得闲置时攒下一堆待补的步
+            self._acc = 0.0
+            return 0
+
+        self.k = self._coef(cfg.get("wave_speed", self._SPEED_REF))
+        self.damp = self._damp_step(cfg.get("wave_persist", self._PERSIST_DEF))
+        step_dt = 1.0 / self._HZ
+        self._acc += dt
+        n = 0
+        while self._acc >= step_dt and n < self._MAX_STEPS_PER_FRAME:
+            self._acc -= step_dt
+            self.step(self.k, self.damp)
+            n += 1
+        if n >= self._MAX_STEPS_PER_FRAME:
+            self._acc = 0.0            # 卡顿时不追帧
+        if n:
+            # "场上还有没有波"要扫全场，比一步波动方程还贵，所以隔一段才判一次。
+            self._since_check += n
+            if self._since_check >= self._IDLE_CHECK:
+                self._since_check = 0
+                if self.active_box() is None:
+                    self.reset()
+        return n
+
+    # ---------------------------------------------------------- 查询
+    def active_box(self, pad=3):
+        """还有波的格范围 `(y0, x0, y1, x1)`；空场返回 None。"""
+        m = (np.abs(self.height) > self._EPS) | (np.abs(self.vel) > self._EPS)
+        rows = np.flatnonzero(m.any(axis=1))
+        if rows.size == 0:
+            return None
+        cols = np.flatnonzero(m.any(axis=0))
+        if cols.size == 0:
+            return None
+        return (max(0, int(rows[0]) - pad), max(0, int(cols[0]) - pad),
+                min(self.gh, int(rows[-1]) + 1 + pad),
+                min(self.gw, int(cols[-1]) + 1 + pad))
+
+    def energy(self):
+        """场上总能量（h² + g²）。测试与调参靠它。"""
+        return float((self.height.astype(np.float64) ** 2).sum()
+                     + (self.vel.astype(np.float64) ** 2).sum())
+
+
 # ------------------------------------------------------------------ 闪电
 class Lightning:
     """随机闪电（**已停用**：用户要求去掉这个功能）。
