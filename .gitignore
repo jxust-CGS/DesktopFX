@@ -4,9 +4,11 @@ __pycache__/
 *.spec
 build/
 
-# PyInstaller 产物里只有 exe 入库；旁侧的运行数据不入库
-dist/*.json
-dist/error.log
+# PyInstaller 构建输出整个不入库。
+# exe 作为 GitHub Release 资产分发（见 README「下载」），不再入库 ——
+# 否则每次构建都会往 git 里塞一个 30MB 的 blob，仓库只会越来越胖。
+# 同时这里也是运行数据目录（在 dist 里直接跑 exe 会生成 config.json 等）。
+dist/
 
 # 运行时个人数据（本地保留，不入库）
 config.json
