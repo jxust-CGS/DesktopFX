@@ -94,18 +94,21 @@ DEFAULTS = {
     "meteor_color": "#FFFFFF",       # 头部（参考里是 additive 的纯白热点）
     "meteor_tail_color": "#5FB8F0",  # 拖尾（越靠尾越接近这个色）
     "meteor_opacity": 0.9,
-    # ---- 颜料盘（CPU 流体颜料，参考 Lively 壁纸 "Fluids"）----
+    # ---- 颜料盘（鼠标搅动的流体颜料，参考 Lively 壁纸 "Fluids"）----
+    # 是**交互驱动**的：指针滑过处落色并推流（搅动），点击炸开一圈向外扩散，
+    # 空闲时颜料靠基流继续涡旋再慢慢消隐 -> 屏幕重新变干净。不自己铺满全屏。
     "paint_enabled": False,
-    "paint_amount": 12.0,        # 稳态颜料团数（生成速率 = 团数 / 平均寿命）
-    "paint_size": 1.0,           # 单团半径倍率
-    "paint_speed": 1.0,          # 涡旋流速倍率
-    "paint_diffusion": 0.25,     # 扩散 / 糊化
-    "paint_fade": 0.35,          # 消隐快慢（越大寿命越短、越"稀"）
+    "paint_brush": 1.0,          # 笔刷大小（落色半径倍率）
+    "paint_flow": 1.0,           # 落色量（划过时留下多少颜料）
+    "paint_swirl": 1.0,          # 搅动强度（基流速度 + 指针推流）
+    "paint_diffusion": 0.35,     # 晕染（颜料在流场里的糊化）
+    "paint_fade": 0.45,          # 消隐速度（越大越"稀"，越快变干净）
+    "paint_click": 1.0,          # 点击扩散强度
     "paint_glow": 0.6,           # 辉光（0 = 关闭，省性能）
     "paint_shading": 0.5,        # 立体感（按亮度梯度着色）
     "paint_hue_spread": 0.5,     # 色相铺开 ±0~180°，1.0 = 整条彩虹
     "paint_color": "#FF4D6D",    # 基准色（只取色相/饱和度）
-    "paint_opacity": 0.9,
+    "paint_opacity": 0.85,
     "spotlight_enabled": False,
     "spotlight_radius": 220.0,
     "spotlight_dim": 0.6,
@@ -187,24 +190,24 @@ PRESETS = {
                   meteor_glow=0.55, meteor_stars=0.22,
                   meteor_color="#FFFFFF", meteor_tail_color="#7FD0FF",
                   meteor_opacity=0.95),
-    # ---- 颜料盘：全屏流体颜料 ----
+    # ---- 颜料盘：鼠标搅动的流体颜料（滑过搅动 / 点击扩散）----
     "颜料盘": dict(rain_enabled=False, snow_enabled=False, petal_enabled=False,
                 meteor_enabled=False, paint_enabled=True,
-                paint_amount=12, paint_size=1.0, paint_speed=1.0,
-                paint_diffusion=0.25, paint_fade=0.35, paint_glow=0.6,
-                paint_shading=0.5, paint_hue_spread=0.5,
-                paint_color="#FF4D6D", paint_opacity=0.9),
+                paint_brush=1.0, paint_flow=1.0, paint_swirl=1.0,
+                paint_diffusion=0.35, paint_fade=0.45, paint_click=1.0,
+                paint_glow=0.6, paint_shading=0.5, paint_hue_spread=0.5,
+                paint_color="#FF4D6D", paint_opacity=0.85),
     "霓虹流体": dict(rain_enabled=False, snow_enabled=False, petal_enabled=False,
                  meteor_enabled=False, paint_enabled=True,
-                 paint_amount=16, paint_size=0.9, paint_speed=1.5,
-                 paint_diffusion=0.18, paint_fade=0.30, paint_glow=0.90,
-                 paint_shading=0.30, paint_hue_spread=1.0,
+                 paint_brush=0.85, paint_flow=1.3, paint_swirl=1.6,
+                 paint_diffusion=0.25, paint_fade=0.55, paint_click=1.4,
+                 paint_glow=0.90, paint_shading=0.30, paint_hue_spread=1.0,
                  paint_color="#7C4DFF", paint_opacity=0.95),
     "水墨": dict(rain_enabled=False, snow_enabled=False, petal_enabled=False,
               meteor_enabled=False, paint_enabled=True,
-              paint_amount=8, paint_size=1.35, paint_speed=0.55,
-              paint_diffusion=0.5, paint_fade=0.16, paint_glow=0.15,
-              paint_shading=0.75, paint_hue_spread=0.0,
+              paint_brush=1.5, paint_flow=0.8, paint_swirl=0.6,
+              paint_diffusion=0.6, paint_fade=0.28, paint_click=0.8,
+              paint_glow=0.10, paint_shading=0.75, paint_hue_spread=0.0,
               paint_color="#5E6B7A", paint_opacity=0.85),
     # ---- 聚光灯：与雨/雪/涟漪自由组合 ----
     "聚光灯": dict(rain_enabled=False, snow_enabled=False,

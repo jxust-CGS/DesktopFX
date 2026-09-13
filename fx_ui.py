@@ -1011,13 +1011,18 @@ class ControlPanel:
     def _page_paint(self, parent):
         p = tk.Frame(parent, bg=BG)
         self._page_head(p, "颜料盘")
+        tk.Label(p, text="鼠标滑过处搅动颜料，点击炸开一圈扩散；\n"
+                         "停手后颜料自行涡旋、消散，屏幕重新变干净。",
+                 bg=BG, fg=SUB, font=FONT_SMALL, justify="left",
+                 anchor="w").pack(fill="x", padx=16, pady=(0, 8))
         c = tk.Frame(p, bg=CARD)
         c.pack(fill="x", padx=16, pady=(0, 8))
         self._toggle(c, "启用颜料盘", "paint_enabled")
-        self._slider(c, "颜料团数", "paint_amount", 0, 60, 1, "{:.0f} 团")
-        self._slider(c, "颜料团大小", "paint_size", 0.4, 3.0, 0.1, "{:.1f} 倍")
-        self._slider(c, "流动速度", "paint_speed", 0.1, 3.0, 0.05, "{:.2f} 倍")
-        self._slider(c, "扩散(糊化)", "paint_diffusion", 0.0, 1.0, 0.05, "{:.0%}")
+        self._slider(c, "笔刷大小", "paint_brush", 0.3, 3.0, 0.1, "{:.1f} 倍")
+        self._slider(c, "落色量", "paint_flow", 0.0, 2.5, 0.05, "{:.2f} 倍")
+        self._slider(c, "搅动强度", "paint_swirl", 0.0, 2.5, 0.05, "{:.2f} 倍")
+        self._slider(c, "点击扩散", "paint_click", 0.0, 2.5, 0.05, "{:.2f} 倍")
+        self._slider(c, "晕染", "paint_diffusion", 0.0, 1.0, 0.05, "{:.0%}")
         self._slider(c, "消隐速度", "paint_fade", 0.0, 1.0, 0.05, "{:.0%}")
         self._slider(c, "辉光", "paint_glow", 0.0, 1.0, 0.05, "{:.0%}")
         self._slider(c, "立体感", "paint_shading", 0.0, 1.0, 0.05, "{:.0%}")

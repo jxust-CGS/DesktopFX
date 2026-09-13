@@ -1482,31 +1482,42 @@ class MeteorField:
 
 # ------------------------------------------------------------------ 颜料盘
 class PaintField:
-    """颜料盘：CPU 版流体颜料，参考 Lively 壁纸 "Fluids"
-    （= PavelDoGreat 的 WebGL Fluid Simulation，MIT）。
+    """颜料盘：鼠标搅动的流体颜料（参考 Lively 壁纸 "Fluids"
+    = PavelDoGreat 的 WebGL Fluid Simulation，MIT）。
 
-    参考工程是**完整 Navier-Stokes**：半拉格朗日平流 + 涡量约束 + Jacobi 压力
-    投影 + bloom + sunrays，全跑 GPU（速度场 228×128、染料场 1820×1024、每帧
-    20 次压力迭代）。CPU 逐像素 overlay 上照搬不可能 60fps，四个取舍：
+    与"全屏自转的色雾"不同，这里是**交互驱动**的：
 
-    1. **不做压力投影**（省掉 20 次 Jacobi，是最大一笔）。改用一个**预烘的
-       curl-noise 基流**：由 φ 旋转梯度得 (u,v) = (∂φ/∂y, −∂φ/∂x)，按构造
-       ∂u/∂x + ∂v/∂y ≡ 0，天然无散度，"不可压缩"的观感一样有。3 条基流各是
-       5 列随机正弦叠加的势场，每帧只按缓慢变化的时间权重混合 —— 每帧 0.2ms，
-       而且流场持续变形，不是一张死图。
-    2. **网格只到 ~110 短边**（16:9 约 198×110 ≈ 22k 格），染料与速度同分辨
-       率，比参考的 1820×1024 粗得多；上屏用最近邻放大。颜料本身是低频的软
-       糊状 + 带辉光，放大后的台阶看不出来。
-    3. **上屏用 take 链放大**，1080p 4.7ms / 3840×1200 9.8ms。同一尺寸下
-       PIL 的 BILINEAR resize 要 46ms、`np.repeat` 要 10.5ms，都更慢。
-    4. **只写有颜料的像素**（`np.copyto(where=)`）。draw 是全屏覆盖写，若直接
-       `u32[:] = ...` 会把先画的聚光灯整片抹掉。多花 ~4ms 换"颜料是一个图层"
-       的正确语义。
+    1. **指针移动 = 搅动**。沿轨迹按间距连续落色，并沿运动方向给流场一记冲量；
+       颜料被拖出去之后又被预烘基流卷成涡旋、拉成丝。
+    2. **点击 = 扩散**。在落点撒一圈**径向向外**的速度冲量 + 一团颜料，
+       颜料被推着向外炸开成一朵。
+    3. **空闲 = 全透明**。没有指针输入就不再注入；已有颜料靠基流继续涡旋，
+       再按 paint_fade 指数消隐，最后整屏干净。draw 只画"有颜料的包围盒"，
+       空闲时几乎零成本 —— 这是它与"自己铺满整屏"的旧版最大的区别。
+
+    参考工程是完整 Navier-Stokes（GPU：228×128 速度场 + 20 次 Jacobi 压力投影
+    + bloom + sunrays）。CPU 逐像素照搬不可能 60fps，四个取舍：
+
+    1. **不做压力投影**（省掉 20 次 Jacobi，最大一笔）。改用**预烘 curl-noise
+       基流**：由 φ 的旋转梯度得 (u,v) = (∂φ/∂y, −∂φ/∂x)，按构造
+       ∂u/∂x + ∂v/∂y ≡ 0，天然无散度。3 条基流各由 5 列随机正弦叠加，只在建
+       网格时算一次；每帧按缓慢变化的时间权重混合（0.2ms），流场持续变形。
+    2. **网格只到 ~110 短边**（16:9 约 198×110 ≈ 22k 格），染料与速度同分辨率，
+       比参考的 1820×1024 粗得多；上屏用最近邻放大。颜料本身是低频软糊状 +
+       带辉光，放大后的台阶看不出来。
+    3. **上屏放大用 take 链 + 先 x 后 y**（见 draw 里的说明），1080p ≈1.1ms。
+    4. **只画包围盒**：颜料稀疏，大部分屏幕常年为空。遮罩赋值只在聚光灯也在场
+       时才需要（否则整片覆盖写就够，更快）。
+
+    **单位约定**（很容易搞错）：`_advect` 里是 `sx = xs − u·gw·dt`，`xs` 是格子
+    坐标，所以 `u` 的量纲是**屏幕宽/秒**，`v` 是**屏幕高/秒**（格是方的，
+    `gw·cell == w`、`gh·cell == h`）。基流 `_FLOW = 0.075` 即"每秒走 7.5% 屏宽"。
 
     颜色存 **RGB**（渲染时才拆进 `_premul_pack(bb, gb, rb, ab)`）—— 落樱在
     这里把红蓝弄反过。
 
-    与其它特效同一套接口（set_amount / set_color / resize / update / draw）。
+    与其它特效同一套接口（set_color / resize / update / draw），另外多两个：
+    `set_pointer()` 每帧喂光标，`reset()` 关闭时清场。
     """
 
     # 网格由"总格数上限"反推短边，保证 16:9 / 21:9 / 4K 双屏都不超预算
@@ -1514,25 +1525,33 @@ class PaintField:
     _G_MIN, _G_MAX = 64, 144
     _BASIS = 3                   # 预烘基流条数
     _WAVES = 5                   # 每条基流叠加的正弦列数
-    _FLOW = 0.075                # 基流速度基准（网格宽/秒），乘 paint_speed
-    _FADE_MIN, _FADE_MAX = 0.02, 0.40    # 消隐速率 1/s（对应 paint_fade 0~1）
-    _R_NORM = 0.05               # 颜料团半径基准（屏幕短边的比例，同参考）
-    _AMP = 1.7                   # 单团峰值浓度
-    _IMPULSE = 0.18              # 单团给流场的冲击强度（网格宽/秒）
-    _DIFF_RATE = 2.5             # 扩散强度基准（1/s），乘 paint_diffusion × dt
+    _FLOW = 0.075                # 基流速度基准（屏宽/秒），乘 paint_swirl
+    _IMP_TAU = 0.22              # 指针/点击冲量场的时间常数（秒）
+    _FOLLOW = 0.55               # 稳态下"流场跟随指针"的比例（见 _pointer 的推导）
+    _FADE_MIN, _FADE_MAX = 0.15, 1.10   # 消隐速率 1/s（对应 paint_fade 0~1）
+    _R_NORM = 0.042              # 笔刷半径基准（屏幕短边比例），乘 paint_brush
+    _AMP = 0.18                  # 单团峰值浓度基准，乘 paint_flow
+    _CLICK_PUSH = 6.00           # 点击径向冲量峰值（屏宽/秒），乘 paint_click
+    _DIFF_RATE = 2.5             # 晕染强度基准（1/s），乘 paint_diffusion × dt
     _DYE_CLAMP = 3.0             # 浓度上限，防叠加爆表
+    _SPAN = 0.55                 # 轨迹采样间距 = 笔刷半径 × 该值（<1 才连成笔触）
+    _MAX_STEPS = 32              # 单帧最多落几团（防高速甩鼠标爆开销）
+    _TELEPORT = 0.45             # 单帧位移超屏幕对角线这个比例 -> 视为瞬移，不断笔
+    _BBOX_EPS = 1.0e-3           # 包围盒判定阈值（低于它的格子打包后必为 0）
 
     def __init__(self, w, h, seed=37):
         self.rng = np.random.default_rng(seed)
         self.gh = self.gw = 0
         self.w, self.h = 0, 0
-        self._want = 0
-        self._acc = 0.0
         self._t = 0.0
+        self._imp_k = 0.1            # 本帧的冲量注入系数（update 里按 dt 算）
         self._hue = 0.96             # 基准色相（#FF4D6D 的 hsv.h）
         self._sat = 0.70
         self._hue_src = None
         self._om = np.array((0.0105, 0.0172, 0.0251), np.float32)
+        self._in = None              # 本帧指针（覆盖层屏幕坐标）
+        self._ouse = None            # 上一次被消费的指针（格子坐标）
+        self._dirty = False          # 场里有东西时置位（让 reset 幂等）
         self._build(w, h)
 
     # ------------------------------------------------------------ 网格 / 基流
@@ -1553,6 +1572,7 @@ class PaintField:
         self.cell = float(h) / float(gh)                    # 方格：w/gw == h/gh
         self.r_base = max(1.5, self._R_NORM * float(min(w, h)) / max(self.cell, 1e-6))
         self.dye = np.zeros((gh, gw, 3), np.float32)
+        self._dye2 = np.zeros((gh, gw, 3), np.float32)   # 平流双缓冲，免每帧分配
         self._iu = np.zeros((gh, gw), np.float32)
         self._iv = np.zeros((gh, gw), np.float32)
         self._ys = np.arange(gh, dtype=np.float32)[:, None]
@@ -1563,9 +1583,10 @@ class PaintField:
         self._ix = (np.arange(w, dtype=np.int64) * gw // w)
         self._bu, self._bv = self._make_basis(gh, gw)
         self._phase = self.rng.uniform(0.0, TAU, self._BASIS).astype(np.float32)
-        self._acc = 0.0
         self._t = 0.0
-        self._primed = False
+        self._in = None
+        self._ouse = None
+        self._dirty = False
 
     def _make_basis(self, gh, gw):
         """预烘 _BASIS 条无散度基流，各自把 RMS 归一到 1。
@@ -1598,8 +1619,15 @@ class PaintField:
         if (w, h) != (self.w, self.h):
             self._build(w, h)
 
-    def set_amount(self, n, w=None, h=None):
-        self._want = max(0, int(n))
+    def reset(self):
+        """关闭颜料盘时清场（幂等：本来就没东西就立刻返回）。"""
+        if not self._dirty:
+            return
+        self._dirty = False
+        self.dye[:] = 0.0
+        self._iu[:] = 0.0
+        self._iv[:] = 0.0
+        self._ouse = None
 
     def set_color(self, hex_str):
         """基准色：由它取色相/饱和度，每团的色相再按 paint_hue_spread 抖动。"""
@@ -1612,9 +1640,32 @@ class PaintField:
         # 基准色偏灰时也把饱和度托起来，否则"颜料盘"会发浊
         self._sat = float(min(1.0, max(0.55, ss)))
 
-    # ------------------------------------------------------------ 颜料团
-    def _splat(self, cx, cy, r, amp, col):
-        """在 (cx,cy) 落一团高斯颜料，并给流场一记随机方向的冲击。"""
+    def set_pointer(self, x, y, clicked=0):
+        """每帧喂入光标（覆盖层屏幕坐标）。
+
+        **特效关闭时也要喂**：`_ouse` 是"上一次被消费的指针"，只在 update()
+        里推进；若只在启用时才喂，重新启用后的第一帧会拿着很久以前的旧位置
+        算出一条横贯屏幕的笔触（_pointer 里还有一道瞬移保护兜底）。
+        """
+        self._in = (float(x), float(y), int(clicked))
+
+    # ------------------------------------------------------------ 落笔
+    def _stroke_color(self, cfg):
+        """落笔颜色：基准色相 ± hue_spread/2。每帧重掷一次，一笔里自然变色。"""
+        spread = float(np.clip(cfg.get("paint_hue_spread", 0.5), 0.0, 1.0)) * 0.5
+        h = self._hue + spread * float(self.rng.uniform(-1.0, 1.0))
+        s = float(min(1.0, self._sat * self.rng.uniform(0.85, 1.12)))
+        r, g, b = _hsv_to_rgb(np.array([h], np.float32),
+                              np.array([s], np.float32),
+                              np.ones(1, np.float32))
+        return np.array((float(r[0]), float(g[0]), float(b[0])), np.float32)
+
+    def _splat(self, cx, cy, r, amp, col, push=(0.0, 0.0), radial=0.0):
+        """落一团高斯颜料，并（可选）给流场加冲量。
+
+        `push` 是均匀方向的速度（屏宽/秒），`radial` 是以落点为心的向外扩散
+        强度（屏宽/秒）。两者互斥，radial 优先。
+        """
         gh, gw = self.gh, self.gw
         ext = 2.6 * r
         x0 = int(max(0, np.floor(cx - ext)))
@@ -1626,58 +1677,139 @@ class PaintField:
         xs = np.arange(x0, x1, dtype=np.float32)[None, :] - np.float32(cx)
         ys = np.arange(y0, y1, dtype=np.float32)[:, None] - np.float32(cy)
         gg = np.exp(-(xs * xs + ys * ys) / np.float32(2.0 * r * r))
-        gg *= np.float32(amp)
-        self.dye[y0:y1, x0:x1] += gg[..., None] * col[None, None, :]
-        ang = float(self.rng.uniform(0.0, 2.0 * np.pi))
-        mag = np.float32(self._IMPULSE * amp * float(self.rng.uniform(0.6, 1.4)))
-        self._iu[y0:y1, x0:x1] += gg * np.float32(np.cos(ang) * mag)
-        self._iv[y0:y1, x0:x1] += gg * np.float32(np.sin(ang) * mag)
+        self.dye[y0:y1, x0:x1] += (gg * np.float32(amp))[..., None] * col[None, None, :]
+        if radial != 0.0:
+            # 方向必须"饱和"：直接拿 (xs, ys) 当方向的话，落点中心附近的速度 ~0，
+            # 而高斯核的质量恰恰集中在中心 —— 整团几乎推不动（实测半径只涨 2 格）。
+            # 把半径下限卡在 0.30r，中心以外的质量就都吃得到接近满值的推力。
+            inv = np.float32(radial) / np.maximum(
+                np.sqrt(xs * xs + ys * ys), np.float32(0.30 * r))
+            self._iu[y0:y1, x0:x1] += gg * (xs * inv)
+            self._iv[y0:y1, x0:x1] += gg * (ys * inv)
+        elif push[0] != 0.0 or push[1] != 0.0:
+            ga = gg * np.float32(amp)
+            self._iu[y0:y1, x0:x1] += ga * np.float32(push[0])
+            self._iv[y0:y1, x0:x1] += ga * np.float32(push[1])
+        self._dirty = True
 
-    def _spawn(self, k, cfg, spread, r_scale=1.0, amp_scale=1.0):
-        if k <= 0:
+    def _burst(self, gx, gy, r, flow, cfg):
+        """点击 -> 落点炸开一圈**径向向外**的冲量 + 一团颜料（"扩散"）。"""
+        click = float(np.clip(cfg.get("paint_click", 1.0), 0.0, 3.0))
+        if click <= 0.0:
             return
-        gh, gw = self.gh, self.gw
-        rng = self.rng
-        r0 = self.r_base * float(cfg.get("paint_size", 1.0)) * r_scale
-        hues = self._hue + spread * rng.uniform(-1.0, 1.0, k)
-        sats = np.minimum(1.0, self._sat * rng.uniform(0.85, 1.12, k))
-        cr, cg, cb = _hsv_to_rgb(hues, sats, np.ones(k))
-        cols = np.stack([cr, cg, cb], axis=1).astype(np.float32)
-        cxs = rng.uniform(0.0, float(gw), k)
-        cys = rng.uniform(0.0, float(gh), k)
-        rs = np.maximum(1.2, r0 * rng.uniform(0.65, 1.5, k))
-        amps = self._AMP * amp_scale * rng.uniform(0.7, 1.3, k)
-        for i in range(k):
-            self._splat(float(cxs[i]), float(cys[i]), float(rs[i]),
-                        float(amps[i]), cols[i])
+        self._splat(gx, gy, r * 2.0, self._AMP * 2.4 * flow,
+                    self._stroke_color(cfg),
+                    radial=self._CLICK_PUSH * click)
 
-    # ------------------------------------------------------------ 每帧
-    def _advect(self, u, v, dt):
+    def _pointer(self, dt, cfg):
+        """把这一帧的光标轨迹翻译成"落色 + 推流"。"""
+        ptr = self._in
+        if ptr is None:
+            return
+        px, py, clicked = ptr
+        self._in = None                       # 一个位置只消费一次
+        gx = px / self.cell
+        gy = py / self.cell
+        gw, gh = self.gw, self.gh
+
+        flow = float(np.clip(cfg.get("paint_flow", 1.0), 0.0, 3.0))
+        swirl = float(np.clip(cfg.get("paint_swirl", 1.0), 0.0, 3.0))
+        r = max(1.2, self.r_base * float(np.clip(cfg.get("paint_brush", 1.0),
+                                                 0.1, 4.0)))
+
+        # 点击：先炸（与"是否移动"无关，原地也能扩散）
+        if clicked:
+            self._burst(gx, gy, r, max(flow, 0.25), cfg)
+
+        if self._ouse is None:
+            self._ouse = (gx, gy)
+            return
+        ox, oy = self._ouse
+        self._ouse = (gx, gy)
+        dx = gx - ox
+        dy = gy - oy
+        dist = float(np.hypot(dx, dy))
+        if dist < 1e-4 or flow <= 0.0:
+            return
+        if dist > float(np.hypot(gw, gh)) * self._TELEPORT:
+            return                            # 光标瞬移：只重新对位，不拉一条长线
+
+        # 沿轨迹按间距采样，连成笔触（和流星拖尾同一个套路：间距 < 直径）
+        span = max(0.5, r * self._SPAN)
+        k = int(min(self._MAX_STEPS, max(1, np.ceil(dist / span))))
+        t = np.arange(1, k + 1, dtype=np.float32) / np.float32(k)
+        cx = ox + dx * t
+        cy = oy + dy * t
+
+        # 推流强度：本帧位移 -> 速度（屏宽或屏高/秒），再乘注入系数。
+        # 系数取 `imp_k × FOLLOW`，其中 imp_k = 1 − exp(−dt/tau) 是这一帧冲量场
+        # 的衰减比例，于是**稳态冲量 = 指针速度 × FOLLOW**（与帧率无关）。
+        # 不要写成"每帧加一个固定量"：冲量场是累加的，固定量会让稳态速度
+        # 变成指针速度的几十倍（0.55/0.015 ≈ 37×），颜料瞬间飞出屏幕。
+        a = self._imp_k * self._FOLLOW * swirl
+        inv_dt = 1.0 / max(dt, 1e-4)
+        vx = dx / float(gw) * inv_dt * a
+        vy = dy / float(gh) * inv_dt * a
+        amp = self._AMP * flow
+        col = self._stroke_color(cfg)
+        for i in range(k):
+            self._splat(float(cx[i]), float(cy[i]), r, amp, col, push=(vx, vy))
+
+    # ------------------------------------------------------------ 平流
+    def _active_box(self, pad):
+        """有颜料的格子范围（含 pad 余量），返回 (y0, y1, x0, x1)；全空则 None。
+
+        颜料是**稀疏**的（鼠标划到哪才有），全网格重算纯属浪费；这是"挂着不费电"
+        的前提。亮通道用 maximum 链而不是 `d.max(axis=2)` —— 后者对"最后一维只有
+        3 个"走通用 reduce，慢十几倍。
+        """
+        d = self.dye
+        lum = np.maximum(np.maximum(d[..., 0], d[..., 1]), d[..., 2])
+        rows = np.flatnonzero(lum.max(axis=1) > self._BBOX_EPS)
+        if rows.size == 0:
+            return None
+        cols = np.flatnonzero(lum.max(axis=0) > self._BBOX_EPS)
+        return (max(0, int(rows[0]) - pad), min(self.gh, int(rows[-1]) + 1 + pad),
+                max(0, int(cols[0]) - pad), min(self.gw, int(cols[-1]) + 1 + pad))
+
+    def _advect(self, u, v, dt, box=None):
         """半拉格朗日平流：反查 (x − u·dt) 处的染料，双线性插值。
 
+        `box` 限定只算这一块 —— 只画了一小片时没必要全网格重算。
         用 `take` 展平索引而不是 2D fancy-index：同样 4 个角点，RGB 三通道
         一起取，实测比 `d[y0, x0]` 快近一倍。
         """
         gh, gw = self.gh, self.gw
-        sy = np.clip(self._ys - v * np.float32(gh * dt), 0.0, gh - 1.001)
-        sx = np.clip(self._xs - u * np.float32(gw * dt), 0.0, gw - 1.001)
-        y0 = sy.astype(np.int32)
-        x0 = sx.astype(np.int32)
-        # 必须把索引转 float32 再相减：int32 - float32 会被提升成 float64，
-        # 后面 4 个 (n,3) 的临时数组会全部翻倍。
-        fy = (sy - y0.astype(np.float32)).reshape(-1, 1)
-        fx = (sx - x0.astype(np.float32)).reshape(-1, 1)
-        base = (y0 * np.int32(gw) + x0).reshape(-1)
-        fl = self.dye.reshape(-1, 3)
-        c00 = fl.take(base, axis=0)
-        c01 = fl.take(base + 1, axis=0)
-        c10 = fl.take(base + gw, axis=0)
-        c11 = fl.take(base + gw + 1, axis=0)
-        out = (c00 * ((1.0 - fx) * (1.0 - fy))
-               + c01 * (fx * (1.0 - fy))
-               + c10 * ((1.0 - fx) * fy)
-               + c11 * (fx * fy))
-        self.dye = out.reshape(gh, gw, 3)
+        if box is None:
+            box = (0, gh, 0, gw)
+        y0, y1, x0, x1 = box
+        prev = self.dye
+        out = self._dye2
+        # box 外必须是 0：上一帧留在那里的数据要丢掉（平流把它搬走了）
+        out[:] = 0.0
+        if y1 > y0 and x1 > x0:
+            ys = np.arange(y0, y1, dtype=np.float32)[:, None]
+            xs = np.arange(x0, x1, dtype=np.float32)[None, :]
+            sy = np.clip(ys - v[y0:y1, x0:x1] * np.float32(gh * dt), 0.0, gh - 1.001)
+            sx = np.clip(xs - u[y0:y1, x0:x1] * np.float32(gw * dt), 0.0, gw - 1.001)
+            by = sy.astype(np.int32)
+            bx = sx.astype(np.int32)
+            # 必须把索引转 float32 再相减：int32 - float32 会被提升成 float64，
+            # 后面 4 个 (n,3) 的临时数组会全部翻倍。
+            fy = (sy - by.astype(np.float32)).reshape(-1, 1)
+            fx = (sx - bx.astype(np.float32)).reshape(-1, 1)
+            base = (by * np.int32(gw) + bx).reshape(-1)
+            fl = prev.reshape(-1, 3)
+            c00 = fl.take(base, axis=0)
+            c01 = fl.take(base + 1, axis=0)
+            c10 = fl.take(base + gw, axis=0)
+            c11 = fl.take(base + gw + 1, axis=0)
+            got = (c00 * ((1.0 - fx) * (1.0 - fy))
+                   + c01 * (fx * (1.0 - fy))
+                   + c10 * ((1.0 - fx) * fy)
+                   + c11 * (fx * fy))
+            out[y0:y1, x0:x1] = got.reshape(y1 - y0, x1 - x0, 3)
+        self.dye, self._dye2 = out, prev
 
     def update(self, dt, cfg):
         dt = float(min(max(dt, 0.0), 0.1))
@@ -1685,6 +1817,7 @@ class PaintField:
             return
         self._t += dt
         gh, gw = self.gh, self.gw
+        swirl = float(np.clip(cfg.get("paint_swirl", 1.0), 0.0, 3.0))
 
         # 1) 时间权重混合出本帧的基流（每帧只此一笔，三角函数早已烘好）
         wt = 0.5 + 0.5 * np.sin(TAU * np.float32(self._t) * self._om + self._phase)
@@ -1694,30 +1827,35 @@ class PaintField:
         for i in range(1, self._BASIS):
             u += bu[i] * wt[i]
             v += bv[i] * wt[i]
+        u *= np.float32(swirl * self._FLOW)
+        v *= np.float32(swirl * self._FLOW)
 
-        # 2) 冲击场：衰减 + 轻微扩散（让被"甩"出去的颜料边缘柔和）
-        self._iu *= np.float32(0.985)
-        self._iv *= np.float32(0.985)
-        _smooth5(self._iu, 0.25, 1)
-        _smooth5(self._iv, 0.25, 1)
-
-        sp = float(np.clip(cfg.get("paint_speed", 1.0), 0.05, 4.0)) * self._FLOW
-        np.add(u, self._iu, out=u)
-        np.add(v, self._iv, out=v)
-        u *= np.float32(sp)
-        v *= np.float32(sp)
+        # 2) 指针冲量场：按固定时间常数衰减 + 轻微扩散（把"手"的运动抹开一点）
+        decay = float(np.exp(-dt / self._IMP_TAU))
+        self._iu *= np.float32(decay)
+        self._iv *= np.float32(decay)
+        _smooth5(self._iu, 0.22, 1)
+        _smooth5(self._iv, 0.22, 1)
+        self._imp_k = 1.0 - decay
+        u += self._iu
+        v += self._iv
 
         # 3) 平流 -> 颜料被拉出丝（流体的灵魂，不能省）
-        self._advect(u, v, dt)
-        # 必须在这里**重新**取一次：_advect 里换成了新的 self.dye，
-        # 若沿用上面缓存的旧引用，后面的扩散/消隐/钳制会全部作用在已经
-        # 被丢弃的那一份上 —— 新数组永不衰减，颜料会无限堆积（踩过）。
+        #    只算"有颜料的格子"那块：本帧速度决定了颜料最远能搬多远，那就是余量。
+        #    画面干净时 box 为 None -> 整段跳过，空闲帧几乎不花钱。
+        pad = 2 + int(np.ceil(max(float(np.abs(u).max()) * gw,
+                                  float(np.abs(v).max()) * gh) * dt))
+        box = self._active_box(pad)
+        if box is not None:
+            self._advect(u, v, dt, box)
+        # 必须在这里**重新**取一次：_advect 里换成了新的 self.dye（双缓冲换位），
+        # 若沿用上面缓存的旧引用，后面的扩散/消隐会全部作用在已经被丢弃的
+        # 那一份上 —— 新数组永不衰减，颜料会无限堆积（踩过）。
         dye = self.dye
 
-        # 4) 扩散（糊化）+ 消隐
-        # 扩散必须按 dt 缩放：写成"每帧固定糊一下"的话，60fps 下每秒糊 120 遍，
-        # 十几秒后 12 团颜料会摊成一整屏均匀的色糊（实测 lit=100%、dye≈3）。
-        diff = float(np.clip(cfg.get("paint_diffusion", 0.25), 0.0, 1.0))
+        # 4) 晕染 + 消隐。两者都必须按 dt 缩放：写成"每帧固定糊一下 / 减一点"
+        #    的话，60fps 下等于每秒 60 次，十几秒后颜料摊成整屏均匀色糊。
+        diff = float(np.clip(cfg.get("paint_diffusion", 0.35), 0.0, 1.0))
         if diff > 0.0:
             _smooth5(dye, self._DIFF_RATE * diff * dt, 2)
         fade = self._FADE_MIN + self._FADE_MAX * float(
@@ -1725,25 +1863,8 @@ class PaintField:
         dye *= np.float32(np.exp(-fade * dt))
         np.clip(dye, 0.0, self._DYE_CLAMP, out=dye)
 
-        # 5) 生成：amount 是"稳态团数"，速率 = 团数 / 平均寿命（1/消隐速率）
-        want = self._want
-        spread = float(np.clip(cfg.get("paint_hue_spread", 0.5), 0.0, 1.0)) * 180.0 / 360.0
-        if not self._primed:
-            # 首次启用先铺一层：否则要等十几秒颜料才铺满屏幕
-            self._primed = True
-            self._spawn(max(4, min(10, want)), cfg, spread,
-                        r_scale=1.45, amp_scale=1.3)
-        if want <= 0:
-            self._acc = 0.0
-            return
-        # 生成速率 = 目标团数 / 平均寿命，而指数衰减的平均寿命就是 1/fade，
-        # 所以速率 = want × fade。写成 want/fade 就等于按"寿命"倍放大，
-        # 默认参数下会从 1.9 团/秒变成 75 团/秒（踩过）。
-        self._acc += float(want) * fade * dt
-        n = int(self._acc)
-        if n > 0:
-            self._acc -= n
-            self._spawn(min(n, 24), cfg, spread)
+        # 5) 光标注入放在最后：本帧刚落的颜料不该再被本帧的消隐/晕染打折
+        self._pointer(dt, cfg)
 
     # ------------------------------------------------------------ 绘制
     def _bloom(self, d):
@@ -1760,7 +1881,14 @@ class PaintField:
         if (w, h) != (self.w, self.h):
             self.resize(w, h)
         op = float(np.clip(cfg.get("paint_opacity", 0.9), 0.0, 1.0))
-        if op <= 0.0:
+        if op <= 0.0 or not self._dirty:
+            return
+        # 空场必须是免费的：辉光 / 立体感 / 打包全都别做。颜料稀疏，画面上
+        # 大部分时间就是这种"鼠标刚停下、颜料已散尽"的状态。
+        d0 = self.dye
+        if not (np.maximum(np.maximum(d0[..., 0], d0[..., 1]),
+                           d0[..., 2]).max() > self._BBOX_EPS):
+            self._dirty = False
             return
         glow = float(np.clip(cfg.get("paint_glow", 0.0), 0.0, 1.0))
         shading = float(np.clip(cfg.get("paint_shading", 0.0), 0.0, 1.0))
@@ -1782,6 +1910,26 @@ class PaintField:
             d = d * sh[..., None]
             lum = lum * sh
 
+        # ---- 只画"有颜料"的包围盒 ----
+        # 颜料是稀疏的（鼠标划到哪才有），空闲时这里直接返回，整帧零成本。
+        # 阈值 1e-3：打包时 a01*255 要四舍五入到 1 需要 a01 ≥ 0.002，
+        # 低于阈值的格子渲染出来必然是 0，裁掉不会丢任何可见像素。
+        rows = np.flatnonzero(lum.max(axis=1) > self._BBOX_EPS)
+        if rows.size == 0:
+            return
+        cols = np.flatnonzero(lum.max(axis=0) > self._BBOX_EPS)
+        gy0 = max(0, int(rows[0]) - 1)
+        gy1 = min(self.gh, int(rows[-1]) + 2)
+        gx0 = max(0, int(cols[0]) - 1)
+        gx1 = min(self.gw, int(cols[-1]) + 2)
+        # 格子 -> 屏幕：反查 _iy / _ix（单调不减，searchsorted 精确且便宜）
+        y0 = int(np.searchsorted(self._iy, gy0, "left"))
+        y1 = int(np.searchsorted(self._iy, gy1 - 1, "right"))
+        x0 = int(np.searchsorted(self._ix, gx0, "left"))
+        x1 = int(np.searchsorted(self._ix, gx1 - 1, "right"))
+        if y1 <= y0 or x1 <= x0:
+            return
+
         # alpha = 亮度，RGB = 归一化后的色相 -> 颜料像"发光"的而不是一块死色
         a01 = np.clip(lum, 0.0, 1.0) * op
         rgb = d / np.maximum(lum, np.float32(1e-5))[..., None]
@@ -1799,17 +1947,18 @@ class PaintField:
         # 赋给 C 连续的 dst 会走"转置拷贝"慢路径（1080p 14.3ms）。
         # 换成先 x 后 y，结果就是 C 连续，赋值只要 1.1ms。
         # 两步都用 `take` 又比裸 fancy-index 快一截：
-        #   1080p  5.4 -> 4.7ms，3840×1200  15.8 -> 9.8ms。
-        big = np.take(small, self._ix, axis=1)[self._iy]
-        dst = u32.reshape(h, w)
+        #   1080p 5.4 -> 4.7ms，3840×1200 15.8 -> 9.8ms。
+        # 这里先按包围盒裁出 sub，再放大 —— 空闲 / 只有一小片颜料时几乎免费。
+        sub = small[gy0:gy1, gx0:gx1]
+        big = np.take(sub, self._ix[x0:x1] - gx0, axis=1)[self._iy[y0:y1] - gy0]
+        dst = u32.reshape(h, w)[y0:y1, x0:x1]
         if cfg.get("spotlight_enabled", False):
-            # 已经有全屏层（聚光灯）画过：只覆盖真有颜料的像素，别整片抹掉
+            # 聚光灯是整屏图层，不能整片覆盖写 —— 只写真有颜料的像素
             np.copyto(dst, big, where=big != 0)
         else:
             dst[:] = big
 
 
-# ------------------------------------------------------------------ 光标拖尾
 class CursorTrailField:
     """光标拖尾：复用鼠标坐标（Scene 每帧 feed 当前位置），在环形缓冲里
     记录最近若干帧的落点，绘制成由近及远逐渐淡出的柔边圆点，形成"彗星尾"。

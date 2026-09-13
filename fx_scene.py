@@ -119,16 +119,21 @@ class Scene:
             self.spot.set_color(cfg["spotlight_color"])
             self.spot.draw(u32, w, h, cfg)
 
-        # ---------------- 颜料盘（全屏流体颜料）
-        # 必须排在聚光灯**之后**：它的 draw 会覆盖大半个屏幕，先画就把聚光灯抹了；
-        # 同时它自己会检测 spotlight_enabled，改成"只覆盖有颜料的像素"（见 draw）。
+        # ---------------- 颜料盘（鼠标搅动的流体颜料）
+        # 排在聚光灯**之后**：它的 draw 会写包围盒内的整片像素，先画就把聚光灯抹了
+        # （聚光灯在的时候它会自动改成"只写有颜料的像素"，见 PaintField.draw）。
+        # 指针位置**每帧都喂，特效关着也喂** —— 否则重新启用时"上一次被消费的
+        # 指针"还停在很久以前的位置，第一帧会画出一条横贯屏幕的长笔触。
+        self.paint.set_pointer(float(self.mouse.mx), float(self.mouse.my),
+                               int(self.mouse.clicked))
         if cfg.get("paint_enabled", False):
-            self.paint.set_amount(int(cfg.get("paint_amount", 12)), w, h)
             if self._last_paint_color != cfg["paint_color"]:
                 self.paint.set_color(cfg["paint_color"])
                 self._last_paint_color = cfg["paint_color"]
             self.paint.update(dt, cfg)
             self.paint.draw(u32, w, h, cfg)
+        else:
+            self.paint.reset()
 
         # ---------------- 雨（独立开关）
         if cfg.get("rain_enabled", True):
