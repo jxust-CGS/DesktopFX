@@ -12,9 +12,9 @@
 """
 import numpy as np
 
-from fx_effects import (RainField, RippleField, Lightning, MouseProbe,
-                        SnowField, SpotlightField,
-                        WindowProbe, hex_to_bgr)
+from fx_effects import (RainField, RippleField, Lightning, MeteorField,
+                        MouseProbe, PaintField, PetalField, SnowField,
+                        SpotlightField, WindowProbe, hex_to_bgr)
 
 
 class Scene:
@@ -22,6 +22,9 @@ class Scene:
         self.w, self.h = w, h
         self.rain = RainField(w, h, seed=7)
         self.snow = SnowField(w, h, seed=9)
+        self.petals = PetalField(w, h, seed=23)         # 落樱
+        self.meteors = MeteorField(w, h, seed=31)       # 流星雨
+        self.paint = PaintField(w, h, seed=37)          # 颜料盘
         self.ripples = RippleField()
         self.bolt = Lightning()
         self.mouse = MouseProbe()
@@ -39,6 +42,11 @@ class Scene:
         self.acc = 0.0
         self._last_color = None
         self._last_snow_color = None
+        self._last_petal_color = None
+        self._last_petal_edge = None
+        self._last_meteor_color = None
+        self._last_meteor_tail = None
+        self._last_paint_color = None
         self._last_ripple_color = None
         self._ripple_color_cache = hex_to_bgr("#7FE7FF")
 
@@ -58,6 +66,9 @@ class Scene:
         self.w, self.h = w, h
         self.rain.resize(w, h)
         self.snow.resize(w, h)
+        self.petals.resize(w, h)
+        self.meteors.resize(w, h)
+        self.paint.resize(w, h)
         self.spot.resize(w, h)
 
     def _ripple_color(self):
@@ -108,6 +119,17 @@ class Scene:
             self.spot.set_color(cfg["spotlight_color"])
             self.spot.draw(u32, w, h, cfg)
 
+        # ---------------- 颜料盘（全屏流体颜料）
+        # 必须排在聚光灯**之后**：它的 draw 会覆盖大半个屏幕，先画就把聚光灯抹了；
+        # 同时它自己会检测 spotlight_enabled，改成"只覆盖有颜料的像素"（见 draw）。
+        if cfg.get("paint_enabled", False):
+            self.paint.set_amount(int(cfg.get("paint_amount", 12)), w, h)
+            if self._last_paint_color != cfg["paint_color"]:
+                self.paint.set_color(cfg["paint_color"])
+                self._last_paint_color = cfg["paint_color"]
+            self.paint.update(dt, cfg)
+            self.paint.draw(u32, w, h, cfg)
+
         # ---------------- 雨（独立开关）
         if cfg.get("rain_enabled", True):
             amount = int(cfg["rain_amount"])
@@ -138,6 +160,32 @@ class Scene:
                 self._last_snow_color = cfg["snow_color"]
             self.snow.update(dt, cfg)
             self.snow.draw(u32, w, h, cfg)
+
+        # ---------------- 落樱（独立开关，与雨/雪正交）----
+        if cfg.get("petal_enabled", False):
+            amount = int(cfg.get("petal_amount", 160))
+            self.petals.set_amount(amount, w, h)
+            if self._last_petal_color != cfg["petal_color"]:
+                self.petals.set_color(cfg["petal_color"])
+                self._last_petal_color = cfg["petal_color"]
+            if self._last_petal_edge != cfg["petal_edge_color"]:
+                self.petals.set_edge_color(cfg["petal_edge_color"])
+                self._last_petal_edge = cfg["petal_edge_color"]
+            self.petals.update(dt, cfg)
+            self.petals.draw(u32, w, h, cfg)
+
+        # ---------------- 流星雨（独立开关，与雨/雪/落樱正交）----
+        if cfg.get("meteor_enabled", False):
+            amount = int(cfg.get("meteor_amount", 14))
+            self.meteors.set_amount(amount, w, h)
+            if self._last_meteor_color != cfg["meteor_color"]:
+                self.meteors.set_color(cfg["meteor_color"])
+                self._last_meteor_color = cfg["meteor_color"]
+            if self._last_meteor_tail != cfg["meteor_tail_color"]:
+                self.meteors.set_tail_color(cfg["meteor_tail_color"])
+                self._last_meteor_tail = cfg["meteor_tail_color"]
+            self.meteors.update(dt, cfg)
+            self.meteors.draw(u32, w, h, cfg)
 
         # ---------------- 鼠标涟漪（由鼠标轨迹 / 点击触发，dist 已在上面临时算出）
         if cfg.get("ripple_move", True) and dist > 0.0:

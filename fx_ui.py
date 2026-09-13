@@ -44,6 +44,17 @@ RAIN_COLORS = ["#BFE3FF", "#FFFFFF", "#A9D6F5", "#7FE7C4", "#FFD9A0", "#E0B3FF"]
 RIPPLE_COLORS = ["#7FE7FF", "#FFFFFF", "#5FD0FF", "#7CFFB2", "#FFC46B", "#FF8FB1"]
 SNOW_COLORS = ["#FFFFFF", "#EAF2FF", "#DCEBFF", "#C9DEFF", "#F2F6FF", "#FFEAF2"]
 SPOTLIGHT_COLORS = ["#05070A", "#04060A", "#0A1A2A", "#1A0A12", "#100A00"]
+# 落樱双色：花瓣是"主体 -> 边缘"的渐变，所以要两组（不是一组色的明暗变体）
+PETAL_COLORS = ["#FF9DB6", "#FF8AA8", "#F58BB0", "#FFB3C7", "#FFFFFF", "#E8A0C8"]
+PETAL_EDGE_COLORS = ["#FFF0F4", "#FFEAF0", "#FFFFFF", "#FFD9E6", "#FFF6F9",
+                     "#F2D7E4"]
+# 流星双色：头部是 additive 的纯白热点，尾部渐隐到彩色
+METEOR_COLORS = ["#FFFFFF", "#EAF6FF", "#FFF6E0", "#E8F0FF", "#FFE9F2", "#F0FFFF"]
+METEOR_TAIL_COLORS = ["#5FB8F0", "#9FC8FF", "#7FD0FF", "#5FE0D0", "#C08FE8",
+                      "#F0A860"]
+# 颜料盘：只取基准色的**色相/饱和度**，实际每团色相再按 paint_hue_spread 抖动，
+# 所以这里给的是"基准色"而不是"唯一色"。
+PAINT_COLORS = ["#FF4D6D", "#7C4DFF", "#20C997", "#FFB020", "#38BDF8", "#F06292"]
 
 FONT_LABEL = ("Microsoft YaHei UI", 9)
 FONT_TITLE = ("Microsoft YaHei UI", 10, "bold")   # 顶栏程序名
@@ -338,6 +349,22 @@ class _NavIcon(tk.Canvas):
                 line([c - 5 * math.cos(rad), c - 5 * math.sin(rad),
                       c + 5 * math.cos(rad), c + 5 * math.sin(rad)])
             dot(c, c, 1.5)
+        elif n == "落樱":
+            # 顶端两个小瓣中间凹一下 = 花瓣的凹口，底端收成尖
+            line([5.5, 5.5, 7.5, 3.0, 9.0, 5.0, 10.5, 3.0, 12.5, 5.5,
+                  12.5, 10.5, 9.0, 15.0, 5.5, 10.5, 5.5, 5.5])
+        elif n == "流星雨":
+            # 一条斜向的长尾：头部实心点 + 尾巴由粗到细三笔
+            line([4.5, 13.5, 13.5, 4.5])
+            dot(14.0, 4.0, 1.6)
+            dot(12.4, 5.6, 1.2)
+        elif n == "颜料盘":
+            # 画家调色板：椭圆盘 + 拇指孔 + 三坨颜料
+            ring(9.5, 9.5, 6.0, 1.4)
+            dot(5.6, 6.4, 1.5)
+            dot(10.6, 5.6, 1.4)
+            dot(6.2, 11.2, 1.3)
+            ring(12.4, 12.6, 1.5, 1.2)
         elif n == "聚光灯":
             ring(9, 8, 4)
             line([9, 1, 9, 3])
@@ -372,6 +399,19 @@ class _NavIcon(tk.Canvas):
                                    c + 5 * math.cos(rad), c + 5 * math.sin(rad)], w)
             self.create_oval(c - 1.5, c - 1.5, c + 1.5, c + 1.5,
                              fill=self.color, outline="")
+        elif n == "落樱":
+            self._legacy_line([5.5, 5.5, 7.5, 3.0, 9.0, 5.0, 10.5, 3.0,
+                               12.5, 5.5, 12.5, 10.5, 9.0, 15.0, 5.5, 10.5,
+                               5.5, 5.5], w)
+        elif n == "流星雨":
+            self._legacy_line([4.5, 13.5, 13.5, 4.5], w)
+            self.create_oval(12.6, 2.6, 15.4, 5.4, fill=self.color, outline="")
+        elif n == "颜料盘":
+            self.create_oval(3.5, 3.5, 15.5, 15.5, outline=self.color, width=w)
+            for cx, cy in ((5.6, 6.4), (10.6, 5.6), (6.2, 11.2)):
+                self.create_oval(cx - 1.5, cy - 1.5, cx + 1.5, cy + 1.5,
+                                 fill=self.color, outline="")
+            self.create_oval(10.9, 11.1, 13.9, 14.1, outline=self.color, width=w)
         elif n == "聚光灯":
             self.create_oval(5, 4, 13, 12, outline=self.color, width=w)
             self._legacy_line([9, 1, 9, 3], w)
@@ -539,6 +579,9 @@ class ControlPanel:
         nav_defs = [
             ("下雨", "下雨"),
             ("下雪", "下雪"),
+            ("落樱", "落樱"),
+            ("流星雨", "流星雨"),
+            ("颜料盘", "颜料盘"),
             ("聚光灯", "聚光灯"),
             ("窗口水波", "窗口水波"),
             ("涟漪", "涟漪"),
@@ -596,6 +639,9 @@ class ControlPanel:
         # ---- 构建各分组页面 ----
         self._pages["下雨"] = self._page_rain(inner)
         self._pages["下雪"] = self._page_snow(inner)
+        self._pages["落樱"] = self._page_petal(inner)
+        self._pages["流星雨"] = self._page_meteor(inner)
+        self._pages["颜料盘"] = self._page_paint(inner)
         self._pages["聚光灯"] = self._page_spot(inner)
         self._pages["窗口水波"] = self._page_win(inner)
         self._pages["涟漪"] = self._page_ripple(inner)
@@ -920,6 +966,66 @@ class ControlPanel:
         self._swatch(c, "雪花颜色", "snow_color", SNOW_COLORS)
         self._save_bar(c, "下雪")
         self._preset_block(p, "下雪")
+        return p
+
+    def _page_petal(self, parent):
+        p = tk.Frame(parent, bg=BG)
+        self._page_head(p, "落樱")
+        c = tk.Frame(p, bg=CARD)
+        c.pack(fill="x", padx=16, pady=(0, 8))
+        self._toggle(c, "启用落樱", "petal_enabled")
+        self._slider(c, "花瓣数量", "petal_amount", 0, 600, 5, "{:.0f} 片")
+        self._slider(c, "飘落速度", "petal_speed", 10, 260, 5, "{:.0f} 像素/秒")
+        self._slider(c, "花瓣大小", "petal_size", 0.4, 2.5, 0.1, "{:.1f} 倍")
+        self._slider(c, "横向漂移", "petal_drift", -0.6, 0.6, 0.01, "{:+.2f}")
+        self._slider(c, "风速(阵风)", "petal_wind", -180, 180, 5, "{:+.0f} 像素/秒")
+        self._slider(c, "自旋", "petal_spin", 0.0, 2.0, 0.05, "{:.2f} 倍")
+        self._slider(c, "翻面", "petal_flutter", 0.0, 1.0, 0.05, "{:.0%}")
+        self._slider(c, "浓度", "petal_opacity", 0.05, 1.0, 0.01, "{:.0%}")
+        self._swatch(c, "花瓣颜色", "petal_color", PETAL_COLORS)
+        self._swatch(c, "边缘颜色(翻面泛白)", "petal_edge_color", PETAL_EDGE_COLORS)
+        self._save_bar(c, "落樱")
+        self._preset_block(p, "落樱")
+        return p
+
+    def _page_meteor(self, parent):
+        p = tk.Frame(parent, bg=BG)
+        self._page_head(p, "流星雨")
+        c = tk.Frame(p, bg=CARD)
+        c.pack(fill="x", padx=16, pady=(0, 8))
+        self._toggle(c, "启用流星雨", "meteor_enabled")
+        self._slider(c, "流星数量", "meteor_amount", 0, 120, 1, "{:.0f} 颗")
+        self._slider(c, "飞行速度", "meteor_speed", 120, 2400, 20, "{:.0f} 像素/秒")
+        self._slider(c, "拖尾长度", "meteor_length", 40, 900, 10, "{:.0f} 像素")
+        self._slider(c, "飞行角度", "meteor_angle", -80, 80, 1, "{:+.0f} °")
+        self._slider(c, "流星粗细", "meteor_size", 0.4, 3.0, 0.1, "{:.1f} 倍")
+        self._slider(c, "头部辉光", "meteor_glow", 0.0, 1.0, 0.05, "{:.0%}")
+        self._slider(c, "星空密度", "meteor_stars", 0.0, 1.0, 0.05, "{:.0%}")
+        self._slider(c, "浓度", "meteor_opacity", 0.05, 1.0, 0.01, "{:.0%}")
+        self._swatch(c, "头部颜色", "meteor_color", METEOR_COLORS)
+        self._swatch(c, "拖尾颜色", "meteor_tail_color", METEOR_TAIL_COLORS)
+        self._save_bar(c, "流星雨")
+        self._preset_block(p, "流星雨")
+        return p
+
+    def _page_paint(self, parent):
+        p = tk.Frame(parent, bg=BG)
+        self._page_head(p, "颜料盘")
+        c = tk.Frame(p, bg=CARD)
+        c.pack(fill="x", padx=16, pady=(0, 8))
+        self._toggle(c, "启用颜料盘", "paint_enabled")
+        self._slider(c, "颜料团数", "paint_amount", 0, 60, 1, "{:.0f} 团")
+        self._slider(c, "颜料团大小", "paint_size", 0.4, 3.0, 0.1, "{:.1f} 倍")
+        self._slider(c, "流动速度", "paint_speed", 0.1, 3.0, 0.05, "{:.2f} 倍")
+        self._slider(c, "扩散(糊化)", "paint_diffusion", 0.0, 1.0, 0.05, "{:.0%}")
+        self._slider(c, "消隐速度", "paint_fade", 0.0, 1.0, 0.05, "{:.0%}")
+        self._slider(c, "辉光", "paint_glow", 0.0, 1.0, 0.05, "{:.0%}")
+        self._slider(c, "立体感", "paint_shading", 0.0, 1.0, 0.05, "{:.0%}")
+        self._slider(c, "色相铺开", "paint_hue_spread", 0.0, 1.0, 0.05, "{:.0%}")
+        self._slider(c, "浓度", "paint_opacity", 0.05, 1.0, 0.01, "{:.0%}")
+        self._swatch(c, "基准色", "paint_color", PAINT_COLORS)
+        self._save_bar(c, "颜料盘")
+        self._preset_block(p, "颜料盘")
         return p
 
     def _page_spot(self, parent):

@@ -62,7 +62,9 @@ def main():
     for name in list(p._pages.keys()):
         p._show_page(name)
         seen.append(name)
-    assert seen == ["下雨", "下雪", "聚光灯", "窗口水波", "涟漪", "其它"], seen
+    # 顺序必须与 nav_defs 一致（可读性检查：侧栏点哪一项，右侧就得有对应页）
+    assert seen == ["下雨", "下雪", "落樱", "流星雨", "颜料盘", "聚光灯",
+                    "窗口水波", "涟漪", "其它"], seen
     # 侧栏导航不再有「预设」独立页，预设方案已下沉到各特效页
     assert "预设" not in p._pages, "预设 page should be removed"
 

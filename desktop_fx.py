@@ -70,7 +70,42 @@ DEFAULTS = {
     "snow_glow": 0.5,            # 近雪辉光强度（0 = 关闭，省性能）
     "snow_color": "#EAF2FF",
     "snow_opacity": 0.9,
-    # ---- 聚光灯（全屏压暗 + 鼠标处透明圆洞）----
+    # ---- 落樱（樱花瓣：边翻面边自旋地飘落）----
+    "petal_enabled": False,
+    "petal_amount": 160.0,
+    "petal_speed": 55.0,
+    "petal_size": 1.0,
+    "petal_drift": 0.08,
+    "petal_wind": 18.0,          # 整场均匀风速（px/s），带阵风起伏
+    "petal_spin": 0.8,           # 自旋快慢倍率
+    "petal_flutter": 0.6,        # 翻面幅度（0=永远正面朝上，1=能翻到完全侧立）
+    "petal_color": "#FF9DB6",    # 花瓣主体（饱和粉那一端）
+    "petal_edge_color": "#FFF0F4",   # 花瓣边缘 / 翻面泛白那一端
+    "petal_opacity": 0.9,
+    # ---- 流星雨（斜向掠过的高亮彗星；可叠加星空）----
+    "meteor_enabled": False,
+    "meteor_amount": 14.0,
+    "meteor_speed": 880.0,
+    "meteor_length": 380.0,
+    "meteor_angle": 34.0,        # 与竖直方向夹角（度），正 = 向右下
+    "meteor_size": 1.0,
+    "meteor_glow": 0.5,          # 头部辉光（0 = 关闭，省性能）
+    "meteor_stars": 0.0,         # 星空密度（0 = 关闭；桌面会有常驻星点）
+    "meteor_color": "#FFFFFF",       # 头部（参考里是 additive 的纯白热点）
+    "meteor_tail_color": "#5FB8F0",  # 拖尾（越靠尾越接近这个色）
+    "meteor_opacity": 0.9,
+    # ---- 颜料盘（CPU 流体颜料，参考 Lively 壁纸 "Fluids"）----
+    "paint_enabled": False,
+    "paint_amount": 12.0,        # 稳态颜料团数（生成速率 = 团数 / 平均寿命）
+    "paint_size": 1.0,           # 单团半径倍率
+    "paint_speed": 1.0,          # 涡旋流速倍率
+    "paint_diffusion": 0.25,     # 扩散 / 糊化
+    "paint_fade": 0.35,          # 消隐快慢（越大寿命越短、越"稀"）
+    "paint_glow": 0.6,           # 辉光（0 = 关闭，省性能）
+    "paint_shading": 0.5,        # 立体感（按亮度梯度着色）
+    "paint_hue_spread": 0.5,     # 色相铺开 ±0~180°，1.0 = 整条彩虹
+    "paint_color": "#FF4D6D",    # 基准色（只取色相/饱和度）
+    "paint_opacity": 0.9,
     "spotlight_enabled": False,
     "spotlight_radius": 220.0,
     "spotlight_dim": 0.6,
@@ -117,6 +152,60 @@ PRESETS = {
               snow_speed=85, snow_size=1.0, snow_drift=0.12,
               snow_wind=20, snow_twinkle=0.45, snow_glow=0.55,
               snow_color="#DCEBFF", snow_opacity=0.9, lightning=True),
+    # ---- 落樱：樱花瓣飘落，与雨/雪/涟漪自由组合 ----
+    "落樱": dict(rain_enabled=False, snow_enabled=False, petal_enabled=True,
+              petal_amount=160, petal_speed=55, petal_size=1.0,
+              petal_drift=0.08, petal_wind=18, petal_spin=0.8, petal_flutter=0.6,
+              petal_color="#FF9DB6", petal_edge_color="#FFF0F4",
+              petal_opacity=0.9),
+    "樱花雨": dict(rain_enabled=False, snow_enabled=False, petal_enabled=True,
+               petal_amount=340, petal_speed=85, petal_size=1.1,
+               petal_drift=0.16, petal_wind=42, petal_spin=1.1, petal_flutter=0.75,
+               petal_color="#FF8AA8", petal_edge_color="#FFEAF0",
+               petal_opacity=0.95),
+    "夜樱": dict(rain_enabled=False, snow_enabled=False, petal_enabled=True,
+              petal_amount=200, petal_speed=62, petal_size=1.0,
+              petal_drift=0.10, petal_wind=22, petal_spin=0.9, petal_flutter=0.65,
+              petal_color="#F58BB0", petal_edge_color="#FFD9E6",
+              petal_opacity=0.9, lightning=True),
+    # ---- 流星雨：斜向掠过的彗星（参考 Wallpaper Engine 场景「流星夜」）----
+    "流星雨": dict(rain_enabled=False, snow_enabled=False, petal_enabled=False,
+                meteor_enabled=True, meteor_amount=14, meteor_speed=880,
+                meteor_length=380, meteor_angle=34, meteor_size=1.0,
+                meteor_glow=0.5, meteor_stars=0.0,
+                meteor_color="#FFFFFF", meteor_tail_color="#5FB8F0",
+                meteor_opacity=0.9),
+    "流星夜": dict(rain_enabled=False, snow_enabled=False, petal_enabled=False,
+                meteor_enabled=True, meteor_amount=9, meteor_speed=640,
+                meteor_length=320, meteor_angle=28, meteor_size=1.0,
+                meteor_glow=0.70, meteor_stars=0.55,
+                meteor_color="#FFFFFF", meteor_tail_color="#9FC8FF",
+                meteor_opacity=0.9),
+    "双子座流星雨": dict(rain_enabled=False, snow_enabled=False, petal_enabled=False,
+                  meteor_enabled=True, meteor_amount=34, meteor_speed=1250,
+                  meteor_length=560, meteor_angle=44, meteor_size=1.1,
+                  meteor_glow=0.55, meteor_stars=0.22,
+                  meteor_color="#FFFFFF", meteor_tail_color="#7FD0FF",
+                  meteor_opacity=0.95),
+    # ---- 颜料盘：全屏流体颜料 ----
+    "颜料盘": dict(rain_enabled=False, snow_enabled=False, petal_enabled=False,
+                meteor_enabled=False, paint_enabled=True,
+                paint_amount=12, paint_size=1.0, paint_speed=1.0,
+                paint_diffusion=0.25, paint_fade=0.35, paint_glow=0.6,
+                paint_shading=0.5, paint_hue_spread=0.5,
+                paint_color="#FF4D6D", paint_opacity=0.9),
+    "霓虹流体": dict(rain_enabled=False, snow_enabled=False, petal_enabled=False,
+                 meteor_enabled=False, paint_enabled=True,
+                 paint_amount=16, paint_size=0.9, paint_speed=1.5,
+                 paint_diffusion=0.18, paint_fade=0.30, paint_glow=0.90,
+                 paint_shading=0.30, paint_hue_spread=1.0,
+                 paint_color="#7C4DFF", paint_opacity=0.95),
+    "水墨": dict(rain_enabled=False, snow_enabled=False, petal_enabled=False,
+              meteor_enabled=False, paint_enabled=True,
+              paint_amount=8, paint_size=1.35, paint_speed=0.55,
+              paint_diffusion=0.5, paint_fade=0.16, paint_glow=0.15,
+              paint_shading=0.75, paint_hue_spread=0.0,
+              paint_color="#5E6B7A", paint_opacity=0.85),
     # ---- 聚光灯：与雨/雪/涟漪自由组合 ----
     "聚光灯": dict(rain_enabled=False, snow_enabled=False,
                 spotlight_enabled=True, spotlight_radius=240,
@@ -138,6 +227,9 @@ PRESET_GROUPS = {
     "下雨": ["毛毛雨", "中雨", "暴雨", "斜风细雨", "夜雨（青）", "暖雨（金）",
            "深蓝高对比", "石墨冷灰"],
     "下雪": ["初雪", "暴雪", "雪夜"],
+    "落樱": ["落樱", "樱花雨", "夜樱"],
+    "流星雨": ["流星雨", "流星夜", "双子座流星雨"],
+    "颜料盘": ["颜料盘", "霓虹流体", "水墨"],
     "聚光灯": ["聚光灯", "舞台光"],
     "窗口水波": ["水面"],
 }

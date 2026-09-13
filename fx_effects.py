@@ -6,6 +6,7 @@
 RGB 需预乘 alpha），整层再由 Windows 以 per-pixel alpha 合成到桌面，
 因此这里只需"画上去"，半透明混合由系统完成。
 """
+import colorsys
 import ctypes
 import ctypes.wintypes as wt
 
@@ -57,6 +58,34 @@ def hex_to_bgr(s):
 def _premul_pack(b, g, r, a):
     """把 4 个 uint32 通道打包成 0xAARRGGBB。"""
     return b | (g << np.uint32(8)) | (r << np.uint32(16)) | (a << np.uint32(24))
+
+
+def _smooth5(a, k, passes=1):
+    """5 点拉普拉斯平滑（原地）。2D / 3D 数组都适用：
+    3D 时最后一维是通道，各通道独立平滑。
+
+    `c += k*(邻居均值 - c)` 里 RHS 会先整体算完再累加，所以重叠读写安全。
+    """
+    k = np.float32(k)
+    for _ in range(passes):
+        c = a[1:-1, 1:-1]
+        c += k * (0.25 * (a[:-2, 1:-1] + a[2:, 1:-1]
+                          + a[1:-1, :-2] + a[1:-1, 2:]) - c)
+
+
+def _hsv_to_rgb(h, s, v):
+    """向量化 HSV->RGB（h/s/v ∈ [0,1]，任意同形状数组）。返回 (r, g, b)。"""
+    h = np.mod(h, 1.0) * 6.0
+    i = np.floor(h).astype(np.int32)
+    f = h - i
+    p = v * (1.0 - s)
+    q = v * (1.0 - s * f)
+    t = v * (1.0 - s * (1.0 - f))
+    i = np.mod(i, 6)
+    r = np.choose(i, [v, q, p, p, t, v])
+    g = np.choose(i, [t, v, v, q, p, p])
+    b = np.choose(i, [p, p, t, v, v, q])
+    return r, g, b
 
 
 # ------------------------------------------------------------------ 雨
@@ -770,6 +799,1014 @@ class SnowField:
     def set_color(self, hex_str):
         bgr = hex_to_bgr(hex_str)
         self._rgb = (float(bgr[2]), float(bgr[1]), float(bgr[0]))
+
+
+# ------------------------------------------------------------------ 落樱
+class PetalField:
+    """落樱：樱花瓣边翻面边自旋地飘落。
+
+    形状与观感取自 WebGL Sakura（Wallpaper Engine 888689688）：
+      * 花瓣 = 椭圆把 |x| 与 y 再转 15° 后、按 x 正负取**不同横向半径**
+        —— 左右不对称就把椭圆切成"顶端带凹口"的花瓣，而不是一颗蛋
+      * 一个端点偏饱和粉、另一端接近白（参考里由 grady 调制 g/b 通道），
+        中脉再压深一点；翻到侧面时漫反射+高光让整片泛白一闪
+      * 三轴连续旋转 + 透视投影（近大远小）
+
+    在 CPU 逐像素 overlay 上的取舍：不可能每帧给每个粒子重采样一张旋转过的
+    精灵图，所以把「形状」预烘成**核表**，档位 = 自旋角(ANGLE_N) × 翻面(6)。
+    关键收益：档位只影响**建表成本**，不影响**每帧成本** —— 每帧只做一次
+    "按档取核 + 批量盖章"。所以档位可以给得比较细来压制转角跳变。
+    核表按半径缓存，`petal_flutter` / `petal_spin` 都不触发重建。
+
+    与 SnowField 同一套接口（set_amount / set_color / resize / update / draw），
+    scene 层可以像对待雪一样对待它。
+    """
+
+    K = 6                        # 花瓣半长基准（中档 + size=1.0）
+    K_MAX = 16                   # 半长上限：petal_size 拉满时不至于糊成一片
+    TIER_EDGES = (0.75, 1.15)    # 深度分档（与雪同构：越近更大更亮）
+    TIER_SCALES = (0.5, 1.0, 1.65)
+    ANGLE_N = 32                 # 自旋角档位（11.25°/档）
+    # 翻面档位：|cos| 量化后的"可见宽度"。刻意固定成常数，这样核表能按半径
+    # 缓存 —— petal_flutter 只改变落在各档的概率，不需要重建表。
+    SQ_LEVELS = (0.26, 0.44, 0.63, 0.80, 0.92, 1.0)
+    KEEP = 0.012                 # 权重阈值：低于它的格子不盖章
+
+    # 参考 shader 里的形状常数（原样搬过来，未做任何"艺术加工"）
+    _SN = 0.28819045102521       # sin 15°
+    _CS = 0.965925826289068      # cos 15°
+    _OX, _OY = 0.0325, 0.012     # 椭圆中心
+    _RX_L, _RX_R = 0.18, 0.29    # 左半 / 右半横向半径（不等 -> 凹口）
+    _RY = 0.48
+
+    _ARR = ("x", "y", "depth", "vary", "phase", "sway_amp", "sway_freq",
+            "rot", "spin", "tumble", "tumble_freq")
+
+    def __init__(self, w, h, seed=23):
+        self.rng = np.random.default_rng(seed)
+        self.w, self.h = w, h
+        self._t = 0.0
+        self._kt = {}                       # r_px -> (kdx, kdy, kw, kmix)
+        self._maxr = None                   # 形状外接半径缓存
+        # 翻面档位分界（档位中点）。类体里不能写推导式引用类变量，
+        # 所以在 __init__ 里算。
+        self._BND = np.array(
+            [(self.SQ_LEVELS[i] + self.SQ_LEVELS[i + 1]) * 0.5
+             for i in range(len(self.SQ_LEVELS) - 1)], dtype=np.float32)
+        self._body = (255.0, 157.0, 182.0)   # 花瓣主体：饱和粉
+        self._edge = (255.0, 240.0, 244.0)   # 花瓣边缘：近白
+        self.n = 0
+        for name in self._ARR:
+            setattr(self, name, np.zeros(0, np.float32))
+        self.set_amount(160, w, h)
+
+    def resize(self, w, h):
+        self.w, self.h = w, h
+
+    # ------------------------------------------------------------ 核表
+    def _shape_dist(self, u, v):
+        """花瓣的"半径函数"：< 1 在花瓣内。u/v 是花瓣自身坐标。
+
+        原样搬参考 shader 的做法：先把 (|u|, v) 再转 15°，再按 fx 的正负取
+        **不同**的横向半径（左 0.18 / 右 0.29）。左右不对称正是"顶端凹口"的来源
+        —— 少了这一步就只是个椭圆，看着像蛋不像花瓣。
+        """
+        ax = np.abs(u)
+        # GLSL 的 mat2(a,b,c,d) 是**列主序**，`v * M` 展开是
+        #   fx = cs*ax - sn*v ,  fy = sn*ax + cs*v
+        # 我最初按行向量矩阵写成了 (cs*ax + sn*v, -sn*ax + cs*v) —— 相当于转了
+        # -15°，凹口因此落到"饱和端"（参考里凹口在**苍白端**）：
+        # 缝线 fx=0 只在 v>0 侧可达，那一侧用的是窄椭圆 rx=0.18，于是花瓣在
+        # 苍白端被掐出一道凹口，饱和端则是饱满圆头。
+        fx = np.float32(self._CS) * ax - np.float32(self._SN) * v
+        fy = np.float32(self._SN) * ax + np.float32(self._CS) * v
+        rx = np.where(fx < 0.0, np.float32(self._RX_L), np.float32(self._RX_R))
+        return np.sqrt(((fx - self._OX) / rx) ** 2
+                       + ((fy - self._OY) / self._RY) ** 2)
+
+    def _max_radius(self):
+        """花瓣形状离原点的最远距离（花瓣自身单位）。
+
+        自旋角任意，所以 sprite 网格必须能装下"转一圈"的花瓣 —— 用形状的外接圆
+        半径定网格，而不是拍脑袋写 [-1,1]²：后者有 3/4 的格子永远算不到花瓣，
+        白白让建表成本翻两番。
+        """
+        if self._maxr is not None:
+            return self._maxr
+        n = 512
+        lin = np.linspace(-1.0, 1.0, n, dtype=np.float32)
+        uu, vv = np.meshgrid(lin, lin, indexing="ij")
+        inside = self._shape_dist(uu, vv) < 1.0
+        rr = np.sqrt(uu ** 2 + vv ** 2)
+        self._maxr = float(rr[inside].max()) if inside.any() else 0.6
+        return self._maxr
+
+    def _ktab(self, r_px):
+        """烘一张核表 (kdx, kdy, kw, kmix)：每档一行，全长 padding 到最宽档。
+
+        r_px = 花瓣**半长**（像素）。参考 shader 里花瓣半长为 0.48（形状单位），
+        所以 1 形状单位 = r_px / 0.48 像素。
+
+        padding 出来的格子权重为 0，盖章时被 KEEP 过滤 —— 这是"变长核批量化"
+        的关键：只有长度统一，才能把 n 个粒子×各自档位 一次性铺成 (n, L)
+        做全向量化盖章，既不用在 Python 里按档分组，也不用逐粒子循环。
+        """
+        got = self._kt.get(r_px)
+        if got is not None:
+            return got
+        R = int(max(1, r_px))
+        scale = np.float32(0.48 / R)                 # 形状单位 -> 像素
+        g = int(np.ceil(self._max_radius() / float(scale)))
+        k = np.arange(-g, g + 1, dtype=np.float32)
+        m = int(k.size)
+        dxs = np.tile(k, m)                          # 快变：x 偏移
+        dys = np.repeat(k, m)                        # 慢变：y 偏移
+        cx = (dxs * scale)[None, :]                  # (1, N) 形状单位
+        cy = (dys * scale)[None, :]
+
+        ang = (np.arange(self.ANGLE_N, dtype=np.float32)
+               * np.float32(TAU / self.ANGLE_N))[:, None]
+        ca, sa = np.cos(ang), np.sin(ang)
+        # 自旋：把屏幕偏移转进花瓣自身坐标（与 shader 的 PointCoord 同为 y 向下）
+        u = ca * cx + sa * cy                        # (A, N) 花瓣横向
+        v = -sa * cx + ca * cy                       # (A, N) 花瓣长轴
+        sq = np.array(self.SQ_LEVELS, dtype=np.float32)[None, :, None]
+        uu = u[:, None, :]                           # (A, S, N)
+        vv = v[:, None, :] / sq                      # 翻面 = 沿长轴压扁
+
+        wgt = np.clip(1.0 - self._shape_dist(uu, vv), 0.0, 1.0) ** 0.45
+
+        # 混色权重 pale：0 = 主体（饱和粉），1 = 边缘（近白）。
+        # 参考 shader 里 grady / 叶脉都用**花瓣自身坐标**（coord.x / coord.y），
+        # 不是屏幕坐标 —— 所以这里用 u/v，否则花瓣一转渐变就跟着屏幕转，露馅。
+        pale = np.clip(v * 0.5 + 0.5, 0.0, 1.0) ** 0.35
+        pale = pale[:, None, :] * (1.0 - 0.35 * np.exp(-(uu / 0.22) ** 2))
+        # 翻到侧面时泛白一闪（参考里 diffuse + specular 的效果）
+        pale = np.clip(pale + (1.0 - sq) * 0.35, 0.0, 1.0)
+
+        V = int(self.ANGLE_N) * len(self.SQ_LEVELS)
+        w2 = np.ascontiguousarray(wgt).reshape(V, m * m)
+        p2 = np.ascontiguousarray(pale).reshape(V, m * m)
+        keep = w2 > self.KEEP
+        cnt = keep.sum(axis=1)
+        L = int(cnt.max()) if cnt.size else 0
+        rows = np.arange(V)[:, None]
+        if L <= 0:
+            z = np.zeros((V, 0), np.int32)
+            tab = (z, z.copy(), np.zeros((V, 0), np.float32),
+                   np.zeros((V, 0), np.float32))
+            self._kt[r_px] = tab
+            return tab
+        # 稳定排序把保留格排到行首（False=保留），裁到 L 列；行内不足 L 的
+        # 位置权重置 0，盖章时被 KEEP 过滤。
+        order = np.argsort(~keep, axis=1, kind="stable")[:, :L]
+        sel = keep[rows, order]
+        tab = (dxs[order].astype(np.int32),
+               dys[order].astype(np.int32),
+               np.where(sel, w2[rows, order], 0.0).astype(np.float32),
+               np.where(sel, p2[rows, order], 0.0).astype(np.float32))
+        self._kt[r_px] = tab
+        return tab
+
+    # ------------------------------------------------------------ 粒子
+    def _init_arrays(self, n, start=0, end=None):
+        if end is None:
+            end = n
+        cnt = end - start
+        if cnt <= 0:
+            return
+        rng = self.rng
+        self.x[start:end] = rng.random(cnt, dtype=np.float32) * self.w
+        self.y[start:end] = rng.random(cnt, dtype=np.float32) * self.h
+        self.depth[start:end] = rng.uniform(0.35, 1.5, cnt).astype(np.float32)
+        self.vary[start:end] = rng.uniform(0.80, 1.20, cnt).astype(np.float32)
+        self.phase[start:end] = rng.uniform(0.0, TAU, cnt).astype(np.float32)
+        self.sway_amp[start:end] = rng.uniform(10.0, 34.0, cnt).astype(np.float32)
+        self.sway_freq[start:end] = rng.uniform(0.35, 1.10, cnt).astype(np.float32)
+        self.rot[start:end] = rng.uniform(0.0, TAU, cnt).astype(np.float32)
+        self.spin[start:end] = (rng.uniform(0.45, 1.50, cnt).astype(np.float32)
+                                * np.where(rng.random(cnt) < 0.5, -1.0, 1.0))
+        self.tumble[start:end] = rng.uniform(0.0, TAU, cnt).astype(np.float32)
+        self.tumble_freq[start:end] = rng.uniform(0.5, 1.5, cnt).astype(np.float32)
+
+    def set_amount(self, n, w=None, h=None):
+        if w:
+            self.w = w
+        if h:
+            self.h = h
+        n = int(max(0, min(800, n)))
+        if n == self.n:
+            return
+        if n > self.n:
+            for name in self._ARR:
+                old = getattr(self, name)
+                new = np.zeros(n, np.float32)
+                new[:len(old)] = old
+                setattr(self, name, new)
+            self._init_arrays(n, start=self.n)
+        else:
+            for name in self._ARR:
+                setattr(self, name, getattr(self, name)[:n].copy())
+        self.n = n
+
+    def _respawn(self, hit):
+        """落到底边 / 飘出侧边后重新投放（保持"永远有花瓣在飘"）。"""
+        k = int(hit.sum())
+        if k <= 0:
+            return
+        rng = self.rng
+        self.y[hit] = -rng.random(k, dtype=np.float32) * self.h * 0.3
+        self.x[hit] = rng.random(k, dtype=np.float32) * self.w
+        self.depth[hit] = rng.uniform(0.35, 1.5, k).astype(np.float32)
+        self.vary[hit] = rng.uniform(0.80, 1.20, k).astype(np.float32)
+        self.phase[hit] = rng.uniform(0.0, TAU, k).astype(np.float32)
+        self.sway_amp[hit] = rng.uniform(10.0, 34.0, k).astype(np.float32)
+        self.sway_freq[hit] = rng.uniform(0.35, 1.10, k).astype(np.float32)
+        self.rot[hit] = rng.uniform(0.0, TAU, k).astype(np.float32)
+        self.spin[hit] = (rng.uniform(0.45, 1.50, k).astype(np.float32)
+                          * np.where(rng.random(k) < 0.5, -1.0, 1.0))
+        self.tumble[hit] = rng.uniform(0.0, TAU, k).astype(np.float32)
+        self.tumble_freq[hit] = rng.uniform(0.5, 1.5, k).astype(np.float32)
+
+    def update(self, dt, cfg):
+        """推进花瓣，返回空数组（落樱不溅水）。"""
+        if self.n == 0:
+            return np.zeros(0, np.float32)
+        self._t += dt
+        speed = np.float32(cfg["petal_speed"]) * self.depth * self.vary
+        # 与雪同构：petal_drift 按 depth 放大（透视倾斜），petal_wind 是整场
+        # 同向气流 + 双正弦阵风。两者独立。
+        wind = float(cfg.get("petal_wind", 0.0))
+        if wind:
+            t = self._t
+            gust = (0.65 + 0.35 * np.sin(TAU * 0.05 * t)
+                    + 0.12 * np.sin(TAU * 0.19 * t + 1.7))
+            wind = np.float32(wind * gust)
+        windx = np.float32(cfg.get("petal_drift", 0.0) * 60.0) * self.depth
+        # 花瓣比雪飘得"活"：左右摆幅更大、频率更低，像被风一下下托着走
+        sway = self.sway_amp * np.sin(self._t * self.sway_freq + self.phase)
+
+        self.y += speed * dt
+        self.x += (windx + wind + sway) * dt
+
+        spin = np.float32(cfg.get("petal_spin", 1.0))
+        self.rot += self.spin * spin * np.float32(dt)
+        self.rot %= TAU                       # 及时取模，避免长时间漂移掉精度
+        self.tumble += self.tumble_freq * np.float32(dt)
+
+        self._respawn(self.y >= self.h)
+        span = self.w + 160.0
+        self.x = np.where(self.x < -80.0, self.x + span, self.x)
+        self.x = np.where(self.x > self.w + 80.0, self.x - span, self.x)
+        return np.zeros(0, np.float32)
+
+    # ------------------------------------------------------------ 绘制
+    def _stamp(self, u32, w, h, sel, ix0, iy0, kdx, kdy, kw, kmix,
+               alpha, body, edge):
+        """批量盖章。kdx/kdy/kw/kmix 都是 (n, L)：n 个粒子各自的核已经按档取好。
+
+        与雪的单核版本相比只多了一路 kmix（双色混）—— 因为花瓣有"一端饱和粉、
+        一端近白"的渐变，单色 tint 会把它压成一张平涂色块。
+        """
+        a = alpha[sel]
+        af = (a[:, None] * kw).reshape(-1)
+        m = af > self.KEEP
+        if not m.any():
+            return
+        wx = (ix0[sel, None] + kdx).reshape(-1)[m]
+        wy = (iy0[sel, None] + kdy).reshape(-1)[m]
+        af = af[m]
+        mi = kmix.reshape(-1)[m]
+        m = (wx >= 0) & (wx < w) & (wy >= 0) & (wy < h)
+        if not m.any():
+            return
+        wx, wy, af, mi = wx[m], wy[m], af[m], mi[m]
+        # 注意：body / edge 存的是 **(r, g, b)**，而 _premul_pack 收的是 (b, g, r)。
+        # 这里曾经把解包顺序写成 (b, g, r)，红蓝直接互换 —— 花瓣渲染成蓝紫色，
+        # 而"抽层差分""点亮面积"这类断言全都照样通过（颜色错了不等于没画上去）。
+        # 是"花瓣贡献的像素必须偏暖 R>B"这条断言把它抓出来的。
+        br0, bg0, bb0 = body
+        br1, bg1, bb1 = edge
+        cb = np.float32(bb0) + (np.float32(bb1) - np.float32(bb0)) * mi
+        cg = np.float32(bg0) + (np.float32(bg1) - np.float32(bg0)) * mi
+        cr = np.float32(br0) + (np.float32(br1) - np.float32(br0)) * mi
+        a_c = np.rint(af * 255.0).astype(np.uint32)
+        packed = _premul_pack(
+            np.rint(cb * af).astype(np.uint32),
+            np.rint(cg * af).astype(np.uint32),
+            np.rint(cr * af).astype(np.uint32), a_c)
+        u32[wy * np.int32(w) + wx] = packed
+
+    def draw(self, u32, w, h, cfg):
+        if self.n == 0:
+            return
+        base = float(cfg.get("petal_size", 1.0))
+        flutter = float(np.clip(cfg.get("petal_flutter", 0.0), 0.0, 1.0))
+        # alpha 必须 clip：depth(<=1.5) × vary(<=1.2) × opacity 可达 1.8，
+        # 打包时左移 24 位会溢出回绕，最亮的花瓣反而变暗/消失（雪踩过这个坑）。
+        alpha = self.depth * self.vary * np.float32(cfg["petal_opacity"])
+        np.clip(alpha, 0.0, 1.0, out=alpha)
+        ix0 = np.rint(self.x).astype(np.int32)
+        iy0 = np.rint(self.y).astype(np.int32)
+
+        lvl = np.digitize(self.depth, self.TIER_EDGES)
+        krad = [int(min(self.K_MAX, max(1, round(self.K * ks * base))))
+                for ks in self.TIER_SCALES]
+
+        # 档位索引 = 自旋角档 × 翻面档
+        ab = np.floor(self.rot * np.float32(self.ANGLE_N / TAU)
+                      ).astype(np.int32) % self.ANGLE_N
+        sqc = 1.0 - flutter * (1.0 - np.abs(np.cos(self.tumble)))
+        sb = np.searchsorted(self._BND, sqc.astype(np.float32)).astype(np.int32)
+        var = ab * len(self.SQ_LEVELS) + sb
+
+        body, edge = self._body, self._edge
+        # 远 -> 近 依次盖章：stamp 是覆盖写，后画的近花瓣压住远的（画家算法）
+        for tier in range(len(self.TIER_SCALES)):
+            sel = lvl == tier
+            if not sel.any():
+                continue
+            kdx, kdy, kw, kmix = self._ktab(krad[tier])
+            v = var[sel]
+            self._stamp(u32, w, h, sel, ix0, iy0,
+                        kdx[v], kdy[v], kw[v], kmix[v], alpha, body, edge)
+
+    def set_color(self, hex_str):
+        """花瓣主体色（参考里的饱和粉那一端）。"""
+        bgr = hex_to_bgr(hex_str)
+        self._body = (float(bgr[2]), float(bgr[1]), float(bgr[0]))
+
+    def set_edge_color(self, hex_str):
+        """花瓣边缘 / 翻面泛白那一端的颜色。"""
+        bgr = hex_to_bgr(hex_str)
+        self._edge = (float(bgr[2]), float(bgr[1]), float(bgr[0]))
+
+
+# ------------------------------------------------------------------ 流星雨
+class MeteorField:
+    """流星雨：斜向高速掠过的"亮头 + 长尾"彗星。
+
+    观感取自 Wallpaper Engine 场景 2016635516「流星夜」里的 Shooting star：
+      * 本质是**粒子 + ropetrail 渲染器**：emitter rate 0.2/s、lifetime 3s、
+        maxcount 16 —— 同一时刻只有一两颗，很克制；velocityrandom 指向 +x、
+        gravity (0,-40,0)、drag 0.1 -> 斜向右下、越走越慢的细长轨迹
+      * material 是 additive 混合的圆形贴图（particle/drop），另有一颗
+        size 100~150 的 sprite 光晕子发射器跟着头走 -> 头部带 bloom
+      * 场景底下还铺了一张星空底图（models/流星夜.json）
+
+    在 CPU 逐像素 overlay 上的三个取舍：
+
+    1. **不逐颗流星做线段栅格化**。那需要给每颗流星开一块 (L×W) 的临时画布，
+       1920×1080 下十几颗就是百万像素级 numpy 开销。改成「把轨迹采样成一串
+       同半径圆点」，把所有流星的所有采样点拼成一个 (n·K, L) 的盖章任务，
+       一次向量化搞定 —— 与雪花/落樱同一套路子。
+    2. **采样间距必须小于直径**，否则拖尾断成一串虚线。所以 K 是按
+       「轨迹长度 / 半径」算出来的，不是拍脑袋的常数（见 `_SPAN`）。
+    3. **头部辉光必须烘进同一张核**（`max(实心核, amp×光晕核)`），不能当独立
+       的一遍画：stamp 是覆盖写、没有混合，先画会被随后的实心核压出一圈暗环，
+       后画又会把最亮的头芯抹暗。雪花的 `snow_glow` 踩过同一个坑。
+
+    颜色存的是 **BGR**（`hex_to_bgr` 的原始顺序），直接喂给 `_premul_pack`，
+    少一次来回换序 —— 落樱那边就是在这里把红蓝弄反过。
+
+    与其它特效同一套接口（set_amount / resize / update / draw）。
+    """
+
+    R_BASE = 2.8                 # 头部实心半径基准（像素，meteor_size=1.0）
+    GLOW_SCALE = 3.8             # 光晕半径 / 实心半径
+    _SPAN = 1.2                  # 采样间距 = 半径 × 该值（<2 才不断线）
+    TRAVEL = (1.3, 2.3)          # 入屏点 -> 燃尽点的行程 / 尾长
+    _KMIN, _KMAX = 12, 512
+    _KEEP = 0.006
+    # 圆盘核内**平坦区**占比：权重在 rr <= (1-PLATEAU)·(r+0.5) 内恒为 1，
+    # 之后才衰减到 0。这是"圆盘链不变成串珠"的关键 —— 盖章是覆盖写不是求和，
+    # 相邻圆盘之间只会取到"较晚画的"那一个的权重；如果核是尖顶（纯衰减），
+    # 两圆心连线的中点只能拿到 w(spacing/2)，实测会形成 ~2 倍的亮度波纹，
+    # 一条彗尾看上去就是一串珠子。有了平坦区，中点落在两个圆盘的平台内 -> 恒 1。
+    # 前提是平台要重叠：2·(1-PLATEAU)(r+0.5) >= _SPAN·r，对 r>=0.84 成立。
+    PLATEAU = 0.42
+    _ARR = ("x", "y", "vx", "vy", "t", "life", "spd", "blen", "bright")
+
+    def __init__(self, w, h, seed=31):
+        self.rng = np.random.default_rng(seed)
+        self.w, self.h = w, h
+        self._t = 0.0
+        self._acc = 0.0
+        self._want = 0
+        self._kt = {}
+        self._hc = (255.0, 255.0, 255.0)      # 头：#FFFFFF (b, g, r)
+        self._tc = (240.0, 184.0, 95.0)       # 尾：#5FB8F0 (b, g, r)
+        self.n = 0
+        for name in self._ARR:
+            setattr(self, name, np.zeros(0, np.float32))
+        # 星空（可选层，独立 rng，避免被流星的随机数消费影响排布）
+        self._sx = np.zeros(0, np.float32)
+        self._sy = np.zeros(0, np.float32)
+        self._su = np.zeros(0, np.float32)
+        self._sph = np.zeros(0, np.float32)
+        self._sfr = np.zeros(0, np.float32)
+        self._s_den = -1.0
+        self._s_w = self._s_h = -1
+        self.set_amount(14, w, h)
+
+    def resize(self, w, h):
+        self.w, self.h = w, h
+        self._s_w = self._s_h = -1            # 星空按新尺寸重排
+
+    # ------------------------------------------------------------ 核
+    def _ktab_round(self, r_px, glow=0.0):
+        """圆形核（可选叠加辉光），返回展平的 (kdx, kdy, kw)。
+
+        实心部分用「平坦区 + 边缘衰减」（见 PLATEAU 的注释）——圆盘链要连成
+        一条**亮度均匀**的带，而不是一串珠子。辉光在这里就和实心核**合并**
+        成一张复合核（逐格取 max），所以盖章时只有一遍 —— 见类注释第 3 条。
+        """
+        key = (int(round(float(r_px) * 4.0)), round(float(glow), 3))
+        got = self._kt.get(key)
+        if got is not None:
+            return got
+        r = float(max(0.7, min(26.0, r_px)))
+        edge = r + 0.5
+        gr = r * float(self.GLOW_SCALE)
+        g = int(np.ceil((gr if glow > 0.0 else r) + 1.0))
+        k = np.arange(-g, g + 1, dtype=np.float32)
+        m = int(k.size)
+        dxs = np.tile(k, m)
+        dys = np.repeat(k, m)
+        rr = np.sqrt(dxs * dxs + dys * dys)
+        wgt = np.clip((1.0 - rr / edge) / self.PLATEAU, 0.0, 1.0) ** 0.9
+        if glow > 0.0:
+            # 参考场景的 bloom（strength 2.0 / threshold 0.65）在 CPU 上的等效：
+            # 峰值 0.78、半径 3.8× 实心半径、近似二次衰减 —— 太弱的话滑条
+            # 推满也只多 5% 像素，用户根本看不出这个旋钮存在。
+            halo = np.clip(1.0 - rr / (gr + 0.5), 0.0, 1.0) ** 1.9 * (0.78 * glow)
+            wgt = np.maximum(wgt, halo)
+        keep = wgt > self._KEEP
+        tab = (dxs[keep].astype(np.int32), dys[keep].astype(np.int32),
+               wgt[keep].astype(np.float32))
+        self._kt[key] = tab
+        return tab
+
+    # ------------------------------------------------------------ 粒子
+    def set_amount(self, n, w=None, h=None):
+        """目标**同时在屏**的流星数。真正的数量由 update 按速率渐入渐出，
+        拖滑条时不会瞬间冒出一屏流星。"""
+        if w:
+            self.w = w
+        if h:
+            self.h = h
+        self._want = int(max(0, min(400, n)))
+
+    def _spawn(self, k, cfg):
+        if k <= 0:
+            return
+        rng = self.rng
+        w, h = self.w, self.h
+        old = self.n
+        tot = old + k
+        for name in self._ARR:
+            a = getattr(self, name)
+            b = np.zeros(tot, np.float32)
+            b[:old] = a
+            setattr(self, name, b)
+
+        speed = max(1.0, float(cfg.get("meteor_speed", 880.0)))
+        ang = float(np.clip(cfg.get("meteor_angle", 34.0), -80.0, 80.0))
+        rad = np.radians(ang)
+        dx, dy = float(np.sin(rad)), float(np.cos(rad))
+        length = max(20.0, float(cfg.get("meteor_length", 380.0)))
+
+        # 出生点 = 「燃尽点」沿 -d 方向退开 lead。燃尽点在整个屏幕内均匀取，
+        # 于是**每颗流星的头部都必然从屏幕内部扫过**（不会在边角擦一下就走）。
+        # 曾经用过"屏幕外一条垂直于 d 的幕布"来投放：矩形屏幕在该幕布切线上
+        # 只有一个切点，幕布两端离屏幕半个对角线那么远，而生平只有几百像素的
+        # 位移根本走不回来 —— 结果 12 颗流星一颗都没进屏（点亮 0 像素）。
+        # 出生点直接取屏幕的**迎风边界**（顶边 / 左右边，按射线通量加权）：
+        #   * 顶边通量 ∝ w·|dy|，侧边通量 ∝ h·|dx| —— 角度越平越偏向侧向进场
+        #   * 位置沿该边均匀取（均匀通量 = 均匀覆盖）
+        # 这样流星一出生就在屏幕边缘，整段寿命都看得见。曾经用"燃尽点在屏内
+        # 均匀取、再往上游退 lead"的模型：lead 最大到 2.1 倍尾长，一半寿命
+        # 花在屏外飞 —— 滑条写 14 实际只有七八颗在屏上，单颗测试更是连跑 70
+        # 帧都还没进场（"什么都没画出来"）。
+        ax, ay = abs(dx), abs(dy)
+        f_top = w * ay
+        f_side = h * ax
+        top = rng.random(k) < (f_top / max(1e-6, f_top + f_side))
+        ex = np.where(top, rng.uniform(0.0, w, k),
+                      (0.0 if dx >= 0.0 else float(w)))
+        ey = np.where(top, 0.0, rng.uniform(0.0, h, k))
+
+        u = rng.uniform(self.TRAVEL[0], self.TRAVEL[1], k).astype(np.float32)
+        blen = (np.float32(length) * rng.uniform(0.70, 1.35, k)).astype(np.float32)
+        travel = (blen * u).astype(np.float32)
+
+        vary = rng.uniform(0.80, 1.25, k)
+        sp = (np.float32(speed) * vary).astype(np.float32)
+
+        sl = slice(old, tot)
+        self.x[sl] = ex.astype(np.float32)
+        self.y[sl] = ey.astype(np.float32)
+        self.vx[sl] = dx * sp
+        self.vy[sl] = dy * sp
+        self.t[sl] = 0.0
+        self.spd[sl] = sp
+        # 尾长是**几何长度**；寿命 = 入屏点到燃尽点的行程 / 速度
+        self.blen[sl] = blen
+        self.life[sl] = np.maximum(0.10, travel / np.maximum(sp, np.float32(1.0))
+                                   ).astype(np.float32)
+        self.bright[sl] = rng.uniform(0.55, 1.0, k).astype(np.float32)
+        self.n = tot
+
+    def update(self, dt, cfg):
+        """推进流星（返回空数组：流星不溅水）。"""
+        dt = float(dt)
+        self._t += dt
+        if self.n:
+            self.x += self.vx * dt
+            self.y += self.vy * dt
+            self.t += dt
+            m = 2.0 * max(self.w, self.h)
+            dead = ((self.t >= self.life) | (self.x < -m) | (self.x > self.w + m)
+                    | (self.y < -m) | (self.y > self.h + m))
+            if dead.any():
+                keep = ~dead
+                for name in self._ARR:
+                    setattr(self, name, getattr(self, name)[keep])
+                self.n = int(keep.sum())
+
+        want = int(max(0, min(400, self._want)))
+        if want <= 0:
+            return np.zeros(0, np.float32)
+        # 平均寿命 = 平均行程 / 平均速度。行程 = 尾长 × TRAVEL × 尾长抖动均值，
+        # 必须把这些系数都算进去，否则 meteor_amount 只是"名义数量"——
+        # 早先漏掉系数，滑条写 14 实际稳态 25 颗。
+        lead_k = 0.5 * (self.TRAVEL[0] + self.TRAVEL[1]) * 1.025
+        mean_life = max(0.08, lead_k
+                        * float(cfg.get("meteor_length", 380.0))
+                        / max(1.0, float(cfg.get("meteor_speed", 880.0))))
+        self._acc += (want / mean_life) * dt
+        k = int(self._acc)
+        if k > 0:
+            self._acc -= k
+            k = min(k, max(4, want), max(0, 400 - self.n))
+            if k:
+                self._spawn(k, cfg)
+        return np.zeros(0, np.float32)
+
+    # ------------------------------------------------------------ 绘制
+    def _stamp(self, u32, w, h, px, py, kdx, kdy, kw, alpha, mixarr, c0, c1,
+               keep=None):
+        """批量盖章。px/py/alpha 是 (P,) 的展平点集，mixarr 是每点的混色权重
+        （None = 全用 c0）。c0 / c1 是 **(b, g, r)** 三元组。"""
+        if keep is None:
+            keep = self._KEEP
+        ax = (px[:, None] + kdx[None, :]).reshape(-1)
+        ay = (py[:, None] + kdy[None, :]).reshape(-1)
+        av = (alpha[:, None] * kw[None, :]).reshape(-1)
+        mi = (np.zeros(av.size, np.float32) if mixarr is None
+              else np.repeat(mixarr, kdx.size))
+        m = av > keep
+        if not m.any():
+            return
+        ax, ay, av, mi = ax[m], ay[m], av[m], mi[m]
+        m = (ax >= 0) & (ax < w) & (ay >= 0) & (ay < h)
+        if not m.any():
+            return
+        ax, ay, av, mi = ax[m], ay[m], av[m], mi[m]
+        # c0 / c1 已经是 (b, g, r)，与 _premul_pack 的入参顺序一致
+        b0, g0, r0 = c0
+        b1, g1, r1 = c1
+        cb = np.float32(b0) + (np.float32(b1) - np.float32(b0)) * mi
+        cg = np.float32(g0) + (np.float32(g1) - np.float32(g0)) * mi
+        cr = np.float32(r0) + (np.float32(r1) - np.float32(r0)) * mi
+        a_c = np.rint(av * 255.0).astype(np.uint32)
+        packed = _premul_pack(np.rint(cb * av).astype(np.uint32),
+                              np.rint(cg * av).astype(np.uint32),
+                              np.rint(cr * av).astype(np.uint32), a_c)
+        u32[ay * np.int32(w) + ax] = packed
+
+    def _ensure_stars(self, w, h, den):
+        if (self._s_den == den and self._s_w == w and self._s_h == h):
+            return
+        rng = np.random.default_rng(20240912)
+        cnt = int(min(6000, round(den * (w * h) / 9000.0)))
+        self._sx = rng.uniform(0.0, w, cnt).astype(np.float32)
+        self._sy = rng.uniform(0.0, h, cnt).astype(np.float32)
+        self._su = rng.random(cnt).astype(np.float32)
+        self._sph = rng.uniform(0.0, float(TAU), cnt).astype(np.float32)
+        self._sfr = rng.uniform(0.35, 1.60, cnt).astype(np.float32)
+        self._s_den, self._s_w, self._s_h = den, w, h
+
+    def _draw_stars(self, u32, w, h, den, cfg):
+        """星空：先画（随后的流星会自然地盖住星点）。"""
+        self._ensure_stars(w, h, den)
+        if self._sx.size == 0:
+            return
+        op = float(np.clip(cfg.get("meteor_opacity", 0.9), 0.0, 1.0))
+        tw = 0.5 + 0.5 * np.sin(self._t * (TAU * self._sfr) + self._sph)
+        mag = 0.18 + 0.82 * self._su ** 2.6      # 暗星多亮星少
+        a = mag * (0.30 + 0.70 * tw) * op * 0.95
+        np.clip(a, 0.0, 1.0, out=a)
+        kdx, kdy, kw = self._ktab_round(1.2)
+        self._stamp(u32, w, h, np.rint(self._sx).astype(np.int32),
+                    np.rint(self._sy).astype(np.int32), kdx, kdy, kw,
+                    a.astype(np.float32), None, self._hc, self._hc, keep=0.004)
+
+    def draw(self, u32, w, h, cfg):
+        den = float(cfg.get("meteor_stars", 0.0))
+        if den > 0.0:
+            self._draw_stars(u32, w, h, den, cfg)
+        if self.n == 0:
+            return
+
+        op = float(np.clip(cfg.get("meteor_opacity", 0.9), 0.0, 1.0))
+        size = float(np.clip(cfg.get("meteor_size", 1.0), 0.3, 4.0))
+        r_head = float(min(26.0, max(0.8, self.R_BASE * size)))
+
+        # 采样数按「最长轨迹 / 采样间距」推：间距 = 半径 × _SPAN < 直径，
+        # 相邻圆盘必然重叠 -> 连成一条带，不会断成虚线。
+        # 轨迹长度取**当前**长度（尾巴要一点点长出来），不是 blen 上限。
+        sp = self.spd + np.float32(1e-6)
+        cur = np.minimum(self.blen, sp * self.t)
+        # 采样数上限所隐含的「最长可连续渲染尾长」：超过就截短，
+        # 宁可短一点也不断成虚线（极细 + 极长的组合才会碰到）。
+        cur = np.minimum(cur, np.float32(self._KMAX * self._SPAN * r_head))
+        ks = int(np.clip(np.ceil(float(cur.max()) / (self._SPAN * r_head)),
+                         self._KMIN, self._KMAX))
+        s = np.linspace(1.0, 0.0, ks, dtype=np.float32)      # 1=尾端, 0=头部
+        ux = (self.vx / (np.sqrt(self.vx * self.vx + self.vy * self.vy)
+                         + np.float32(1e-6)))[:, None]
+        uy = (self.vy / (np.sqrt(self.vx * self.vx + self.vy * self.vy)
+                         + np.float32(1e-6)))[:, None]
+        blc = cur[:, None]
+        px = np.rint(self.x[:, None] - ux * blc * s[None, :]).astype(np.int32)
+        py = np.rint(self.y[:, None] - uy * blc * s[None, :]).astype(np.int32)
+
+        # 生灭包络：亮起 ~6%、最后 30% 渐隐 —— 否则整条尾巴会在 t=life
+        # 那一帧**整条同时消失**（rope trail 没有火焰残影，一撤就穿帮）。
+        tt = self.t / np.maximum(self.life, np.float32(1e-3))
+        env = (np.clip(tt / 0.06, 0.0, 1.0)
+               * np.clip((1.0 - tt) / 0.30, 0.0, 1.0)).astype(np.float32)
+
+        # 头部 12% 保持满亮（亮头），之后按 1.55 次幂向尾部收
+        prof = np.clip((1.0 - s) / 0.88, 0.0, 1.0) ** 1.55
+        alp = (self.bright * env)[:, None] * op * prof[None, :]
+        np.clip(alp, 0.0, 1.0, out=alp)
+        # 混色：头部近亮白、55% 之后全用尾色。
+        # 必须铺成 (n, ks) —— 混色只沿轨迹变化、与是哪颗流星无关，
+        # 但盖章收的是展平点集，长度得跟 px 对齐（这里踩过一次索引对不上的坑）。
+        mix = np.tile(np.clip(s / 0.55, 0.0, 1.0), (self.n, 1))
+
+        kdx, kdy, kw = self._ktab_round(r_head)
+        # 尾 -> 头 依次盖章（stamp 是覆盖写，后画的亮头压住暗尾）
+        self._stamp(u32, w, h, px.reshape(-1), py.reshape(-1),
+                    kdx, kdy, kw, alp.reshape(-1).astype(np.float32),
+                    mix.astype(np.float32), self._hc, self._tc)
+
+        glow = float(np.clip(cfg.get("meteor_glow", 0.0), 0.0, 1.0))
+        if glow > 0.0:
+            gdx, gdy, gw = self._ktab_round(r_head, glow)
+            ga = np.clip(self.bright * env * op, 0.0, 1.0).astype(np.float32)
+            self._stamp(u32, w, h, np.rint(self.x).astype(np.int32),
+                        np.rint(self.y).astype(np.int32), gdx, gdy, gw, ga,
+                        None, self._hc, self._hc)
+
+    def set_color(self, hex_str):
+        """头部颜色（参考里是 additive 的纯白热点）。"""
+        self._hc = tuple(float(v) for v in hex_to_bgr(hex_str))
+
+    def set_tail_color(self, hex_str):
+        """拖尾颜色（越靠尾越接近这个色）。"""
+        self._tc = tuple(float(v) for v in hex_to_bgr(hex_str))
+
+
+# ------------------------------------------------------------------ 颜料盘
+class PaintField:
+    """颜料盘：CPU 版流体颜料，参考 Lively 壁纸 "Fluids"
+    （= PavelDoGreat 的 WebGL Fluid Simulation，MIT）。
+
+    参考工程是**完整 Navier-Stokes**：半拉格朗日平流 + 涡量约束 + Jacobi 压力
+    投影 + bloom + sunrays，全跑 GPU（速度场 228×128、染料场 1820×1024、每帧
+    20 次压力迭代）。CPU 逐像素 overlay 上照搬不可能 60fps，四个取舍：
+
+    1. **不做压力投影**（省掉 20 次 Jacobi，是最大一笔）。改用一个**预烘的
+       curl-noise 基流**：由 φ 旋转梯度得 (u,v) = (∂φ/∂y, −∂φ/∂x)，按构造
+       ∂u/∂x + ∂v/∂y ≡ 0，天然无散度，"不可压缩"的观感一样有。3 条基流各是
+       5 列随机正弦叠加的势场，每帧只按缓慢变化的时间权重混合 —— 每帧 0.2ms，
+       而且流场持续变形，不是一张死图。
+    2. **网格只到 ~110 短边**（16:9 约 198×110 ≈ 22k 格），染料与速度同分辨
+       率，比参考的 1820×1024 粗得多；上屏用最近邻放大。颜料本身是低频的软
+       糊状 + 带辉光，放大后的台阶看不出来。
+    3. **上屏用 take 链放大**，1080p 4.7ms / 3840×1200 9.8ms。同一尺寸下
+       PIL 的 BILINEAR resize 要 46ms、`np.repeat` 要 10.5ms，都更慢。
+    4. **只写有颜料的像素**（`np.copyto(where=)`）。draw 是全屏覆盖写，若直接
+       `u32[:] = ...` 会把先画的聚光灯整片抹掉。多花 ~4ms 换"颜料是一个图层"
+       的正确语义。
+
+    颜色存 **RGB**（渲染时才拆进 `_premul_pack(bb, gb, rb, ab)`）—— 落樱在
+    这里把红蓝弄反过。
+
+    与其它特效同一套接口（set_amount / set_color / resize / update / draw）。
+    """
+
+    # 网格由"总格数上限"反推短边，保证 16:9 / 21:9 / 4K 双屏都不超预算
+    _CELLS_MAX = 22000
+    _G_MIN, _G_MAX = 64, 144
+    _BASIS = 3                   # 预烘基流条数
+    _WAVES = 5                   # 每条基流叠加的正弦列数
+    _FLOW = 0.075                # 基流速度基准（网格宽/秒），乘 paint_speed
+    _FADE_MIN, _FADE_MAX = 0.02, 0.40    # 消隐速率 1/s（对应 paint_fade 0~1）
+    _R_NORM = 0.05               # 颜料团半径基准（屏幕短边的比例，同参考）
+    _AMP = 1.7                   # 单团峰值浓度
+    _IMPULSE = 0.18              # 单团给流场的冲击强度（网格宽/秒）
+    _DIFF_RATE = 2.5             # 扩散强度基准（1/s），乘 paint_diffusion × dt
+    _DYE_CLAMP = 3.0             # 浓度上限，防叠加爆表
+
+    def __init__(self, w, h, seed=37):
+        self.rng = np.random.default_rng(seed)
+        self.gh = self.gw = 0
+        self.w, self.h = 0, 0
+        self._want = 0
+        self._acc = 0.0
+        self._t = 0.0
+        self._hue = 0.96             # 基准色相（#FF4D6D 的 hsv.h）
+        self._sat = 0.70
+        self._hue_src = None
+        self._om = np.array((0.0105, 0.0172, 0.0251), np.float32)
+        self._build(w, h)
+
+    # ------------------------------------------------------------ 网格 / 基流
+    def _build(self, w, h):
+        ar = (float(w) / float(h)) if h else 1.0
+        if not (ar > 0.0):
+            ar = 1.0
+        long_ar = max(ar, 1.0 / ar)
+        g = int(round(np.sqrt(self._CELLS_MAX / long_ar)))
+        g = int(np.clip(g, self._G_MIN, self._G_MAX))
+        gw = max(8, int(round(g * ar)))
+        gh = g
+        # 取偶数：辉光要做 2×2 池化 + 整数倍放大
+        gw -= gw % 2
+        gh -= gh % 2
+        self.w, self.h = w, h
+        self.gh, self.gw = gh, gw
+        self.cell = float(h) / float(gh)                    # 方格：w/gw == h/gh
+        self.r_base = max(1.5, self._R_NORM * float(min(w, h)) / max(self.cell, 1e-6))
+        self.dye = np.zeros((gh, gw, 3), np.float32)
+        self._iu = np.zeros((gh, gw), np.float32)
+        self._iv = np.zeros((gh, gw), np.float32)
+        self._ys = np.arange(gh, dtype=np.float32)[:, None]
+        self._xs = np.arange(gw, dtype=np.float32)[None, :]
+        # 上屏放大用的索引（最近邻）。放大的两步必须"先 x 后 y"，
+        # 见 draw() 里的说明。
+        self._iy = (np.arange(h, dtype=np.int64) * gh // h)
+        self._ix = (np.arange(w, dtype=np.int64) * gw // w)
+        self._bu, self._bv = self._make_basis(gh, gw)
+        self._phase = self.rng.uniform(0.0, TAU, self._BASIS).astype(np.float32)
+        self._acc = 0.0
+        self._t = 0.0
+        self._primed = False
+
+    def _make_basis(self, gh, gw):
+        """预烘 _BASIS 条无散度基流，各自把 RMS 归一到 1。
+
+        只在建网格时算一次（~15 次全网格 sin），每帧不再碰三角函数。
+        """
+        rng = self.rng
+        X = np.arange(gw, dtype=np.float32)[None, :] / np.float32(gw)
+        Y = np.arange(gh, dtype=np.float32)[:, None] / np.float32(gh)
+        bu = np.empty((self._BASIS, gh, gw), np.float32)
+        bv = np.empty((self._BASIS, gh, gw), np.float32)
+        for k in range(self._BASIS):
+            u = np.zeros((gh, gw), np.float32)
+            v = np.zeros((gh, gw), np.float32)
+            for _ in range(self._WAVES):
+                # 频率不取近 0：否则基流退化成整体平移，画面变成"整块飘"
+                kx = rng.uniform(0.6, 3.2) * (1.0 if rng.random() < 0.5 else -1.0)
+                ky = rng.uniform(0.6, 3.2) * (1.0 if rng.random() < 0.5 else -1.0)
+                th = TAU * (np.float32(kx) * X + np.float32(ky) * Y) \
+                    + np.float32(rng.uniform(0.0, 2.0 * np.pi))
+                s = np.sin(th)
+                u += np.float32(TAU * ky) * s       # ∂φ/∂y
+                v -= np.float32(TAU * kx) * s       # −∂φ/∂x
+            m = float(np.sqrt(np.mean(u * u + v * v))) + 1e-6
+            bu[k] = u / m
+            bv[k] = v / m
+        return bu, bv
+
+    def resize(self, w, h):
+        if (w, h) != (self.w, self.h):
+            self._build(w, h)
+
+    def set_amount(self, n, w=None, h=None):
+        self._want = max(0, int(n))
+
+    def set_color(self, hex_str):
+        """基准色：由它取色相/饱和度，每团的色相再按 paint_hue_spread 抖动。"""
+        if hex_str == self._hue_src:
+            return
+        self._hue_src = hex_str
+        b, g, r = (float(x) for x in hex_to_bgr(hex_str))
+        hh, ss, _vv = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
+        self._hue = float(hh)
+        # 基准色偏灰时也把饱和度托起来，否则"颜料盘"会发浊
+        self._sat = float(min(1.0, max(0.55, ss)))
+
+    # ------------------------------------------------------------ 颜料团
+    def _splat(self, cx, cy, r, amp, col):
+        """在 (cx,cy) 落一团高斯颜料，并给流场一记随机方向的冲击。"""
+        gh, gw = self.gh, self.gw
+        ext = 2.6 * r
+        x0 = int(max(0, np.floor(cx - ext)))
+        x1 = int(min(gw, np.ceil(cx + ext) + 1))
+        y0 = int(max(0, np.floor(cy - ext)))
+        y1 = int(min(gh, np.ceil(cy + ext) + 1))
+        if x1 <= x0 or y1 <= y0:
+            return
+        xs = np.arange(x0, x1, dtype=np.float32)[None, :] - np.float32(cx)
+        ys = np.arange(y0, y1, dtype=np.float32)[:, None] - np.float32(cy)
+        gg = np.exp(-(xs * xs + ys * ys) / np.float32(2.0 * r * r))
+        gg *= np.float32(amp)
+        self.dye[y0:y1, x0:x1] += gg[..., None] * col[None, None, :]
+        ang = float(self.rng.uniform(0.0, 2.0 * np.pi))
+        mag = np.float32(self._IMPULSE * amp * float(self.rng.uniform(0.6, 1.4)))
+        self._iu[y0:y1, x0:x1] += gg * np.float32(np.cos(ang) * mag)
+        self._iv[y0:y1, x0:x1] += gg * np.float32(np.sin(ang) * mag)
+
+    def _spawn(self, k, cfg, spread, r_scale=1.0, amp_scale=1.0):
+        if k <= 0:
+            return
+        gh, gw = self.gh, self.gw
+        rng = self.rng
+        r0 = self.r_base * float(cfg.get("paint_size", 1.0)) * r_scale
+        hues = self._hue + spread * rng.uniform(-1.0, 1.0, k)
+        sats = np.minimum(1.0, self._sat * rng.uniform(0.85, 1.12, k))
+        cr, cg, cb = _hsv_to_rgb(hues, sats, np.ones(k))
+        cols = np.stack([cr, cg, cb], axis=1).astype(np.float32)
+        cxs = rng.uniform(0.0, float(gw), k)
+        cys = rng.uniform(0.0, float(gh), k)
+        rs = np.maximum(1.2, r0 * rng.uniform(0.65, 1.5, k))
+        amps = self._AMP * amp_scale * rng.uniform(0.7, 1.3, k)
+        for i in range(k):
+            self._splat(float(cxs[i]), float(cys[i]), float(rs[i]),
+                        float(amps[i]), cols[i])
+
+    # ------------------------------------------------------------ 每帧
+    def _advect(self, u, v, dt):
+        """半拉格朗日平流：反查 (x − u·dt) 处的染料，双线性插值。
+
+        用 `take` 展平索引而不是 2D fancy-index：同样 4 个角点，RGB 三通道
+        一起取，实测比 `d[y0, x0]` 快近一倍。
+        """
+        gh, gw = self.gh, self.gw
+        sy = np.clip(self._ys - v * np.float32(gh * dt), 0.0, gh - 1.001)
+        sx = np.clip(self._xs - u * np.float32(gw * dt), 0.0, gw - 1.001)
+        y0 = sy.astype(np.int32)
+        x0 = sx.astype(np.int32)
+        # 必须把索引转 float32 再相减：int32 - float32 会被提升成 float64，
+        # 后面 4 个 (n,3) 的临时数组会全部翻倍。
+        fy = (sy - y0.astype(np.float32)).reshape(-1, 1)
+        fx = (sx - x0.astype(np.float32)).reshape(-1, 1)
+        base = (y0 * np.int32(gw) + x0).reshape(-1)
+        fl = self.dye.reshape(-1, 3)
+        c00 = fl.take(base, axis=0)
+        c01 = fl.take(base + 1, axis=0)
+        c10 = fl.take(base + gw, axis=0)
+        c11 = fl.take(base + gw + 1, axis=0)
+        out = (c00 * ((1.0 - fx) * (1.0 - fy))
+               + c01 * (fx * (1.0 - fy))
+               + c10 * ((1.0 - fx) * fy)
+               + c11 * (fx * fy))
+        self.dye = out.reshape(gh, gw, 3)
+
+    def update(self, dt, cfg):
+        dt = float(min(max(dt, 0.0), 0.1))
+        if dt <= 0.0:
+            return
+        self._t += dt
+        gh, gw = self.gh, self.gw
+
+        # 1) 时间权重混合出本帧的基流（每帧只此一笔，三角函数早已烘好）
+        wt = 0.5 + 0.5 * np.sin(TAU * np.float32(self._t) * self._om + self._phase)
+        bu, bv = self._bu, self._bv
+        u = bu[0] * wt[0]
+        v = bv[0] * wt[0]
+        for i in range(1, self._BASIS):
+            u += bu[i] * wt[i]
+            v += bv[i] * wt[i]
+
+        # 2) 冲击场：衰减 + 轻微扩散（让被"甩"出去的颜料边缘柔和）
+        self._iu *= np.float32(0.985)
+        self._iv *= np.float32(0.985)
+        _smooth5(self._iu, 0.25, 1)
+        _smooth5(self._iv, 0.25, 1)
+
+        sp = float(np.clip(cfg.get("paint_speed", 1.0), 0.05, 4.0)) * self._FLOW
+        np.add(u, self._iu, out=u)
+        np.add(v, self._iv, out=v)
+        u *= np.float32(sp)
+        v *= np.float32(sp)
+
+        # 3) 平流 -> 颜料被拉出丝（流体的灵魂，不能省）
+        self._advect(u, v, dt)
+        # 必须在这里**重新**取一次：_advect 里换成了新的 self.dye，
+        # 若沿用上面缓存的旧引用，后面的扩散/消隐/钳制会全部作用在已经
+        # 被丢弃的那一份上 —— 新数组永不衰减，颜料会无限堆积（踩过）。
+        dye = self.dye
+
+        # 4) 扩散（糊化）+ 消隐
+        # 扩散必须按 dt 缩放：写成"每帧固定糊一下"的话，60fps 下每秒糊 120 遍，
+        # 十几秒后 12 团颜料会摊成一整屏均匀的色糊（实测 lit=100%、dye≈3）。
+        diff = float(np.clip(cfg.get("paint_diffusion", 0.25), 0.0, 1.0))
+        if diff > 0.0:
+            _smooth5(dye, self._DIFF_RATE * diff * dt, 2)
+        fade = self._FADE_MIN + self._FADE_MAX * float(
+            np.clip(cfg.get("paint_fade", 0.35), 0.0, 1.0))
+        dye *= np.float32(np.exp(-fade * dt))
+        np.clip(dye, 0.0, self._DYE_CLAMP, out=dye)
+
+        # 5) 生成：amount 是"稳态团数"，速率 = 团数 / 平均寿命（1/消隐速率）
+        want = self._want
+        spread = float(np.clip(cfg.get("paint_hue_spread", 0.5), 0.0, 1.0)) * 180.0 / 360.0
+        if not self._primed:
+            # 首次启用先铺一层：否则要等十几秒颜料才铺满屏幕
+            self._primed = True
+            self._spawn(max(4, min(10, want)), cfg, spread,
+                        r_scale=1.45, amp_scale=1.3)
+        if want <= 0:
+            self._acc = 0.0
+            return
+        # 生成速率 = 目标团数 / 平均寿命，而指数衰减的平均寿命就是 1/fade，
+        # 所以速率 = want × fade。写成 want/fade 就等于按"寿命"倍放大，
+        # 默认参数下会从 1.9 团/秒变成 75 团/秒（踩过）。
+        self._acc += float(want) * fade * dt
+        n = int(self._acc)
+        if n > 0:
+            self._acc -= n
+            self._spawn(min(n, 24), cfg, spread)
+
+    # ------------------------------------------------------------ 绘制
+    def _bloom(self, d):
+        """大半径辉光：2×2 池化到 1/4 面积再平滑 3 遍，等效半径翻倍且更便宜。"""
+        gh, gw = self.gh, self.gw
+        # 池化用四条切片相加而不是 .mean(axis=(1,3))：后者在非连续视图上
+        # 走通用 reduce，实测 1.63ms，切片写法只要 0.14ms。
+        p = (d[0::2, 0::2] + d[0::2, 1::2] + d[1::2, 0::2] + d[1::2, 1::2])
+        p *= np.float32(0.25)
+        _smooth5(p, 0.62, 3)
+        return np.repeat(np.repeat(p, 2, axis=0), 2, axis=1)
+
+    def draw(self, u32, w, h, cfg):
+        if (w, h) != (self.w, self.h):
+            self.resize(w, h)
+        op = float(np.clip(cfg.get("paint_opacity", 0.9), 0.0, 1.0))
+        if op <= 0.0:
+            return
+        glow = float(np.clip(cfg.get("paint_glow", 0.0), 0.0, 1.0))
+        shading = float(np.clip(cfg.get("paint_shading", 0.0), 0.0, 1.0))
+
+        d = self.dye
+        if glow > 0.0:
+            d = d + self._bloom(d) * np.float32(0.9 * glow)
+
+        # 亮通道用 maximum 链而不是 d.max(axis=2)：后者对"最后一维只有 3 个"
+        # 走的是通用 reduce，实测 0.86ms，(110,196) 上纯属浪费。
+        lum = np.maximum(np.maximum(d[..., 0], d[..., 1]), d[..., 2])
+        if shading > 0.0:
+            # 用亮度的梯度给颜料加"厚度"：迎光面亮、背光面暗（参考的 SHADING）
+            gy = np.zeros_like(lum)
+            gx = np.zeros_like(lum)
+            gy[1:-1, :] = (lum[2:, :] - lum[:-2, :]) * np.float32(0.5)
+            gx[:, 1:-1] = (lum[:, 2:] - lum[:, :-2]) * np.float32(0.5)
+            sh = np.clip(1.0 + shading * 7.0 * (gx + gy), 0.35, 1.9).astype(np.float32)
+            d = d * sh[..., None]
+            lum = lum * sh
+
+        # alpha = 亮度，RGB = 归一化后的色相 -> 颜料像"发光"的而不是一块死色
+        a01 = np.clip(lum, 0.0, 1.0) * op
+        rgb = d / np.maximum(lum, np.float32(1e-5))[..., None]
+        np.clip(rgb, 0.0, 1.0, out=rgb)
+        sc = a01 * 255.0
+        ab = np.rint(sc).astype(np.uint32)
+        rb = np.rint(rgb[..., 0] * sc).astype(np.uint32)
+        gb = np.rint(rgb[..., 1] * sc).astype(np.uint32)
+        bb = np.rint(rgb[..., 2] * sc).astype(np.uint32)
+        small = _premul_pack(bb, gb, rb, ab)
+
+        # 上屏放大：**必须先 x 后 y**。
+        # numpy 的高级索引会把被索引的那个轴放到结果的最内层，于是
+        #   `small[iy][:, ix]` -> 结果按 (W, H) 排布 = Fortran 连续，
+        # 赋给 C 连续的 dst 会走"转置拷贝"慢路径（1080p 14.3ms）。
+        # 换成先 x 后 y，结果就是 C 连续，赋值只要 1.1ms。
+        # 两步都用 `take` 又比裸 fancy-index 快一截：
+        #   1080p  5.4 -> 4.7ms，3840×1200  15.8 -> 9.8ms。
+        big = np.take(small, self._ix, axis=1)[self._iy]
+        dst = u32.reshape(h, w)
+        if cfg.get("spotlight_enabled", False):
+            # 已经有全屏层（聚光灯）画过：只覆盖真有颜料的像素，别整片抹掉
+            np.copyto(dst, big, where=big != 0)
+        else:
+            dst[:] = big
 
 
 # ------------------------------------------------------------------ 光标拖尾
