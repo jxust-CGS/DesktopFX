@@ -261,7 +261,7 @@ DesktopFX/
 ├── _diag_layers.py         # 真机验证：雨+聚光灯同屏启动，抓帧差分确认画到桌面
 ├── _diag_zorder.py         # 诊断：30ms 轮询覆盖层与面板的 z 序相对位置，抓周期性互压
 ├── _diag_above.py          # 诊断（只读）：摊开"谁压在覆盖层之上"，逐窗标注会不会被判为遮挡
-├── _run_all_verify.py      # 顺序跑完整套 _verify_*.py 并汇总（必须顺序，并行会互相干扰出假失败）
+├── _run_all_verify.py      # 分层顺序跑验证脚本并汇总（`--fast` 约 1 分钟 / `--skip-slow` 约 3 分钟 / 全量约 11 分钟；必须顺序，并行会互相干扰出假失败）
 ├── _verify_stability.py    # 18000 帧长跑：内存泄漏 / 帧耗时漂移 / 池溢出
 ├── _verify_mouse_init.py   # 鼠标探针首帧幽灵位移修复验证
 ├── _verify_dpi.py          # DPI 感知声明验证
@@ -334,6 +334,11 @@ python _runtime_test.py
 #   图层组合 / 窗口水波 / 置顶保活与层级 / 特效分类 / 避开任务栏 / 界面运行时
 # 托盘脚本会真机拉起程序（约 15 秒），并断言干净启动不产生 error.log
 # 稳定性脚本额外需要 psutil：pip install psutil
+
+# 或者按范围分层跑（推荐）：改完代码先用 --fast，别一律跑全量
+python _run_all_verify.py --fast        # 核心回归，约 40 秒
+python _run_all_verify.py --skip-slow   # 略过性能/长跑/烟雾，约 3 分钟
+python _run_all_verify.py               # 全量，约 11 分钟
 python _verify_visibility.py
 python _verify_config.py
 python _verify_user_presets.py
