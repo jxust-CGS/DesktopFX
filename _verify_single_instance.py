@@ -146,6 +146,12 @@ print("== A. mutex semantics across real processes ==")
 print(f"  pre-clean: terminated {kill_strays()} stray pythonw.exe")
 time.sleep(0.6)
 
+# 判据全部**事件驱动**，不用固定的 sleep 猜时序。
+# 早先的写法是"起 p1 -> sleep 1.2s -> 起 p2"，机器一忙（例如同时跑
+# _verify_perf / _verify_stability）就假失败：p1 的 Python 解释器 + import 可能
+# 超过 1.2s 才起来，而 p1 只持锁 2s —— 等 p2 真正去抢锁时 p1 早已退出并释放，
+# 于是两个都拿到 GOT。现在改成：p1 拿到锁后**立刻** flush 一行，父进程读到这行
+# 才去起 p2（读到 GOT 即证明锁已被持有），p1 则持锁 30s 等父进程主动收工。
 probe = os.path.join(HERE, "_probe_singleton.py")
 with open(probe, "w", encoding="utf-8") as f:
     f.write(
@@ -153,29 +159,36 @@ with open(probe, "w", encoding="utf-8") as f:
         "sys.path.insert(0, r'%s')\n"
         "import desktop_fx\n"
         "got = desktop_fx._acquire_singleton()\n"
-        "print('GOT' if got else 'REFUSED')\n"
-        "time.sleep(2.0) if got else None\n" % HERE
+        "print('GOT' if got else 'REFUSED', flush=True)\n"
+        "time.sleep(30.0) if got else None\n" % HERE
     )
 
-p1 = subprocess.Popen([PY, probe], stdout=subprocess.PIPE, text=True)
-time.sleep(1.2)                       # let it grab the mutex and stay alive
-p2 = subprocess.Popen([PY, probe], stdout=subprocess.PIPE, text=True)
-out2 = p2.communicate(timeout=30)[0].strip()
-out1 = p1.communicate(timeout=30)[0].strip()
 
+def _start_probe():
+    p = subprocess.Popen([PY, probe], stdout=subprocess.PIPE, text=True)
+    line = (p.stdout.readline() or "").strip()   # 阻塞到子进程报出结果为止
+    return p, line
+
+
+p1, out1 = _start_probe()
 print(f"  first  process : {out1}")
+p2, out2 = _start_probe()
 print(f"  second process : {out2}")
 if out1 == "GOT" and out2 == "REFUSED":
     print("  [OK] mutex correctly refuses the second instance")
 else:
     print("  [FAIL] mutex did not behave as expected")
     ok = False
+p1.terminate()
+p1.wait(timeout=10)                  # 等它真的退出（句柄释放）再验下一段
+p2.terminate()
+p2.wait(timeout=10)
 
 # after the first process exits, the mutex must be released again
-time.sleep(0.4)
-p3 = subprocess.Popen([PY, probe], stdout=subprocess.PIPE, text=True)
-out3 = p3.communicate(timeout=30)[0].strip()
+p3, out3 = _start_probe()
 print(f"  after first exits, a new process : {out3}")
+p3.terminate()
+p3.wait(timeout=10)
 if out3 == "GOT":
     print("  [OK] mutex released on process exit (no permanent lockout)")
 else:

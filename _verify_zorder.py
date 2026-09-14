@@ -17,6 +17,7 @@
 """
 import ctypes
 import ctypes.wintypes as wt
+import time
 
 import fx_winlayer as fw
 from _win32 import user32, hwnd_int
@@ -199,6 +200,60 @@ def test_occluder_found_past_helpers():
     return True, "跳过辅助窗后找到真实遮挡者 -> 复位 1 次"
 
 
+def test_raise_is_throttled():
+    """**每帧**调用是安全的：被盖住时不许变成每秒 60 次 z 序重排。
+
+    主循环现在每帧问一次"我是不是被盖住了"（反应延迟压到一帧，才抢得过
+    Citrix 那类以十几 Hz 重新置顶自己的远控全屏窗）。判"被盖"很便宜但仍要
+    两道闸门，这里把两道都锁住：
+
+    * 连续 30 帧（同一毫秒内）调用，一次额外 SetWindowPos 都不许发；
+    * 把抢顶限流显式关掉（`min_interval=0.0`）后，**过了链签名短路窗口**就
+      该每次都动手 —— 证明"安静"确实是限流带来的，不是别的东西顺手挡住了。
+
+    同时锁死"闸门不得挡住判定"：`min_interval=0.0` 时必须每次都动手。
+    """
+    ov, fake = _patched({OVERLAY: OTHER, OTHER: 0}, {OTHER}, panel=PANEL)
+    ov.keep_on_top()
+    n1 = len(fake.setpos)
+    for _ in range(30):                 # 模拟紧接着的 30 帧
+        ov.keep_on_top()
+    n2 = len(fake.setpos) - n1
+    if n1 != 1:
+        return False, f"首次被盖应复位 1 次，实际 {n1}"
+    if n2 != 0:
+        return False, f"限流失效：紧接着的 30 次调用又抢了 {n2} 次顶"
+    ov2, fake2 = _patched({OVERLAY: OTHER, OTHER: 0}, {OTHER}, panel=PANEL)
+    ov2.keep_on_top(min_interval=0.0)
+    time.sleep(fw._FULL_CHECK_INTERVAL + 0.05)   # 走出链签名短路窗口
+    ov2.keep_on_top(min_interval=0.0)
+    if len(fake2.setpos) != 2:
+        return False, (f"min_interval=0 且已过复查间隔时本该每次都动手，"
+                       f"实际 {len(fake2.setpos)} 次")
+    return True, "被盖时首帧复位 1 次，随后 30 帧 0 次额外重排；关掉限流则每帧动手"
+
+
+def test_chain_change_triggers_immediate_recheck():
+    """链一变就必须**当帧**重查 —— 这是"每帧自检 + 链签名短路"的正确性核心。
+
+    用户报的场景：Citrix 那类远控全屏窗把自己抬到我们头上。它一抬上来，我们
+    之上的 z 序链就变了（签名随之改变），必须当帧发现并抢回，而不是等满复查
+    间隔。所以短路只能在"链没变"时才生效。
+    """
+    ov, fake = _patched({OVERLAY: TINY, TINY: 0}, {TINY}, sizes={TINY: (1, 1)})
+    if ov.keep_on_top() or fake.setpos:
+        return False, "初始（只有 1x1 辅助窗）不该抢顶"
+    # 对方抬到我们头上：链首换成真实大窗口（同一毫秒内立刻再问一次）
+    fake.chain = {OVERLAY: OTHER, OTHER: TINY, TINY: 0}
+    fake.sizes[OTHER] = (800, 600)
+    fake.visible.add(OTHER)
+    moved = ov.keep_on_top()
+    if not moved or len(fake.setpos) != 1:
+        return False, (f"链变了却没有当帧重查（moved={moved}, "
+                       f"setpos={len(fake.setpos)}）")
+    return True, "遮挡者抬上来（链变）当帧即重查并抢回，不必等满复查间隔"
+
+
 # ---------------------------------------------------------------- 真实窗口冒烟
 class _CountProxy:
     """包装真实 user32，只统计 SetWindowPos 次数。"""
@@ -216,10 +271,14 @@ class _CountProxy:
 
 
 def test_real_window_steady_state():
-    """真实 overlay：进入稳态后连续 10 次调用必须 0 次实际重排。
+    """真实 overlay：进入稳态后连续 5 次**全量检查**必须 0 次实际重排。
 
     首次调用允许一次自愈复位（桌面上可能本来就有别人的置顶窗口压着）；
     重点是从第二次起必须彻底安静 —— 无条件抢顶的实现会在这里每次 +1。
+
+    每次调用之间 sleep 过链签名短路窗口，否则后 9 次会被"链没变"直接短路掉，
+    这道不变量就变成没测到（短路本身在 test_chain_change_triggers_immediate_recheck
+    里单独锁）。
     """
     try:
         ov = fw.Overlay().create()
@@ -230,15 +289,16 @@ def test_real_window_steady_state():
         fw.user32 = proxy
         first = ov.keep_on_top()
         proxy.setpos = 0
-        for _ in range(10):
+        for _ in range(5):
+            time.sleep(fw._FULL_CHECK_INTERVAL + 0.05)
             ov.keep_on_top()
         n = proxy.setpos
     finally:
         fw.user32 = _REAL_USER32
         ov.destroy()
     if n:
-        return False, f"进入稳态后仍抢顶 {n} 次/10 次调用（应为 0）"
-    return True, f"真实窗口稳态 10 次调用 -> 0 次 SetWindowPos（首次自愈={first}）"
+        return False, f"进入稳态后仍抢顶 {n} 次/5 次全量检查（应为 0）"
+    return True, f"真实窗口稳态 5 次全量检查 -> 0 次 SetWindowPos（首次自愈={first}）"
 
 
 def test_real_window_geometry_sane():
@@ -254,6 +314,67 @@ def test_real_window_geometry_sane():
     if covered:
         return False, "_covered() 为真 —— 判据过宽，会导致周期性抢顶"
     return True, "_covered() 为假（无真实窗口压在全屏 overlay 之上）"
+
+
+def test_real_foreign_topmost_is_recovered():
+    """真机端到端：别人的置顶窗压上来，keep_on_top 必须真的抢回置顶。
+
+    用一个 `WS_EX_TOPMOST` 的 STATIC 窗口当"Citrix 那类全屏远控窗"的替身 ——
+    先把窗口建出来，再 `SetWindowPos(HWND_TOPMOST)` 显式抬到 topmost 组顶部，
+    模拟对方"被激活后压过我们"。这正是用户报的"展示层级还不是最高的"。
+
+    抢回之后还要**连续调用 20 次**确认一次都不再动手：主循环是每帧调用的，
+    若抢回后仍反复重排 z 序，画面会闪。
+    """
+    import time as _time
+
+    WS_VISIBLE = 0x10000000
+    try:
+        ov = fw.Overlay().create()
+    except Exception as e:
+        return None, f"SKIP（{type(e).__name__}: {e}）"
+    occ = None
+    try:
+        if ov._covered():               # 先把桌面上本来就有的东西让开，基线要干净
+            ov.keep_on_top()
+        occ = user32.CreateWindowExW(
+            fw.WS_EX_TOPMOST | fw.WS_EX_TOOLWINDOW, "Static", "dfx-occluder",
+            fw.WS_POPUP | WS_VISIBLE, ov.x + 40, ov.y + 40, 320, 240,
+            None, None, None, None)
+        if not occ:
+            return None, "SKIP（造不出替身遮挡窗）"
+        # 关键一步：抬到 topmost 组**顶部**（光带 WS_EX_TOPMOST 会被放在该组
+        # 最下面，压不到我们头上，就测不出东西了）。
+        user32.SetWindowPos(occ, fw.HWND_TOPMOST, ov.x + 40, ov.y + 40, 320, 240,
+                            fw.SWP_SHOWWINDOW | fw.SWP_NOACTIVATE)
+        deadline = _time.time() + 2.0
+        while _time.time() < deadline and not ov._covered():
+            _time.sleep(0.05)
+        if not ov._covered():
+            return False, "自己造的置顶遮挡窗没被判成遮挡（判定过窄，抢不回置顶）"
+
+        proxy = _CountProxy(user32)
+        fw.user32 = proxy
+        try:
+            raised = ov.keep_on_top()
+            n_raise = proxy.setpos
+            for _ in range(20):         # 模拟之后 20 帧
+                ov.keep_on_top()
+            n_steady = proxy.setpos - n_raise
+        finally:
+            fw.user32 = _REAL_USER32
+        if not raised or n_raise != 1:
+            return False, f"被真实置顶窗盖住却没抢回（raised={raised}, n={n_raise}）"
+        if ov._covered():
+            return False, "抢顶之后仍被判为被盖 —— 抢占没真正生效"
+        if n_steady:
+            return False, f"抢回后仍反复重排 z 序（20 帧里又抢了 {n_steady} 次）"
+    finally:
+        fw.user32 = _REAL_USER32
+        if occ:
+            user32.DestroyWindow(occ)
+        ov.destroy()
+    return True, "置顶窗压上来 -> 判定为被盖 -> 抢回成功，随后 20 帧 0 次重排"
 
 
 # ---------------------------------------------------------------- 显示层级
@@ -497,8 +618,11 @@ def main():
         test_other_topmost_triggers_once,
         test_other_topmost_without_panel,
         test_occluder_found_past_helpers,
+        test_raise_is_throttled,
+        test_chain_change_triggers_immediate_recheck,
         test_real_window_steady_state,
         test_real_window_geometry_sane,
+        test_real_foreign_topmost_is_recovered,
         test_workerw_lookup_safe,
         test_real_desktop_layer_roundtrip,
         test_real_two_overlay_render_loop,

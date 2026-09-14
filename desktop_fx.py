@@ -158,6 +158,12 @@ DEFAULTS = {
     # 关闭（默认）时同一分类里只能开一个特效，开新的会自动关掉同类的旧的。
     "multi_fullscreen": False,
     "multi_mouse": False,
+    # ---- 避开任务栏 ----
+    # 覆盖窗是置顶窗（WS_EX_TOPMOST），任务栏不是 —— 不挡的话特效会被直接
+    # 画在任务栏上面（用户报的"真实水波在下方任务栏会有残影"）。开着时上屏
+    # 前把任务栏矩形（含每块副屏的任务栏）擦干净，任务栏始终干净；观感上
+    # 等于"任务栏浮在特效之前"。
+    "avoid_taskbar": True,
 }
 
 PRESETS = {
@@ -725,6 +731,7 @@ class App:
     def _render_loop(self):
         # 延迟导入，保证 numpy 缺失时能在主线程友好提示
         import numpy as np
+        import fx_winlayer
         from fx_winlayer import Overlay
         from fx_scene import Scene
 
@@ -746,12 +753,17 @@ class App:
         last = time.perf_counter()
         frame = 0
         fps_ema = 60.0
-        _last_top = 0.0     # 上次"钉顶"时刻；见 ov.keep_on_top 注释
         _last_alive = 0.0   # 上次"桌面层存活自检"时刻
         z_applied = (None, None)   # 已施加的 (全屏层, 鼠标层) 层级
         # 上一帧该层是否**有内容**。用于空层跳过呈现（见第 5 步注释）：
         # 有 -> 空 的那一帧还要补提交一次，把上一帧的像素擦掉。
         fs_dirty = ms_dirty = True
+        # 系统任务栏矩形（缓存）。每次都得跨进程读窗口矩形，所以别每帧问；
+        # 但也不能缓存太久：任务栏自动隐藏时会被系统挪到屏幕外（此时矩形与
+        # 虚拟屏不相交、自然不擦），鼠标触到屏幕边缘它又滑回来 —— 缓存 0.25s
+        # 意味着这段时间内它滑回来的话特效会短暂画上去。
+        bars = ()
+        bars_t = 0.0
 
         while not self.stop_evt.is_set():
             t0 = time.perf_counter()
@@ -814,17 +826,21 @@ class App:
                     # 鼠标层恒在全屏层之上（两层都是最上层时才纠正，见 _restack_overlays）
                     self._restack_overlays()
 
-                # 4) 周期性把"最上层"的层钉回置顶：被其它置顶窗口（全屏视频/
-                #    画中画等）盖住后 ≤0.5s 内自动复位；NOACTIVATE 不抢焦点。
-                #    keep_on_top 内部会先判定"是否真被盖"，未被盖是空操作 ——
-                #    无条件抢顶会跟面板的置顶保活互抢，造成周期性 z 序翻转闪烁。
+                # 4) 把"最上层"的层钉回置顶：**每帧**判一次是否被别人的置顶窗
+                #    盖住，被盖就立刻插回置顶组顶部；NOACTIVATE 不抢焦点。
+                #    这里必须每帧做，不能像早先那样 0.5s 一次 —— Citrix 之类
+                #    的远程桌面全屏窗会以十几 Hz 重新把自己置顶，0.5s 的检查
+                #    周期意味着特效有近一半时间被压在下面（用户报的"还是会
+                #    遮住"）。每帧做必须便宜：keep_on_top 内部先用**链签名**
+                #    （只读我们之上最近 4 个窗口的 hwnd，0.7µs/次）短路掉绝大多数
+                #    帧，只有链变了才做昂贵的全量检查（读每个窗口的矩形 18µs +
+                #    类名 4.3µs，一次约 74µs，渲染循环里因 GIL 争用还会更大）；
+                #    真正的 SetWindowPos 再按 _RAISE_MIN_INTERVAL 限流，
+                #    所以抢不过时也不会退化成每帧重排 z 序。
                 #    刚重建过 DIB 的帧要跳过：那一瞬间 _hdc_mem 还挂着占位位图，
                 #    此时再改 z 序容易让 DWM 取到无效内容。
                 #    桌面层的窗口不参与抢顶（它本来就该待在下面）。
-                if resized:
-                    _last_top = now
-                elif now - _last_top > 0.5:
-                    _last_top = now
+                if not resized:
                     moved = False
                     for ov in (ov_fs, ov_ms):
                         if ov.z_mode == fx_kinds.LAYER_TOPMOST:
@@ -839,6 +855,23 @@ class App:
                 u32_ms[:] = 0
                 scene.cfg = cfg
                 scene.step(dt, u32_fs, w, h, u32_ms)
+
+                # 5b) 避开任务栏：覆盖窗是置顶窗而任务栏不是，不擦的话特效会
+                #     被直接画在任务栏上（用户报的"真实水波在下方任务栏会有
+                #     残影"）。擦在**合成之后、判空之前**：擦完再判"这层还有
+                #     没有内容"，就不会为一块本该全透明的地方白提交一次上屏。
+                #     有 -> 空 的那一帧仍由 fs_dirty/ms_dirty 保证补提交一次，
+                #     所以"擦掉"这件事一定会上屏（不会把上一帧的条纹留在那里）。
+                if cfg.get("avoid_taskbar", True):
+                    if now - bars_t > 0.25:
+                        bars_t = now
+                        try:
+                            bars = fx_winlayer.system_bar_rects()
+                        except Exception:
+                            bars = ()          # 拿不到任务栏就当成没有，不打断渲染
+                    if bars:
+                        fx_winlayer.blank_rects(u32_fs, w, h, ov_fs.x, ov_fs.y, bars)
+                        fx_winlayer.blank_rects(u32_ms, w, h, ov_ms.x, ov_ms.y, bars)
 
                 # 空层跳过呈现。分成两个覆盖窗口后，每层每帧一次全屏
                 # UpdateLayeredWindow（实测约 4ms @3840x1200）—— 而常常只有一类

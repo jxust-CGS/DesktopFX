@@ -285,16 +285,36 @@ def main():
     before_wins = len(wins)
     before_procs = len(procs)
     os.startfile(bat)
-    time.sleep(4.0)
-    wins2 = count_overlay_windows()
-    n2 = len(list_procs("pythonw.exe"))
-    if len(wins2) > before_wins or n2 > before_procs:
+
+    # 轮询到"计数稳定"为止，而不是固定睡 4 秒取一次样：被拒的第二个实例在退出前
+    # 会**短暂**多出 2 个 pythonw（.bat 的 launcher pythonw + 真正的解释器），
+    # 机器一忙（例如同时在跑性能基准）这个瞬时窗口就会被固定采样正好命中，
+    # 于是"第二次双击什么都没加"被误判成失败。
+    # 判据看的是**持久**增量：覆盖层窗口是"第二个实例真跑起来了"的铁证，
+    # 而 pythonw 计数必须回落到基线。
+    wins_max = before_wins
+    procs_max = before_procs
+    settled = False
+    deadline = time.time() + 12.0
+    while time.time() < deadline:
+        time.sleep(0.5)
+        w = len(count_overlay_windows())
+        n = len(list_procs("pythonw.exe"))
+        wins_max = max(wins_max, w)
+        procs_max = max(procs_max, n)
+        if w <= before_wins and n <= before_procs:
+            settled = True
+            break
+    if wins_max > before_wins or not settled:
         print(f"  [FAIL] second launch created another instance "
-              f"(overlay {before_wins}->{len(wins2)}, pythonw {before_procs}->{n2})")
+              f"(overlay {before_wins}->{wins_max}, "
+              f"pythonw {before_procs}->{procs_max}"
+              f"{'' if settled else '，计数始终没回落到基线'}）")
         ok = False
     else:
         print(f"  [OK] second double-click added nothing "
-              f"(overlay {len(wins2)}, pythonw {n2})")
+              f"(overlay 恒为 {before_wins}，pythonw 瞬时峰值 {procs_max} "
+              f"后回落到 {before_procs})")
 
     print()
     print("== cleanup ==")

@@ -2,6 +2,7 @@
 """Win32 per-pixel-alpha 分层覆盖窗口。依赖 _win32 预设的函数签名。"""
 import ctypes
 import ctypes.wintypes as wt
+import time
 
 import numpy as np
 
@@ -55,6 +56,29 @@ _NON_OCCLUDERS = frozenset((
 # 全算成遮挡 —— 那样每 0.5s 都会触发一次抢顶。
 _OCCLUDER_MIN_PX = 32
 
+# 同一层两次"真正抢顶"之间的最小间隔（秒）。主循环现在**每帧**问一次
+# "我是不是被盖住了"（反应要快，见 keep_on_top），但真动手复位要限流：
+# 万一对面是个抢不过的窗口、或 SetWindowPos 反复失败，不限流就退化成
+# 每秒 60 次 z 序重排 —— 每次都让 DWM 重新合成整屏，闪且白烧 GPU。
+_RAISE_MIN_INTERVAL = 0.1
+
+# 每帧自检的廉价短路：只读我们之上最近这么多个窗口的 hwnd 当"链签名"。
+#
+# 为什么这是**正确**的而不只是省事：能盖住全屏覆盖窗的窗口，一定是被对方抬到了
+# topmost 组顶部（不抬到我们头上它就盖不住我们），因此必然出现在这前几个之内 ——
+# 它的出现一定会改变签名，于是那一帧就会触发全量检查。取 4 是留余量：链首常常是
+# 1x1 的驱动辅助窗（ThumbnailDeviceHelperWnd 之类），多发几个也只是几次 GetWindow。
+#
+# 为什么需要它：全量检查要读每个窗口的矩形（实测 18µs/次）与类名（4.3µs/次），
+# 一次约 74µs（渲染循环里因 GIL 争用还会放大到 ~340µs）；而 GetWindow 只要 0.73µs。
+# 每帧做两次全量检查 = 白烧几个点的 CPU，只读签名则几乎免费。
+_SIG_DEPTH = 4
+
+# 两次"全量被盖检查"之间的最小间隔（秒）：链**没变**时才受它限制，链一变就立刻
+# 重查。它兜的是"链没变、但链上某个窗口自己变可见 / 长到能盖住我们"这种极端情况，
+# 同时也给"已经知道被盖、正在限流"的状态一个上界（最多 1/该值 次/秒的复查）。
+_FULL_CHECK_INTERVAL = 0.25
+
 
 class POINT(ctypes.Structure):
     _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
@@ -97,6 +121,63 @@ def virtual_screen():
     w = user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
     h = user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
     return x, y, max(1, w), max(1, h)
+
+
+# 系统任务栏的窗口类：主屏一个 Shell_TrayWnd，每块副屏各一个 Shell_SecondaryTrayWnd。
+_SYSTEM_BAR_CLASSES = ("Shell_TrayWnd", "Shell_SecondaryTrayWnd")
+
+
+def system_bar_rects():
+    """当前所有系统任务栏的**屏幕矩形** `[(left, top, right, bottom), ...]`。
+
+    为什么需要它：覆盖窗是 `WS_EX_TOPMOST`，**任务栏不是** —— 于是特效会被直接
+    画在任务栏上面，用户报的"真实水波在下方任务栏会有残影"就是这么来的（一道
+    半透明的明暗条纹糊在任务栏上）。上屏前把这几块矩形擦干净，任务栏就始终
+    干净；观感上等于"任务栏浮在特效之前"，这也正是用户的预期。
+
+    用窗口类枚举、而不是 `SHAppBarMessage(ABM_GETTASKBARPOS)`：后者只认主屏
+    那一个（微软文档明说多显示器时返回主任务栏的位置）。按类枚举则天然拿到
+    每块屏的任务栏，而且：
+
+    * 自动隐藏时系统会把任务栏整个挪到屏幕外，矩形与虚拟屏不相交 —— 不用特判；
+    * 任务栏挪到屏幕上/左/右也一样成立，不假设它在底部。
+
+    拿不到、或某个任务栏不可见时直接跳过（擦空气是白费力气）。
+    """
+    out = []
+    for cls in _SYSTEM_BAR_CLASSES:
+        h = user32.FindWindowW(cls, None)
+        while h:
+            try:
+                if user32.IsWindowVisible(h):
+                    r = RECT()
+                    if user32.GetWindowRect(h, ctypes.byref(r)) and \
+                            r.right > r.left and r.bottom > r.top:
+                        out.append((r.left, r.top, r.right, r.bottom))
+            except Exception:
+                pass
+            # 同一类的下一个（多显示器下每块屏一个）
+            h = user32.FindWindowExW(None, h, cls, None)
+    return out
+
+
+def blank_rects(u32, w, h, ox, oy, rects):
+    """把若干**屏幕坐标**矩形从 32 位缓冲区里清零（越界自动裁剪）。
+
+    `ox, oy` 是缓冲区左上角对应的屏幕坐标（虚拟屏原点，常为负）。返回被擦掉的
+    像素数，供诊断与测试断言用。
+    """
+    if not rects:
+        return 0
+    arr = u32.reshape(int(h), int(w))
+    n = 0
+    for (l, t, r, b) in rects:
+        x0, x1 = max(0, int(l) - ox), min(int(w), int(r) - ox)
+        y0, y1 = max(0, int(t) - oy), min(int(h), int(b) - oy)
+        if x1 > x0 and y1 > y0:
+            arr[y0:y1, x0:x1] = 0
+            n += (x1 - x0) * (y1 - y0)
+    return n
 
 
 def _wnd_proc(hwnd, msg, wparam, lparam):
@@ -213,6 +294,10 @@ class Overlay:
         # 控制面板 hwnd。面板是我们自己的窗口，必须从"谁盖住了我"的判定里排除，
         # 否则 overlay 会跟面板无限互抢 z 序（见 keep_on_top）。
         self.panel_hwnd = None
+        self._last_raise = 0.0          # 上次真正抢顶的时刻（单调钟），供限流
+        # 每帧自检的短路状态：链签名 + 上次全量检查时刻（见 _chain_sig）
+        self._last_sig = None
+        self._last_full_check = 0.0
 
     def create(self):
         self._create_window()
@@ -345,22 +430,60 @@ class Overlay:
             h = user32.GetWindow(h, GW_HWNDPREV)
         return False
 
-    def keep_on_top(self):
+    def _chain_sig(self):
+        """我们之上最近 `_SIG_DEPTH` 个窗口的 hwnd（z 序自上而下）。
+
+        只做 `GetWindow`（~0.7µs/次），**不读矩形也不读类名** —— 这是"每帧自检"
+        得以便宜的关键。它只用来判断"链变没变"：变了才去做昂贵的全量检查。
+        """
+        out = []
+        h = user32.GetWindow(self.hwnd, GW_HWNDPREV)
+        n = 0
+        while h and n < _SIG_DEPTH:
+            out.append(hwnd_int(h))
+            h = user32.GetWindow(h, GW_HWNDPREV)
+            n += 1
+        return tuple(out)
+
+    def keep_on_top(self, min_interval=_RAISE_MIN_INTERVAL):
         """把叠加层钉回最上层 —— 但只在真的被盖住时才动手。
 
         窗口创建时虽带 WS_EX_TOPMOST，但只要用户点开一个同样置顶的应用
-        （全屏视频 / 画中画 / 悬浮窗 / 部分游戏），对方被激活后就会压过我们。
-        topmost 不会因为普通窗口激活而丢失，所以"点击后特效跑到后面"几乎
-        都是被"别的置顶窗口"盖住了。
+        （全屏视频 / 画中画 / 悬浮窗 / Citrix 之类的远程桌面全屏窗），对方被
+        激活后就会压过我们。topmost 不会因为普通窗口激活而丢失，所以"点击后
+        特效跑到后面"几乎都是被"别的置顶窗口"盖住了。
 
         关键：**不能无条件周期调用**。控制面板自己也在做置顶保活，若 overlay
-        每 0.5s 无条件抢一次顶，就会和面板每 2s 的抢顶互相翻转 z 序 —— 表现
-        为"每隔几秒画面闪一下"。所以先判定是否真被盖，未被盖直接返回。
+        无条件抢顶，就会和面板的抢顶互相翻转 z 序 —— 表现为"每隔几秒画面闪
+        一下"。所以先判定是否真被盖，未被盖直接返回。
+
+        调用频率是**每帧**（主循环就这么调），所以两个"别太贵"的闸门：
+
+        * **链签名短路**：链上最近的窗口没变、且距上次全量检查不到
+          `_FULL_CHECK_INTERVAL` —— 直接返回。全量检查要读每个窗口的矩形与类名
+          （74µs 起，渲染循环里因 GIL 争用可到 340µs），而读签名只要 0.7µs/次。
+          被盖住的关键事件（对方被抬到我们头上）必然改变签名，所以短路不会
+          让反应变慢：链一变当帧就查。
+        * **抢顶限流** `min_interval`：真正的 `SetWindowPos` 之间至少隔这么久，
+          防止抢不过时退化成每帧重排 z 序。
+
+        顺序是刻意的：判"被盖"必须发生在抢顶限流之前，否则"没有遮挡时一次
+        SetWindowPos 都不许发"这条不变量就变成"被限流挡住了"，测试会失效。
         """
         if not self.hwnd or self.z_mode != LAYER_TOPMOST:
             return False
+        now = time.monotonic()
+        sig = self._chain_sig()
+        if sig == self._last_sig and now - self._last_full_check < _FULL_CHECK_INTERVAL:
+            return False
+        self._last_sig = sig
+        self._last_full_check = now
         if not self._covered():
             return False
+        if min_interval > 0.0:
+            if now - self._last_raise < min_interval:
+                return False
+            self._last_raise = now
         # 插到面板之下（两者同属 topmost 组）：既复位又不把面板压掉；
         # 面板不存在时直接插到 topmost 组顶部。NOCOPYBITS 避免系统去
         # 保存/恢复被遮挡位图 —— 那会在重排瞬间翻出一帧无效内容。
@@ -368,6 +491,10 @@ class Overlay:
         user32.SetWindowPos(self.hwnd, after, 0, 0, 0, 0,
                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
                             | SWP_NOCOPYBITS | SWP_NOOWNERZORDER)
+        # 抢顶会改变链（我们从别人下面挪到了上面），把签名作废，
+        # 下一帧必定重新全量检查一次 —— 否则会拿着旧签名跳过一整轮，
+        # 万一同一个对手立刻又抬上来，我们就要等满 _FULL_CHECK_INTERVAL 才发现。
+        self._last_sig = None
         return True
 
     # ------------------------------------------------------------ 显示层级

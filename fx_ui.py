@@ -1250,11 +1250,21 @@ class ControlPanel:
 
         # ---- 特效多开 ----
         c3 = tk.Frame(p, bg=CARD)
-        c3.pack(fill="x", padx=16, pady=(0, 16))
+        c3.pack(fill="x", padx=16, pady=(0, 8))
         self._card_title(c3, "特效多开")
         self._hint(c3, "关闭时同一分类只能开一个特效，开启新的会自动关掉旧的。")
         self._toggle(c3, "全屏特效允许多开", "multi_fullscreen")
         self._toggle(c3, "鼠标特效允许多开", "multi_mouse")
+
+        # ---- 任务栏 ----
+        # 覆盖窗是置顶窗、任务栏不是，所以特效默认会被画在任务栏上 ——
+        # 真实水波那种整片明暗条纹糊在任务栏上就是用户报的"残影"。
+        c4 = tk.Frame(p, bg=CARD)
+        c4.pack(fill="x", padx=16, pady=(0, 16))
+        self._card_title(c4, "任务栏")
+        self._hint(c4, "任务栏永远浮在特效之前（含副屏任务栏）；"
+                       "关掉后特效会盖在任务栏上。")
+        self._toggle(c4, "不在任务栏上绘制", "avoid_taskbar")
         return p
 
     def _card_title(self, card, text):
