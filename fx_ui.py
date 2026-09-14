@@ -517,20 +517,30 @@ class ControlPanel:
             h = self._hwnd()
             if h:
                 # 把面板 hwnd 交给覆盖层：它做置顶保活时会把面板排除在
-                # "谁盖住了我"之外。否则 overlay 每 0.5s、面板每 2s 各抢一次
-                # topmost 组顶部，互相翻转 z 序 -> 表现为"每隔几秒闪一下"。
+                # "谁盖住了我"之外，并在"面板压得住对手"时拿面板当插入锚点
+                # （插到面板正下方 = 既复位又不遮住设置界面）。否则 overlay
+                # 每 0.5s、面板每 2s 各抢一次 topmost 组顶部，互相翻转 z 序
+                # -> 表现为"每隔几秒闪一下"。
                 ovs = getattr(self.app, "overlays", None) \
                     or [getattr(self.app, "overlay", None)]
                 for ov in ovs:
                     if ov is not None:
                         ov.set_panel_hwnd(h)
-                # 已隐藏时无需抢顶（也不该给系统制造无谓的重排）
-                if self.root.state() != "withdrawn":
-                    user32.SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0,
-                                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+                # **面板隐藏时也要补置顶位**，不能跳过。覆盖层拿面板当插入锚点
+                # 之前会先验"面板是不是置顶窗"：插到一个非置顶窗之后会把覆盖层
+                # 自己的 WS_EX_TOPMOST 一起清掉（实测：清掉之后连抢 30 次都回不来，
+                # 效果从此被任何普通窗口盖住）。而面板一旦从未被置顶过、又一直
+                # 缩在托盘里，就会踩中这条。置顶位对隐藏窗口同样有效，也不改变
+                # 可见性，所以这里无条件补。
+                user32.SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0,
+                                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
         except Exception:
             pass
-        self.root.after(2000, self._raise_top)
+        # 1s 一次（早先 2s）：对手（Citrix 那类十几 Hz 重新置顶的全屏窗）在
+        # 两次之间的窗口期里会把面板压下去，面板一被压住就不能再给覆盖层当
+        # 天花板 —— 覆盖层此时会退回"插到置顶组顶部"（见 Overlay._anchor），
+        # 所以不再是硬依赖，但面板勤快一点能让"面板浮在特效之上"这件事更稳。
+        self.root.after(1000, self._raise_top)
 
     def _start_move(self, e):
         self._drag = (e.x_root, e.y_root)

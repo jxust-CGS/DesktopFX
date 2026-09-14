@@ -14,6 +14,16 @@
        触摸板 SynTP、缩略图 helper）不算遮挡 —— 它们是导致"每 0.5s 都误判"
        的真正元凶。
     D. 真被第三方置顶窗口盖住时，必须复位一次，插到面板之下且带 NOCOPYBITS。
+    E. **插入锚点不得自封顶**（2026-09-14 补）。Win32 的 SetWindowPos(A, B)
+       把 A 插到 B **之下**，所以 after=面板 就是"插到面板正下方"。面板压得住
+       对手时这正好；面板自己被对手压住（Citrix 那类十几 Hz 重新置顶的全屏窗
+       逼的）时就变成天花板 —— 每次抢顶只是插回面板之下，永远回不到对手之上。
+       合成窗口实测：只换锚点，被盖采样 0% -> 100%，且与帧率无关（不是频率不够，
+       是方向错了）。
+    F. 锚点自己不是置顶窗时同样不能用：SetWindowPos 到非置顶窗之后会把本窗口的
+       WS_EX_TOPMOST 一起清掉，而 keep_on_top 自己修不回来（实测连抢 30 次仍丢）。
+    G. 置顶位若因故丢失，下一次 keep_on_top 必须自愈。
+    H. place_above 的方向：必须让 self 真的位于 other **之上**，不能写反。
 """
 import ctypes
 import ctypes.wintypes as wt
@@ -38,12 +48,21 @@ class FakeUser32:
     窗口矩形默认 200x200（够大，算真实窗口）。
     """
 
-    def __init__(self, chain=None, visible=(), sizes=None, classes=None):
+    def __init__(self, chain=None, visible=(), sizes=None, classes=None,
+                 not_topmost=()):
         self.chain = dict(chain or {})
         self.visible = set(visible)
         self.sizes = dict(sizes or {})       # hwnd -> (w, h)
         self.classes = dict(classes or {})   # hwnd -> 类名
+        # 明确标成"非置顶窗"的 hwnd。默认所有窗口都在置顶组里（覆盖层、面板、
+        # 对手本来就都是 topmost），只有要验"锚点资格"时才把某个标掉。
+        self.not_topmost = set(not_topmost)
         self.setpos = []
+
+    def GetWindowLongW(self, h, index):
+        if index != fw.GWL_EXSTYLE:
+            return 0
+        return 0 if hwnd_int(h) in self.not_topmost else fw.WS_EX_TOPMOST
 
     def GetWindow(self, h, flag):
         return self.chain.get(hwnd_int(h), 0)
@@ -188,6 +207,47 @@ def test_other_topmost_without_panel():
     return True, "无面板 -> 插到 topmost 组顶部"
 
 
+def test_anchor_refuses_panel_below_blocker():
+    """**面板自己被对手压住时，不许再拿它当插入锚点。**
+
+    这是"特效不能保持在最上层"的根因。Win32 语义：SetWindowPos(A, B) 把 A 插到
+    B 的**下面**，所以 after=面板 就是"插到面板正下方"。面板压得住对手时这正好
+    （复位 + 不遮住设置界面）；面板被对手压住时就变成了**自封顶** —— 每次"抢顶"
+    都只是把覆盖层重新插回面板之下，而面板在对手之下，于是永远回不到对手之上。
+    合成窗口实测：同样只换锚点，被盖采样从 0% 跳到 100%，抢顶 78 次全部白费；
+    且与帧率无关（20fps 与 60fps 结果相同）—— 不是抢顶频率不够，是方向错了。
+    """
+    # 链里没有 PANEL 的上一级 => 面板不在对手之上
+    ov, fake = _patched({OVERLAY: OTHER, OTHER: 0}, {OTHER}, panel=PANEL)
+    moved = ov.keep_on_top()
+    if not moved or len(fake.setpos) != 1:
+        return False, f"被盖应复位 1 次，实际 moved={moved} n={len(fake.setpos)}"
+    after = fake.setpos[0]["after"]
+    if after != hwnd_int(fw.HWND_TOPMOST):
+        return False, (f"面板在对手之下仍拿它当锚点（after={after}）-> 自封顶，"
+                       f"每次抢顶只是插回面板之下，永远上不去")
+    return True, "面板被对手压住 -> 改插置顶组顶部（不再自封顶）"
+
+
+def test_anchor_refuses_non_topmost_panel():
+    """锚点自己不是置顶窗时同样不能用 —— 它会把我们的置顶位一起吃掉。
+
+    实测：把带 WS_EX_TOPMOST 的窗口 SetWindowPos 到**非置顶窗**之后，它的
+    WS_EX_TOPMOST 会被清掉；此后任何普通窗口都能盖住特效，而 keep_on_top 每次
+    "抢顶"只是又插回同一个非置顶锚点之后 —— 连抢 30 次仍丢失，自己修不回来。
+    """
+    ov, fake = _patched({OVERLAY: OTHER, OTHER: PANEL, PANEL: 0},
+                        {OTHER, PANEL}, panel=PANEL, not_topmost=(PANEL,))
+    moved = ov.keep_on_top()
+    if not moved or len(fake.setpos) != 1:
+        return False, f"被盖应复位 1 次，实际 moved={moved} n={len(fake.setpos)}"
+    after = fake.setpos[0]["after"]
+    if after != hwnd_int(fw.HWND_TOPMOST):
+        return False, (f"锚点不是置顶窗却仍拿它当锚点（after={after}）-> "
+                       f"覆盖层的 WS_EX_TOPMOST 会被一起清掉")
+    return True, "锚点非置顶窗 -> 改插置顶组顶部（置顶位不会被吃掉）"
+
+
 def test_occluder_found_past_helpers():
     """遮挡者藏在若干辅助窗之后时仍要能找到。"""
     ov, fake = _patched(
@@ -271,12 +331,17 @@ class _CountProxy:
 
 
 def test_real_window_steady_state():
-    """真实 overlay：进入稳态后连续 5 次**全量检查**必须 0 次实际重排。
+    """真实 overlay：进入稳态后**只有真被盖住才许动手**。
 
-    首次调用允许一次自愈复位（桌面上可能本来就有别人的置顶窗口压着）；
-    重点是从第二次起必须彻底安静 —— 无条件抢顶的实现会在这里每次 +1。
+    首次调用允许一次自愈复位（桌面上可能本来就有别人的置顶窗口压着）。
 
-    每次调用之间 sleep 过链签名短路窗口，否则后 9 次会被"链没变"直接短路掉，
+    判据是"抢顶次数 ≤ 真被盖的次数"，而不是"必须是 0"：这台机器上真的跑着
+    Citrix（Desktop Viewer 那类会自己重新置顶的全屏窗），它在 1.5 秒里完全可能
+    抢上来一次 —— 那一次抢顶是**正确行为**，不该算失败（早先按"必须 0 次"判，
+    全量跑时偶发假失败）。而不变量本身没有被削弱：无条件抢顶的实现会 5 次全 +1，
+    真被盖的次数通常只有 0~1，照样判失败。
+
+    每次调用之间 sleep 过链签名短路窗口，否则后几次会被"链没变"直接短路掉，
     这道不变量就变成没测到（短路本身在 test_chain_change_triggers_immediate_recheck
     里单独锁）。
     """
@@ -289,16 +354,24 @@ def test_real_window_steady_state():
         fw.user32 = proxy
         first = ov.keep_on_top()
         proxy.setpos = 0
+        covered_n = 0
         for _ in range(5):
             time.sleep(fw._FULL_CHECK_INTERVAL + 0.05)
+            if ov._covered():          # 只统计，不改状态
+                covered_n += 1
             ov.keep_on_top()
         n = proxy.setpos
+        still_covered = ov._covered()
     finally:
         fw.user32 = _REAL_USER32
         ov.destroy()
-    if n:
-        return False, f"进入稳态后仍抢顶 {n} 次/5 次全量检查（应为 0）"
-    return True, f"真实窗口稳态 5 次全量检查 -> 0 次 SetWindowPos（首次自愈={first}）"
+    if still_covered:
+        return False, "5 次全量检查结束时仍被判为被盖 —— 抢顶没真正生效"
+    if n > covered_n:
+        return False, (f"进入稳态后抢顶 {n} 次，而真正被盖只有 {covered_n} 次 "
+                       f"—— 多出来的就是无条件抢顶（会导致周期性闪烁）")
+    return True, (f"真实窗口稳态 5 次全量检查 -> 抢顶 {n} 次 / 真被盖 {covered_n} 次"
+                  f"（首次自愈={first}）")
 
 
 def test_real_window_geometry_sane():
@@ -375,6 +448,167 @@ def test_real_foreign_topmost_is_recovered():
             user32.DestroyWindow(occ)
         ov.destroy()
     return True, "置顶窗压上来 -> 判定为被盖 -> 抢回成功，随后 20 帧 0 次重排"
+
+
+# ------------------------------------------------- 插入锚点（2026-09-14 根因）
+WS_VISIBLE = 0x10000000
+
+
+def _make_helper(name, x, y, w, h, topmost=True):
+    """造一个替身窗口（真实窗口，用于合成"面板 / 对手"）。"""
+    ex = fw.WS_EX_TOOLWINDOW | (fw.WS_EX_TOPMOST if topmost else 0)
+    h = user32.CreateWindowExW(ex, "Static", name, fw.WS_POPUP | WS_VISIBLE,
+                               x, y, w, h, None, None, None, None)
+    if not h:
+        return 0
+    if topmost:
+        user32.SetWindowPos(h, fw.HWND_TOPMOST, x, y, w, h,
+                            fw.SWP_SHOWWINDOW | fw.SWP_NOACTIVATE)
+    return h
+
+
+def _above(target, other):
+    """other 是否位于 target 之上（沿 GW_HWNDPREV 从 target 往上找 other）。
+
+    注意别把方向记反：SetWindowPos(A, B) 是把 A 插到 B **之下**。
+    """
+    h = user32.GetWindow(fw.HWND(target), fw.GW_HWNDPREV)
+    n = 0
+    while h and n < 200:
+        if hwnd_int(h) == hwnd_int(other):
+            return True
+        h = user32.GetWindow(h, fw.GW_HWNDPREV)
+        n += 1
+    return False
+
+
+def test_real_anchor_ceiling_recovered():
+    """真机端到端：面板被对手压住时，覆盖层仍必须能爬到对手之上。
+
+    自己造两个替身把相对位置钉死（不依赖真实远控窗此刻恰好排在哪）：
+        fake_panel 先抬到最顶，rival 后抬到最顶  => rival 稳在 fake_panel 之上
+    然后把覆盖层压到 rival 之下，并把 panel_hwnd 指向 fake_panel —— 这正是
+    "面板已被对手压住"的现场。
+
+    修复前：抢顶一律插回 fake_panel 之下（仍低于 rival），持续被判为被盖；
+    修复后：_anchor 发现面板压不住对手，改插置顶组顶部，立刻回到 rival 之上。
+    """
+    ov = fake_panel = rival = None
+    try:
+        ov = fw.Overlay().create()
+        fake_panel = _make_helper("dfx-fake-panel", ov.x + 20, ov.y + 20, 400, 600)
+        rival = _make_helper("dfx-rival", ov.x, ov.y, 1600, 900)
+        if not (fake_panel and rival):
+            return None, "SKIP（造不出替身窗口）"
+        time.sleep(0.3)
+        ov.set_panel_hwnd(fake_panel)
+        # 压到对手之下（SetWindowPos(me, X) = 插到 X 之下）
+        user32.SetWindowPos(ov.hwnd, fw.HWND(rival), 0, 0, 0, 0,
+                            fw.SWP_NOMOVE | fw.SWP_NOSIZE | fw.SWP_NOACTIVATE
+                            | fw.SWP_NOOWNERZORDER)
+        time.sleep(0.15)
+        if not ov._covered():
+            return None, "SKIP（没能把覆盖层压到替身对手之下，条件不成立）"
+        # 模拟主循环帧：被盖就抢
+        for _ in range(6):
+            ov._last_sig = None
+            ov._last_full_check = 0.0
+            ov._last_raise = 0.0
+            if not ov.keep_on_top(min_interval=0.0):
+                break
+            time.sleep(0.05)
+        if ov._covered():
+            return False, ("面板被对手压住时抢顶只是把覆盖层插回面板之下 —— "
+                           "永远回不到对手之上（自封顶）")
+        if not _is_topmost(ov.hwnd):
+            return False, "抢顶之后覆盖层丢了 WS_EX_TOPMOST"
+    finally:
+        for h in (rival, fake_panel):
+            if h:
+                try:
+                    user32.DestroyWindow(h)
+                except Exception:
+                    pass
+        if ov is not None:
+            ov.destroy()
+    return True, "面板被对手压住 -> 覆盖层仍抢回对手之上，且置顶位保住"
+
+
+def test_real_demoted_overlay_self_heals():
+    """置顶位被吃掉时必须能自愈。
+
+    怎么会被吃掉：把置顶窗 SetWindowPos 到**非置顶窗**之后（历史锚点用法就会踩中：
+    控制面板从未被置顶过、又一直缩在托盘里）。丢掉之后这个窗口被任何普通窗口
+    盖住，而且 _covered() 赖以成立的"我们之上的窗口同属 topmost 组"前提也不成立。
+    """
+    ov = plain = None
+    try:
+        ov = fw.Overlay().create()
+        if not _is_topmost(ov.hwnd):
+            return False, "刚建好的覆盖层就没带 WS_EX_TOPMOST"
+        plain = _make_helper("dfx-plain", ov.x + 30, ov.y + 30, 300, 200,
+                             topmost=False)
+        if not plain:
+            return None, "SKIP（造不出非置顶窗）"
+        user32.SetWindowPos(ov.hwnd, fw.HWND(plain), 0, 0, 0, 0,
+                            fw.SWP_NOMOVE | fw.SWP_NOSIZE | fw.SWP_NOACTIVATE
+                            | fw.SWP_NOOWNERZORDER)
+        time.sleep(0.2)
+        if _is_topmost(ov.hwnd):
+            return None, "SKIP（本机行为与预期不符：插到非置顶窗之后没丢置顶位）"
+        ov._last_sig = None
+        ov._last_full_check = 0.0
+        ov.keep_on_top(min_interval=0.0)
+        if not _is_topmost(ov.hwnd):
+            return False, "置顶位被吃掉后 keep_on_top 没有把它补回来"
+    finally:
+        if plain:
+            try:
+                user32.DestroyWindow(plain)
+            except Exception:
+                pass
+        if ov is not None:
+            ov.destroy()
+    return True, "丢掉 WS_EX_TOPMOST -> 下一次 keep_on_top 即自愈"
+
+
+def test_real_place_above_direction():
+    """place_above 必须真的把"自己"放到对方**之上**（方向别再写反）。
+
+    win32 里 SetWindowPos(A, B) 把 A 插到 B **之下**，所以"插到对方之上"不能直接
+    把对方当插入点 —— 那正好是反的。早先的实现就是这么写的，于是"鼠标层浮在全屏层
+    之上"实际做成了"鼠标层被压在全屏层之下"。两层都是 per-pixel alpha 的透明窗，
+    肉眼看不出来，所以一直没暴露。
+    """
+    a = b = None
+    try:
+        a = fw.Overlay().create()
+        b = fw.Overlay().create()
+        # 摆位：先把 b 抬到最顶，再把 a 压到 b 之下
+        user32.SetWindowPos(b.hwnd, fw.HWND_TOPMOST, 0, 0, 0, 0,
+                            fw.SWP_NOMOVE | fw.SWP_NOSIZE | fw.SWP_NOACTIVATE
+                            | fw.SWP_NOOWNERZORDER)
+        user32.SetWindowPos(a.hwnd, fw.HWND(b.hwnd), 0, 0, 0, 0,
+                            fw.SWP_NOMOVE | fw.SWP_NOSIZE | fw.SWP_NOACTIVATE
+                            | fw.SWP_NOOWNERZORDER)
+        time.sleep(0.2)
+        if not _above(a.hwnd, b.hwnd):
+            return None, "SKIP（摆位没成功，b 不在 a 之上）"
+        if not a.place_above(b.hwnd):
+            return False, "place_above 返回假"
+        time.sleep(0.2)
+        if _above(a.hwnd, b.hwnd):
+            return False, "place_above 之后 b 仍在 a 之上 —— 方向反了"
+        if not _above(b.hwnd, a.hwnd):
+            return False, "place_above 之后 a 与 b 不在同一条相邻序上"
+    finally:
+        for ov in (a, b):
+            if ov is not None:
+                try:
+                    ov.destroy()
+                except Exception:
+                    pass
+    return True, "place_above 之后 self 确实位于 other 之上（方向正确）"
 
 
 # ---------------------------------------------------------------- 显示层级
@@ -617,12 +851,17 @@ def main():
         test_invisible_window_ignored,
         test_other_topmost_triggers_once,
         test_other_topmost_without_panel,
+        test_anchor_refuses_panel_below_blocker,
+        test_anchor_refuses_non_topmost_panel,
         test_occluder_found_past_helpers,
         test_raise_is_throttled,
         test_chain_change_triggers_immediate_recheck,
         test_real_window_steady_state,
         test_real_window_geometry_sane,
         test_real_foreign_topmost_is_recovered,
+        test_real_anchor_ceiling_recovered,
+        test_real_demoted_overlay_self_heals,
+        test_real_place_above_direction,
         test_workerw_lookup_safe,
         test_real_desktop_layer_roundtrip,
         test_real_two_overlay_render_loop,

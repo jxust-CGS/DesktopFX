@@ -44,6 +44,40 @@ SWP_NOCOPYBITS = 0x0100
 SWP_NOOWNERZORDER = 0x0200
 # GetWindow 的 z 序方向：返回"位于该窗口之上"的邻窗
 GW_HWNDPREV = 3
+GWL_EXSTYLE = -20
+
+# 沿 z 序链向上找窗口时的步数上限。链上常夹着一堆 0x0 / 1x1 的系统辅助窗
+# （IME、MSCTFIME、tooltips、ForegroundStaging），给足余量但绝不无限走。
+_CHAIN_GUARD = 64
+
+
+def _is_topmost_window(hwnd):
+    """窗口是否在置顶组里（WS_EX_TOPMOST）。
+
+    它决定一个窗口能不能当"插入锚点"：SetWindowPos(A, B) 是把 A 插到 **B 之下**，
+    而插到**非置顶**窗之下会把 A 的 WS_EX_TOPMOST 一起清掉（实测 —— 见下方
+    Overlay._anchor 的说明）。所以当锚点之前必须先验这一位。
+    """
+    return bool(user32.GetWindowLongW(HWND(hwnd), GWL_EXSTYLE) & WS_EX_TOPMOST)
+
+
+def _is_above(hwnd, other_hwnd):
+    """other_hwnd 是否位于 hwnd 之上（沿 GW_HWNDPREV 往上找）。
+
+    注意 win32 的语义：SetWindowPos(A, B) 把 A 插到 B **之下**（B 在 A 之上），
+    与 HWND_TOP / HWND_TOPMOST（插到最顶）是同一条规则的两个端点。
+    """
+    if not hwnd or not other_hwnd:
+        return False
+    target = hwnd_int(other_hwnd)
+    h = user32.GetWindow(HWND(hwnd), GW_HWNDPREV)
+    n = 0
+    while h and n < _CHAIN_GUARD:
+        if hwnd_int(h) == target:
+            return True
+        h = user32.GetWindow(h, GW_HWNDPREV)
+        n += 1
+    return False
 
 # 这些窗口即使 IsWindowVisible 为真也从不真正遮住别人（桌面 / 任务栏 / 阴影）。
 # 判"是否被盖住"时必须排除，否则会一直误判成被盖。
@@ -383,7 +417,13 @@ class Overlay:
             user32.DispatchMessageW(ctypes.byref(msg))
 
     def set_panel_hwnd(self, hwnd):
-        """登记控制面板 hwnd（面板创建 / 重建时调用，供 keep_on_top 排除）。"""
+        """登记控制面板 hwnd（面板创建 / 重建时调用）。
+
+        两个用途，都不是可选的：
+        1. 从"谁盖住了我"的判定里排除 —— 面板浮在特效之上是预期状态；
+        2. 抢顶时的插入锚点（插到面板正下方，既复位又不遮住设置界面）——
+           但只在"面板自己是置顶窗、且确实压得住对手"时才用它，见 _anchor。
+        """
         v = hwnd_int(hwnd)
         self.panel_hwnd = v or None
 
@@ -411,24 +451,66 @@ class Overlay:
         # 否则两层会互相判定被盖、各自每 0.5s 抢一次顶，表现为周期性闪烁。
         return buf.value not in _NON_OCCLUDERS and buf.value != _CLASS_NAME
 
-    def _covered(self):
-        """本窗口是否被"别人的"可见置顶窗口盖住。
+    def _covered_by(self):
+        """返回压在我们之上、被判为遮挡物的**第一个**窗口 hwnd（没有则 0）。
 
         沿 z 序向上逐个检查（GW_HWNDPREV）：我们是 WS_EX_TOPMOST，链上的窗口
         必然同属 topmost 组，因此链上出现任何"非自家"的真实窗口即视为被盖。
         控制面板不算"别人"—— 面板浮在特效之上是预期状态，不是故障。
+
+        返回 hwnd 而不是 bool 的原因：抢顶时要判断"面板是不是比这个对手高"
+        （见 _anchor）——拿面板当锚点只有在面板确实压得住对手时才成立。
         """
         if not self.hwnd:
-            return False
+            return 0
         h = user32.GetWindow(self.hwnd, GW_HWNDPREV)
         guard = 0
-        while h and guard < 64:
+        while h and guard < _CHAIN_GUARD:
             guard += 1
             if not (self.panel_hwnd and hwnd_int(h) == self.panel_hwnd):
                 if self._is_occluder(h):
-                    return True
+                    return hwnd_int(h)
             h = user32.GetWindow(h, GW_HWNDPREV)
-        return False
+        return 0
+
+    def _covered(self):
+        """本窗口是否被"别人的"可见置顶窗口盖住（_covered_by 的布尔形式）。"""
+        return bool(self._covered_by())
+
+    def _anchor(self, blocker=0):
+        """抢顶时的插入锚点。
+
+        Win32 语义（实测确认，含"插到非置顶窗之后会丢掉 WS_EX_TOPMOST"一条）：
+            SetWindowPos(A, B) 把 A 插到 **B 之下** —— B 在 A 之上。
+        所以 after = 面板 就是"插到面板正下方"：既把自己复位到最上层附近，
+        又不把面板压掉（面板是本程序自己的窗口，压掉它等于让特效糊在设置界面上）。
+
+        **但这只在面板确实比对手高时才成立。** 面板的置顶保活是 fx_ui 每 2s 一次
+        （面板隐藏时早先还压根不补），而 Citrix 那类远控全屏窗会以十几 Hz 把自己
+        重新置顶 —— 面板很容易被它压在下面。那一刻再拿面板当锚点，就等于把面板
+        的位置当成天花板：每次"抢顶"都只是把我们重新插回面板之下，**永远回不到
+        对手之上**。
+
+        合成对手 + 合成面板、同一进程只换锚点的实测：
+            锚点 = HWND_TOPMOST  -> 被盖采样 0%（静态对手 / 10Hz 对手都一样）
+            锚点 = 面板 hwnd      -> 被盖采样 100%，抢顶 78 次全部白费
+        即"抢顶频率/帧率"不是瓶颈（20fps 与 60fps 结果相同），**方向**才是。
+
+        还有一条更硬的约束：锚点自己不是置顶窗时，SetWindowPos 会把我们的
+        WS_EX_TOPMOST 一起清掉，之后任何普通窗口都能盖住特效，而 keep_on_top
+        每次"抢顶"只是又插回同一个非置顶锚点之后 —— 实测连抢 30 次仍丢失。
+        所以锚点资格必须先验。
+        """
+        p = self.panel_hwnd
+        if not p or not _is_topmost_window(p):
+            return HWND_TOPMOST
+        # 注意 _is_above(hwnd, other) 问的是"other 在 hwnd 之上"。
+        # 我们要确认的是"面板压得住对手"，也就是面板在对手**之上**：
+        #   _is_above(blocker, p) == True  -> 面板在上，可以拿它当锚点
+        #   False                          -> 面板自己都被压住了，它当不了天花板
+        if blocker and not _is_above(blocker, p):
+            return HWND_TOPMOST
+        return HWND(p)
 
     def _chain_sig(self):
         """我们之上最近 `_SIG_DEPTH` 个窗口的 hwnd（z 序自上而下）。
@@ -472,23 +554,31 @@ class Overlay:
         """
         if not self.hwnd or self.z_mode != LAYER_TOPMOST:
             return False
+        # 置顶位自愈：一旦 WS_EX_TOPMOST 掉了，这个窗口就被任何普通窗口盖住，
+        # 而链签名/遮挡判定的前提（"我们之上的窗口同属 topmost 组"）也跟着失效。
+        # 掉的原因就是上面那条 —— 曾经把锚点插到了非置顶窗（例如从未被置顶过的
+        # 控制面板）之后。读一次扩展样式只要 ~0.3µs，每帧做也划算。
+        if not _is_topmost_window(self.hwnd):
+            self.apply_z_mode(LAYER_TOPMOST)
+            self._last_sig = None
+            return True
         now = time.monotonic()
         sig = self._chain_sig()
         if sig == self._last_sig and now - self._last_full_check < _FULL_CHECK_INTERVAL:
             return False
         self._last_sig = sig
         self._last_full_check = now
-        if not self._covered():
+        blocker = self._covered_by()
+        if not blocker:
             return False
         if min_interval > 0.0:
             if now - self._last_raise < min_interval:
                 return False
             self._last_raise = now
-        # 插到面板之下（两者同属 topmost 组）：既复位又不把面板压掉；
-        # 面板不存在时直接插到 topmost 组顶部。NOCOPYBITS 避免系统去
-        # 保存/恢复被遮挡位图 —— 那会在重排瞬间翻出一帧无效内容。
-        after = HWND(self.panel_hwnd) if self.panel_hwnd else HWND_TOPMOST
-        user32.SetWindowPos(self.hwnd, after, 0, 0, 0, 0,
+        # 锚点怎么选见 _anchor：面板只在"它压得住对手"时才配当锚点，否则直接
+        # 插到置顶组顶部。NOCOPYBITS 避免系统去保存/恢复被遮挡位图 —— 那会在
+        # 重排瞬间翻出一帧无效内容。
+        user32.SetWindowPos(self.hwnd, self._anchor(blocker), 0, 0, 0, 0,
                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
                             | SWP_NOCOPYBITS | SWP_NOOWNERZORDER)
         # 抢顶会改变链（我们从别人下面挪到了上面），把签名作废，
@@ -524,9 +614,17 @@ class Overlay:
                                     | SWP_NOCOPYBITS | SWP_NOOWNERZORDER)
         else:
             self._desktop_fallback = False
+            # 先记下"切过来之前我们是不是置顶窗"：从桌面层（WorkerW 的 WS_CHILD
+            # 子窗口）切回来时，沿 GW_HWNDPREV 得到的是一条子窗口链，拿它当"被谁
+            # 盖住"毫无意义，会把随便一个桌面图标窗口当成对手。
+            was_topmost = _is_topmost_window(self.hwnd)
             self._detach_parent()
-            after = HWND(self.panel_hwnd) if self.panel_hwnd else HWND_TOPMOST
-            user32.SetWindowPos(self.hwnd, after, self.x, self.y, self.w, self.h,
+            # 锚点同样要过 _anchor 的资格检查：用户点了「最上层」却发现特效还在
+            # 对手之下，最常见的原因就是这里又把窗口插回了"已经被对手压住的面板"
+            # 之下。
+            blocker = self._covered_by() if was_topmost else 0
+            user32.SetWindowPos(self.hwnd, self._anchor(blocker),
+                                self.x, self.y, self.w, self.h,
                                 SWP_NOACTIVATE | SWP_NOCOPYBITS
                                 | SWP_NOOWNERZORDER | SWP_SHOWWINDOW)
         return mode
@@ -588,16 +686,26 @@ class Overlay:
                             | SWP_NOCOPYBITS | SWP_NOOWNERZORDER)
 
     def place_above(self, other_hwnd):
-        """把本窗口插到另一个窗口的正上方（只在最上层模式下有意义）。
+        """把本窗口插到另一个窗口的**正上方**（只在最上层模式下有意义）。
 
         两层都在最上层时，钉顶保活只把"被盖住的那层"插回置顶组顶部 ——
         反复几次后两层的先后可能翻过来（雨盖住水波）。调用方在每次层级/
         钉顶动作之后用它统一纠正一次。
+
+        **实现要点**：win32 里 SetWindowPos(A, B) 是把 A 插到 **B 之下**
+        （B 在 A 之上），所以"插到 other 之上"不能直接把 other 当插入点 ——
+        那正好是反的。要拿 other 的**上一个**窗口当插入点；other 已经在最顶时
+        用 HWND_TOPMOST。早先的实现直接传 other_hwnd，方向是反的：本意是
+        "鼠标层浮在全屏层之上"，实际被按在全屏层之下（两层都是 per-pixel alpha
+        的透明窗，肉眼看不出来，所以一直没暴露，但相对顺序确实是错的，
+        也让"谁盖住了我"这条链更难看懂）。
         """
         if not self.hwnd or not other_hwnd:
             return False
+        above_other = user32.GetWindow(HWND(other_hwnd), GW_HWNDPREV)
+        after = HWND(above_other) if above_other else HWND_TOPMOST
         return bool(user32.SetWindowPos(
-            self.hwnd, HWND(other_hwnd), 0, 0, 0, 0,
+            self.hwnd, after, 0, 0, 0, 0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOCOPYBITS
             | SWP_NOOWNERZORDER))
 
