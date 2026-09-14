@@ -307,6 +307,22 @@ def _find_wallpaper_workerw():
     return hwnd_int(found[0]) if found else 0
 
 
+def _client_origin(hwnd):
+    """窗口**客户区原点**在屏幕坐标里的位置。
+
+    挂成子窗口后，窗口的 x/y 是相对父窗口客户区的，而客户区左上角在屏幕上的
+    位置未必是父窗口矩形的左上角（有边框/菜单时两者不同）。所以统一用
+    ClientToScreen 精确取，不要拿 GetWindowRect 的 left/top 顶替。
+    """
+    pt = POINT(0, 0)
+    if user32.ClientToScreen(HWND(hwnd), ctypes.byref(pt)):
+        return (pt.x, pt.y)
+    r = RECT()                      # 兜底：取不到就当没有非客户区
+    if user32.GetWindowRect(HWND(hwnd), ctypes.byref(r)):
+        return (r.left, r.top)
+    return (0, 0)
+
+
 class Overlay:
     def __init__(self, z_mode=LAYER_TOPMOST):
         self.z_mode = z_mode
@@ -321,6 +337,10 @@ class Overlay:
         self._cbuf = None
         self.x = self.y = 0
         self.w = self.h = 1
+        # 窗口本地原点(0,0)对应的屏幕坐标。顶层窗就是 (0,0)；挂成 WorkerW 的
+        # 子窗口后等于父窗口**客户区**原点。present() 必须按它把屏幕坐标折算成
+        # 当前坐标系下的坐标，否则子窗口会被越挪越远（见 present 注释）。
+        self._origin = (0, 0)
         self.buffer = None
         self.flat = None
         self.u32 = None
@@ -345,6 +365,7 @@ class Overlay:
         show_panel_message()  # 必须在窗口创建前注册，wndproc 才知道要拦哪个号
         x, y, w, h = virtual_screen()
         self.x, self.y, self.w, self.h = x, y, w, h
+        self._origin = (0, 0)           # 新建的是顶层窗，本地原点即屏幕原点
         # 刻意**不带** WS_EX_TOPMOST：层级运行时可改（最上层 / 仅桌面图层），
         # 统一交给 SetWindowPos 施加，省得来回改扩展样式。
         self.hwnd = user32.CreateWindowExW(
@@ -401,7 +422,14 @@ class Overlay:
         return False
 
     def present(self):
-        pt_dst = POINT(self.x, self.y)
+        # pptDst 的坐标系**跟着窗口走**：顶层窗是屏幕坐标，而 WS_CHILD 子窗口是
+        # 父窗口客户区坐标。桌面层的窗口挂在 WorkerW 下，若这里仍传屏幕坐标
+        # self.x/self.y，窗口会被再挪一个"父客户区原点"的距离，而且是每帧都挪
+        # —— 实测在"副屏在主屏左侧"的布局里（虚拟屏原点 x=-1920），桌面层窗口
+        # 稳定停在屏幕 (-3840, 0)，主屏上完全看不到桌面层特效。
+        # 所以统一减掉 _origin 折算到当前坐标系。
+        ox, oy = self._origin
+        pt_dst = POINT(self.x - ox, self.y - oy)
         pt_src = POINT(0, 0)
         size = SIZE(self.w, self.h)
         blend = BLENDFUNCTION(AC_SRC_OVER, 0, 255, AC_SRC_ALPHA)
@@ -649,10 +677,13 @@ class Overlay:
         # 在系统眼里仍是"顶层窗"，GetParent 返回的是 owner（恒为 0）——
         # 父子关系形同虚设，还可能被当成独立顶层窗重新参与 z 序竞争。
         style = user32.GetWindowLongW(self.hwnd, GWL_STYLE)
-        ctypes.set_last_error(0)
         user32.SetWindowLongW(self.hwnd, GWL_STYLE,
                               (style & ~WS_POPUP_STYLE) | WS_CHILD)
-        if ctypes.get_last_error():
+        # 回读校验，而不是看 SetLastError：SetWindowLong 成功时并不保证把
+        # last error 清零，而"样式本来就已经是 WS_CHILD"（重复施加层级时）
+        # 不会触发任何内部动作，残留的旧错误码会被当成失败 —— 结果是明明
+        # 挂得上却静默降级成"沉底窗口"。回读才是可靠的判据。
+        if not (user32.GetWindowLongW(self.hwnd, GWL_STYLE) & WS_CHILD):
             return False
         # SetParent 的返回值是"原来的父亲"，顶层窗时就是 NULL，无法据此判断成败，
         # 因此直接回读 GetParent 校验；不成立就回滚样式，别留下半吊子状态。
@@ -662,9 +693,12 @@ class Overlay:
             user32.SetWindowLongW(self.hwnd, GWL_STYLE, style)
             return False
         self._parented = True
-        # 子窗口坐标相对父窗口客户区：WorkerW 左上角通常就是虚拟屏原点，但不是
-        # 所有系统都如此，按窗口矩形差值折算。
-        user32.SetWindowPos(self.hwnd, None, self.x - r.left, self.y - r.top,
+        # 子窗口坐标相对父窗口**客户区**：WorkerW 的客户区原点通常就是虚拟屏
+        # 原点，但不是所有系统都如此，按 ClientToScreen 精确折算。折算结果存进
+        # _origin —— present() 每帧重新定位时必须用同一套坐标系（见其注释）。
+        self._origin = _client_origin(workerw)
+        user32.SetWindowPos(self.hwnd, None,
+                            self.x - self._origin[0], self.y - self._origin[1],
                             self.w, self.h,
                             SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW
                             | SWP_NOCOPYBITS | SWP_NOOWNERZORDER)
@@ -681,6 +715,7 @@ class Overlay:
         user32.SetWindowLongW(self.hwnd, GWL_STYLE,
                               (style & ~WS_CHILD) | WS_POPUP_STYLE)
         self._parented = False
+        self._origin = (0, 0)           # 回到顶层窗，本地原点即屏幕原点
         user32.SetWindowPos(self.hwnd, None, self.x, self.y, self.w, self.h,
                             SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW
                             | SWP_NOCOPYBITS | SWP_NOOWNERZORDER)

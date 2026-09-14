@@ -27,10 +27,22 @@
 """
 import ctypes
 import ctypes.wintypes as wt
+import os
+import tempfile
 import time
 
 import fx_winlayer as fw
 from _win32 import user32, hwnd_int
+
+# 本脚本要起**真实 App**，而 App.__init__ 会读用户真实的 config.json。
+# 不隔离就会让断言依赖用户设置：实测用户把两层都设成"仅桌面图层"后，
+# `test_real_two_overlay_render_loop` 里的"鼠标层默认不该挂在别的窗口下"
+# 立刻失败（那层已经变成了 WorkerW 的子窗口）—— 是测试读了用户配置，不是
+# 产品坏了。测试必须自带配置，顺便也保证它不去写用户的文件。
+import desktop_fx as d
+
+d.CONFIG_PATH = os.path.join(tempfile.mkdtemp(prefix="fx_zorder_"),
+                             "config.json")
 
 _REAL_USER32 = fw.user32
 

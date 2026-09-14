@@ -122,6 +122,15 @@ def test_render_loop_masks_taskbar():
 
     import desktop_fx as d
 
+    # 本脚本要起**真实 App**，App.__init__ 会读用户真实的 config.json。
+    # 把它挪到临时文件：断言不能依赖用户设置（比如用户关掉了 avoid_taskbar，
+    # 这条端到端用例就会被自己的前置条件判失败），也顺带不去写用户的文件。
+    import os
+    import tempfile
+
+    d.CONFIG_PATH = os.path.join(tempfile.mkdtemp(prefix="fx_taskbar_"),
+                                 "config.json")
+
     bars = fw.system_bar_rects()
     if not bars:
         return None, "SKIP（本机没有可见任务栏）"
