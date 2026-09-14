@@ -12,6 +12,7 @@ import tkinter as tk
 
 from _win32 import user32, HANDLE, HWND, INT, UINT, hwnd_int, screen_pixel
 from _paths import app_root
+import fx_kinds
 
 # ------------------------------------------------------------------ 设计系统
 # 冷色底 + 单一强调色（青），红色只表示破坏性/错误。语义令牌避免散落字面色。
@@ -518,9 +519,11 @@ class ControlPanel:
                 # 把面板 hwnd 交给覆盖层：它做置顶保活时会把面板排除在
                 # "谁盖住了我"之外。否则 overlay 每 0.5s、面板每 2s 各抢一次
                 # topmost 组顶部，互相翻转 z 序 -> 表现为"每隔几秒闪一下"。
-                ov = getattr(self.app, "overlay", None)
-                if ov is not None:
-                    ov.set_panel_hwnd(h)
+                ovs = getattr(self.app, "overlays", None) \
+                    or [getattr(self.app, "overlay", None)]
+                for ov in ovs:
+                    if ov is not None:
+                        ov.set_panel_hwnd(h)
                 # 已隐藏时无需抢顶（也不该给系统制造无谓的重排）
                 if self.root.state() != "withdrawn":
                     user32.SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0,
@@ -588,21 +591,14 @@ class ControlPanel:
         side.pack_propagate(False)
 
         # 注意：name 必须与 _pages 的注册键一致，否则点击后右侧空白。
-        # 导航标签(左侧显示)与页面键(内部)在此统一为同一字符串。
-        nav_defs = [
-            ("下雨", "下雨"),
-            ("下雪", "下雪"),
-            ("落樱", "落樱"),
-            ("流星雨", "流星雨"),
-            ("颜料盘", "颜料盘"),
-            ("聚光灯", "聚光灯"),
-            ("窗口水波", "窗口水波"),
-            ("涟漪", "涟漪"),
-            ("真实水波", "真实水波"),
-            ("其它", "其它"),
-        ]
-        for label, name in nav_defs:
-            self._nav_item(side, label, name)
+        # 分组与顺序取自 fx_kinds.NAV_GROUPS —— 侧栏分类、渲染分层、同类
+        # 互斥共用同一份定义，避免"界面归了类、别处还对不上"。
+        for cat, pages in fx_kinds.NAV_GROUPS:
+            self._nav_group(side, cat)
+            for name in pages:
+                self._nav_item(side, fx_kinds.page_title(name), name)
+        self._nav_sep(side)
+        self._nav_item(side, "其他设置", "其它")
 
         fb = tk.Frame(side, bg=SIDEBAR_BG)
         fb.pack(side="bottom", fill="x", pady=(8, 12))
@@ -655,16 +651,21 @@ class ControlPanel:
         self._inner = inner
 
         # ---- 构建各分组页面 ----
-        self._pages["下雨"] = self._page_rain(inner)
-        self._pages["下雪"] = self._page_snow(inner)
-        self._pages["落樱"] = self._page_petal(inner)
-        self._pages["流星雨"] = self._page_meteor(inner)
-        self._pages["颜料盘"] = self._page_paint(inner)
-        self._pages["聚光灯"] = self._page_spot(inner)
-        self._pages["窗口水波"] = self._page_win(inner)
-        self._pages["涟漪"] = self._page_ripple(inner)
-        self._pages["真实水波"] = self._page_wave(inner)
-        self._pages["其它"] = self._page_other(inner)
+        builders = {
+            "下雨": self._page_rain,
+            "下雪": self._page_snow,
+            "落樱": self._page_petal,
+            "流星雨": self._page_meteor,
+            "聚光灯": self._page_spot,
+            "颜料盘": self._page_paint,
+            "涟漪": self._page_ripple,
+            "真实水波": self._page_wave,
+            "窗口水波": self._page_win,
+            "其它": self._page_other,
+        }
+        # 按侧栏顺序注册：_pages 的键序即导航顺序，测试直接比对二者
+        for name in fx_kinds.nav_order():
+            self._pages[name] = builders[name](inner)
         for f in self._pages.values():
             f.pack_forget()
         self._show_page(self._load_last_page())
@@ -674,6 +675,16 @@ class ControlPanel:
         tip.pack(pady=(0, 10))
 
     # ------------------------------------------------------------ 侧栏/导航
+    def _nav_group(self, side, text):
+        """侧栏分组标题：小一号的次级灰字，与导航项拉开层级。"""
+        lbl = tk.Label(side, text=text, bg=SIDEBAR_BG, fg=SUB,
+                       font=FONT_SMALL, anchor="w")
+        lbl.pack(fill="x", padx=14, pady=(12, 2))
+
+    def _nav_sep(self, side):
+        """导航项与设置之间的发丝分隔线。"""
+        tk.Frame(side, bg=LINE, height=1).pack(fill="x", padx=12, pady=(12, 4))
+
     def _nav_item(self, side, label, name):
         b = tk.Frame(side, bg=SIDEBAR_BG, height=44)
         b.pack(fill="x")
@@ -1175,6 +1186,7 @@ class ControlPanel:
         self._page_head(p, "鼠标涟漪")
         c = tk.Frame(p, bg=CARD)
         c.pack(fill="x", padx=16, pady=(0, 8))
+        self._toggle(c, "启用鼠标涟漪", "ripple_enabled")
         self._toggle(c, "跟随鼠标移动", "ripple_move")
         self._toggle(c, "点击时扩散", "ripple_click")
         self._slider(c, "触发灵敏度", "ripple_step", 6, 90, 1, "{:.0f} 像素")
@@ -1214,7 +1226,7 @@ class ControlPanel:
 
     def _page_other(self, parent):
         p = tk.Frame(parent, bg=BG)
-        self._page_head(p, "其它")
+        self._page_head(p, "其他设置")
         c = tk.Frame(p, bg=CARD)
         c.pack(fill="x", padx=16, pady=(0, 8))
         self._slider(c, "帧率上限", "fps", 24, 144, 1, "{:.0f} 帧/秒")
@@ -1226,7 +1238,75 @@ class ControlPanel:
         self._autostart_var = tk.BooleanVar(value=self.app.get_autostart())
         _Toggle(row, self._autostart_var,
                 command=lambda v: self._toggle_autostart()).pack(side="right")
+
+        # ---- 特效层级：全屏层 / 鼠标层各一套（两层是独立的覆盖窗口）----
+        c2 = tk.Frame(p, bg=CARD)
+        c2.pack(fill="x", padx=16, pady=(0, 8))
+        self._card_title(c2, "特效层级")
+        self._hint(c2, "最上层＝始终浮在窗口之上（默认）；"
+                       "仅桌面图层＝被窗口盖住、只在桌面可见。")
+        self._layer_row(c2, "全屏特效", "layer_fullscreen")
+        self._layer_row(c2, "鼠标特效", "layer_mouse")
+
+        # ---- 特效多开 ----
+        c3 = tk.Frame(p, bg=CARD)
+        c3.pack(fill="x", padx=16, pady=(0, 16))
+        self._card_title(c3, "特效多开")
+        self._hint(c3, "关闭时同一分类只能开一个特效，开启新的会自动关掉旧的。")
+        self._toggle(c3, "全屏特效允许多开", "multi_fullscreen")
+        self._toggle(c3, "鼠标特效允许多开", "multi_mouse")
         return p
+
+    def _card_title(self, card, text):
+        """卡片内的小标题，与「预设方案」标题同一套样式。"""
+        tk.Label(card, text=text, bg=CARD, fg=SUB,
+                 font=(FONT_LABEL[0], FONT_LABEL[1], "bold")).pack(
+            anchor="w", padx=12, pady=(10, 4))
+
+    def _hint(self, card, text):
+        """设置项下方的说明文字：用次级灰，避免和主标签抢注意力。"""
+        # wraplength 必须 ≤ 卡片内可用宽度（卡片 412 − 两侧 padx 32 = 380）：
+        # 给大了会让最后一个字单独折到下一行，出现"）。"这种孤字。
+        tk.Label(card, text=text, bg=CARD, fg=SUB, font=FONT_SMALL,
+                 anchor="w", justify="left", wraplength=372).pack(
+            fill="x", padx=16, pady=(0, 4))
+
+    def _layer_row(self, parent, label, key):
+        """层级行：名称 …… 最上层 (开关) 仅桌面图层。
+
+        层级是两选一，但只有一边是"非默认"的，所以沿用项目统一的胶囊开关：
+        关＝最上层（默认），开＝仅桌面图层。两侧文字跟着开关染色，不用点开
+        就知道当前在哪一档。
+        """
+        app = self.app
+        row = tk.Frame(parent, bg=CARD)
+        row.pack(fill="x", padx=16, pady=8)
+        tk.Label(row, text=label, bg=CARD, fg=TEXT,
+                 font=FONT_LABEL).pack(side="left")
+        right = tk.Frame(row, bg=CARD)
+        right.pack(side="right")
+        lbl_desk = tk.Label(right, text="仅桌面图层", bg=CARD, fg=SUB,
+                            font=FONT_SMALL)
+        lbl_desk.pack(side="right", padx=(8, 0))
+        var = tk.BooleanVar(value=str(app.cfg.get(key)) == "desktop")
+
+        def repaint():
+            on = bool(var.get())
+            lbl_top.config(fg=ACCENT if not on else SUB)
+            lbl_desk.config(fg=ACCENT if on else SUB)
+
+        def _on(v):
+            app.set(key, "desktop" if v else "topmost")
+            repaint()
+
+        _Toggle(right, var, command=_on).pack(side="right", padx=8)
+        lbl_top = tk.Label(right, text="最上层", bg=CARD, fg=ACCENT,
+                           font=FONT_SMALL)
+        lbl_top.pack(side="right")
+        repaint()
+        # 注册写入回调：测试可以直接驱动开关，不必去翻 widget 树
+        self._ctrls[key] = {"kind": "layer", "var": var, "repaint": repaint,
+                            "on": _on}
 
     # ------------------------------------------------------------ 控件原语
     def _toggle(self, parent, label, key):
@@ -1236,9 +1316,15 @@ class ControlPanel:
         row.pack(fill="x", padx=16, pady=8)
         tk.Label(row, text=label, bg=CARD, fg=TEXT,
                  font=FONT_LABEL).pack(side="left")
-        _Toggle(row, var, command=lambda v: app.set(key, bool(v))).pack(side="right")
-        var.trace_add("write", lambda *a: app.set(key, bool(var.get())))
-        self._ctrls[key] = {"kind": "toggle", "var": var}
+
+        def _on(v):
+            app.set(key, bool(v))
+            # 同类互斥可能连带关掉别的特效开关，回读一次让面板跟着变
+            self._sync_from_cfg()
+
+        _Toggle(row, var, command=_on).pack(side="right")
+        # 不再挂 var.trace：_sync_from_cfg 回写变量时不该反过来再 set 一次
+        self._ctrls[key] = {"kind": "toggle", "var": var, "on": _on}
 
     def _slider(self, parent, label, key, lo, hi, res, fmt):
         app = self.app
@@ -1363,6 +1449,9 @@ class ControlPanel:
                 c["label"].config(text=c["fmt"].format(fv))
             elif c["kind"] == "toggle":
                 c["var"].set(bool(v))
+            elif c["kind"] == "layer":   # 层级是字符串键，开关只反映"是否桌面层"
+                c["var"].set(str(v) == "desktop")
+                c["repaint"]()
         for refresh in self._swatches.values():
             refresh()
 

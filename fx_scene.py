@@ -69,6 +69,30 @@ class Scene:
         self.ov_x, self.ov_y = x, y
         self.win.set_origin(x, y)
 
+    def layer_activity(self):
+        """本帧两层**可能**有内容吗 —— 返回 (全屏层, 鼠标层)。
+
+        只给渲染循环用来决定"这一层还需不需要提交"：两个覆盖窗口意味着每层每帧
+        一次全屏 UpdateLayeredWindow，而全空层再提交一次全 0 与上一帧画面完全
+        一样，纯属白付。（调用方在信号为 False 时还会用真实像素复核，所以这里
+        允许保守 —— 多提交只是不省，漏提交才会把上一帧冻在桌面上。）
+
+        保守体现在"开着就算有内容"：聚光灯恒画满屏、颜料盘/真实水波开着就可能
+        随时出图，都懒得去猜。真正能省下来的是**涟漪池空着**的时候，所以要按池子
+        的真实活跃状态判，而不是按 ripple_enabled —— 后者开着但用户没动鼠标时
+        池子是空的。
+        """
+        cfg = self.cfg
+        fs = bool(cfg.get("rain_enabled", True) or cfg.get("snow_enabled", False)
+                  or cfg.get("petal_enabled", False)
+                  or cfg.get("meteor_enabled", False))
+        ms = bool(cfg.get("spotlight_enabled", False)
+                  or cfg.get("paint_enabled", False)
+                  or cfg.get("wave_enabled", False)
+                  or cfg.get("win_ripple_enabled", False)
+                  or self.ripples.active.any())
+        return fs, ms
+
     def resize(self, w, h):
         self.w, self.h = w, h
         self.rain.resize(w, h)
@@ -87,8 +111,24 @@ class Scene:
         return self._ripple_color_cache
 
     # ------------------------------------------------------------ 每帧
-    def step(self, dt, u32, w, h):
+    def step(self, dt, u32, w, h, u32_mouse=None):
+        """推进一帧。u32 = 全屏特效层缓冲。
+
+        u32_mouse 不为 None 时按**层分流**绘制：全屏特效（雨/雪/落樱/流星雨）
+        画进 u32，「鼠标特效」层（聚光灯/颜料盘/涟漪/真实水波/窗口水波）画进
+        u32_mouse。两层各是一个独立的覆盖窗口，用户可分别设定"最上层 / 仅
+        桌面图层"，所以不能合到一张缓冲上。
+
+        u32_mouse 为 None（旧调用方式）时全部画进同一张缓冲，绘制顺序与
+        分层前逐条一致 —— 测试脚本仍按老签名调用，行为保持不变。
+
+        注意：**模拟状态只推进一步**（与调用几个缓冲无关）。若按层各建一个
+        Scene 实例，物理就会被推进两次，波形/粒子速度会翻倍。
+        """
         cfg = self.cfg
+        # 画到哪张缓冲：全屏层恒为 u32；鼠标层缺省与全屏层共用一张
+        buf_fs = u32
+        buf_ms = u32 if u32_mouse is None else u32_mouse
 
         # 鼠标坐标最先更新：聚光灯与鼠标涟漪都要用到当前光标
         dist = self.mouse.update(dt, self.ov_x, self.ov_y)
@@ -125,7 +165,7 @@ class Scene:
             self.spot.set_radius(float(cfg.get("spotlight_radius", 220)))
             self.spot.set_dim(float(cfg.get("spotlight_dim", 0.6)))
             self.spot.set_color(cfg["spotlight_color"])
-            self.spot.draw(u32, w, h, cfg)
+            self.spot.draw(buf_ms, w, h, cfg)
 
         # ---------------- 颜料盘（鼠标搅动的流体颜料）
         # 排在聚光灯**之后**：它的 draw 会写包围盒内的整片像素，先画就把聚光灯抹了
@@ -139,7 +179,7 @@ class Scene:
                 self.paint.set_color(cfg["paint_color"])
                 self._last_paint_color = cfg["paint_color"]
             self.paint.update(dt, cfg)
-            self.paint.draw(u32, w, h, cfg)
+            self.paint.draw(buf_ms, w, h, cfg)
         else:
             self.paint.reset()
 
@@ -151,7 +191,7 @@ class Scene:
                 self.rain.set_color(cfg["rain_color"])
                 self._last_color = cfg["rain_color"]
             splash_x = self.rain.update(dt, cfg)
-            self.rain.draw(u32, w, h, cfg)
+            self.rain.draw(buf_fs, w, h, cfg)
 
             if cfg.get("splash", True) and splash_x.size:
                 col = self._ripple_color()
@@ -172,7 +212,7 @@ class Scene:
                 self.snow.set_color(cfg["snow_color"])
                 self._last_snow_color = cfg["snow_color"]
             self.snow.update(dt, cfg)
-            self.snow.draw(u32, w, h, cfg)
+            self.snow.draw(buf_fs, w, h, cfg)
 
         # ---------------- 落樱（独立开关，与雨/雪正交）----
         if cfg.get("petal_enabled", False):
@@ -185,7 +225,7 @@ class Scene:
                 self.petals.set_edge_color(cfg["petal_edge_color"])
                 self._last_petal_edge = cfg["petal_edge_color"]
             self.petals.update(dt, cfg)
-            self.petals.draw(u32, w, h, cfg)
+            self.petals.draw(buf_fs, w, h, cfg)
 
         # ---------------- 流星雨（独立开关，与雨/雪/落樱正交）----
         if cfg.get("meteor_enabled", False):
@@ -198,10 +238,13 @@ class Scene:
                 self.meteors.set_tail_color(cfg["meteor_tail_color"])
                 self._last_meteor_tail = cfg["meteor_tail_color"]
             self.meteors.update(dt, cfg)
-            self.meteors.draw(u32, w, h, cfg)
+            self.meteors.draw(buf_fs, w, h, cfg)
 
         # ---------------- 鼠标涟漪（由鼠标轨迹 / 点击触发，dist 已在上面临时算出）
-        if cfg.get("ripple_move", True) and dist > 0.0:
+        # ripple_enabled 是「鼠标涟漪」的主开关（同类互斥靠它开关），但它只管
+        # **鼠标生成的涟漪** —— 雨滴溅起的水花、窗口水波照旧落进同一个池子。
+        if cfg.get("ripple_enabled", True) \
+                and cfg.get("ripple_move", True) and dist > 0.0:
             self.acc += dist
             step_r = max(6.0, float(cfg["ripple_step"]))
             cnt = 0
@@ -221,7 +264,8 @@ class Scene:
         else:
             self.acc *= 0.90
 
-        if cfg.get("ripple_click", True) and self.mouse.clicked:
+        if cfg.get("ripple_enabled", True) \
+                and cfg.get("ripple_click", True) and self.mouse.clicked:
             self.ripples.spawn(float(self.mouse.mx), float(self.mouse.my),
                               float(cfg["ripple_size"]) * 1.9,
                               float(cfg["ripple_life"]) * 1.35,
@@ -230,7 +274,7 @@ class Scene:
 
         # ---------------- 涟漪
         self.ripples.update(dt)
-        self.ripples.draw(u32, w, h)
+        self.ripples.draw(buf_ms, w, h)
 
         # ---------------- 真实水波（独立开关，与上面的彩色涟漪正交）
         # 排在最后 = 最上层：它写的是半透明**暗**像素（波谷），被别层压住就看不出来了。
@@ -240,7 +284,7 @@ class Scene:
                 self._last_wave_color = cfg["wave_color"]
             self._wave_trigger(cfg, dist, w, h, dt)
             self.wave.update(dt, cfg)
-            self.wave.draw(u32, w, h, cfg)
+            self.wave.draw(buf_ms, w, h, cfg)
         elif self.wave._alive:
             # 关闭时清场：否则重新打开时会冒出上一次留下的波
             self.wave.reset()

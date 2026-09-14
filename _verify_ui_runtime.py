@@ -67,9 +67,12 @@ def main():
     for name in list(p._pages.keys()):
         p._show_page(name)
         seen.append(name)
-    # 顺序必须与 nav_defs 一致（可读性检查：侧栏点哪一项，右侧就得有对应页）
-    assert seen == ["下雨", "下雪", "落樱", "流星雨", "颜料盘", "聚光灯",
-                    "窗口水波", "涟漪", "真实水波", "其它"], seen
+    # 顺序必须与侧栏一致（可读性检查：侧栏点哪一项，右侧就得有对应页），
+    # 且直接等于分类表的导航顺序 —— 侧栏分组不允许在 UI 里再写一份
+    import fx_kinds
+    assert seen == ["下雨", "下雪", "落樱", "流星雨", "聚光灯", "颜料盘",
+                    "涟漪", "真实水波", "窗口水波", "其它"], seen
+    assert seen == fx_kinds.nav_order(), (seen, fx_kinds.nav_order())
 
 
     # 侧栏导航不再有「预设」独立页，预设方案已下沉到各特效页
@@ -90,6 +93,35 @@ def main():
     p._sync_from_cfg()
     assert float(app.cfg["rain_amount"]) == 130.0, app.cfg["rain_amount"]
     assert bool(app.cfg["rain_enabled"]) is True
+
+    # 2d) 各特效页的启停开关都能写回 cfg（同类互斥要靠它触发）
+    for page, key in (("下雨", "rain_enabled"), ("下雪", "snow_enabled"),
+                      ("落樱", "petal_enabled"), ("流星雨", "meteor_enabled"),
+                      ("聚光灯", "spotlight_enabled"), ("颜料盘", "paint_enabled"),
+                      ("涟漪", "ripple_enabled"), ("真实水波", "wave_enabled"),
+                      ("窗口水波", "win_ripple_enabled")):
+        assert key in p._ctrls, f"{page} 页缺少启停开关 {key}"
+        p._ctrls[key]["on"](True)
+        assert app.cfg[key] is True, f"{key} 未写回 cfg"
+        p._ctrls[key]["on"](False)
+        assert app.cfg[key] is False, f"{key} 未写回 cfg"
+
+    # 2e) 「其他设置」页：层级 / 多开开关已注册，且写的是字符串档位
+    for k in ("layer_fullscreen", "layer_mouse", "multi_fullscreen", "multi_mouse"):
+        assert k in p._ctrls, f"其他设置页缺少控件 {k}"
+    p._ctrls["layer_fullscreen"]["on"](True)
+    assert app.cfg["layer_fullscreen"] == "desktop", app.cfg["layer_fullscreen"]
+    p._ctrls["layer_fullscreen"]["on"](False)
+    assert app.cfg["layer_fullscreen"] == "topmost"
+    app.cfg["layer_mouse"] = "desktop"          # cfg -> UI 的同步方向
+    p._sync_from_cfg()
+    assert p._ctrls["layer_mouse"]["var"].get() is True
+    app.cfg["layer_mouse"] = "topmost"
+    p._sync_from_cfg()
+    assert p._ctrls["layer_mouse"]["var"].get() is False
+    p._ctrls["multi_fullscreen"]["on"](True)
+    assert app.cfg["multi_fullscreen"] is True
+    p._ctrls["multi_fullscreen"]["on"](False)
 
     # 3) 切到「下雨」页并强制布局
     p._show_page("下雨")

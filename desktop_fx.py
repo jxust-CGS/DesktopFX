@@ -19,6 +19,7 @@ import winreg
 
 from _win32 import user32, kernel32
 from _paths import app_root
+import fx_kinds
 
 # 源码运行 = 项目目录；PyInstaller 冻结 = exe 所在目录（用户数据随 exe 走）
 APP_DIR = app_root()
@@ -50,6 +51,10 @@ DEFAULTS = {
     "rain_color": "#5FA8D8",          # 深蓝高对比：白底 / 深底都清晰
     "rain_opacity": 0.85,
     "splash": True,
+    # 涟漪主开关：关掉后鼠标不再生涟漪（雨滴溅水花 / 窗口水波不受影响）。
+    # 它同时是"鼠标特效同类互斥"的判定键 —— 没有它，涟漪在配置里恒为开，
+    # 会一直把聚光灯 / 颜料盘 / 真实水波顶掉。
+    "ripple_enabled": True,
     "ripple_move": True,
     "ripple_click": True,
     "ripple_step": 24.0,
@@ -143,6 +148,16 @@ DEFAULTS = {
     "win_ripple_strength": 0.7,
     "win_ripple_color": "#7FE7FF",
     "win_ripple_edge_density": 12,
+    # ---- 特效分层与多开（面板「其它设置」页）----
+    # 全屏特效层 / 鼠标特效层各是一个独立覆盖窗口，层级各自设定：
+    #   topmost = 始终浮在窗口之上（默认）；desktop = 仅桌面图层，任何窗口
+    #   都能盖住它（挂到桌面壁纸层，挂不上则降级为沉底窗口）。
+    "layer_fullscreen": "topmost",
+    "layer_mouse": "topmost",
+    # ---- 同类是否允许多开 ----
+    # 关闭（默认）时同一分类里只能开一个特效，开新的会自动关掉同类的旧的。
+    "multi_fullscreen": False,
+    "multi_mouse": False,
 }
 
 PRESETS = {
@@ -313,6 +328,9 @@ class App:
         self.cfg = dict(DEFAULTS)
         self.load()
         self.user_presets = self._load_user_presets()
+        # 刻意**不在启动时**做同类收拢：那会静默改掉用户当前的桌面
+        # （他可能就想让同类叠开着）。"不允许多开"约束的是**新的开启动作**，
+        # 由 set() / apply_preset() 负责。
         self.snapshot = dict(self.cfg)      # 渲染线程只读副本，整体替换保证原子
 
         # 托盘产出的事件先进 _raw_events，由泵线程写进 error.log 之后再转发到
@@ -331,6 +349,7 @@ class App:
         self.fps = 0.0
         self.cost_ms = 0.0
         self.overlay = None
+        self.overlays = []      # [全屏特效层, 鼠标特效层]
         self.tray = None
         self._thread = None
         self._last_color = None
@@ -426,6 +445,7 @@ class App:
 
     def set(self, key, value):
         self.cfg[key] = value
+        self._exclusive_after(key, value)
         self.snapshot = dict(self.cfg)
         self._autosave_dirty = True
 
@@ -434,6 +454,75 @@ class App:
         self.cfg.update(mapping)
         self.snapshot = dict(self.cfg)
         self._autosave_dirty = True
+
+    # ---------------------------------------------------------------- 同类互斥
+    def _exclusive_after(self, key, value):
+        """开了某个特效之后，若该分类"不允许多开"，把同类的其它特效关掉。
+
+        只在这一个地方兜底：面板开关、预设套用、托盘菜单最终都落到 cfg 写入，
+        分散到各处去拦迟早会漏一处。value 为假时什么都不做。
+        """
+        name = fx_kinds.ENABLE_TO_EFFECT.get(key)
+        if not name or not value:
+            return
+        info = fx_kinds.EFFECTS[name]
+        if self.cfg.get(fx_kinds.multi_key_of(name), False):
+            return
+        for other in fx_kinds.effects_of(info["cat"]):
+            if other == name:
+                continue
+            for k in fx_kinds.off_keys(other):
+                self.cfg[k] = False
+
+    def _normalize_exclusive(self, prefer):
+        """套用预设后收拢同类：只处理预设**显式打开**了特效的那些分类。
+
+        预设只覆盖它写到的键，没写到的键沿用当前值 —— 于是"沿用下来的旧特效"
+        与"预设想开的特效"会同时开着。此时保留预设显式打开的那个，关掉同类其余。
+
+        为什么不做全局收拢：
+          1. 启动时收拢会静默改掉用户当前的桌面（他可能就要同类叠开）；
+          2. 套用「下雨」预设不该顺手关掉另一分类的「真实水波」。
+        所以没被预设碰到的分类一律不动。
+        """
+        if not prefer:
+            return
+        for cat in fx_kinds.CATEGORY_ORDER:
+            names = fx_kinds.effects_of(cat)
+            if not names:
+                continue
+            keep = None
+            for n in names:
+                ek = fx_kinds.EFFECTS[n].get("enable")
+                if ek and prefer.get(ek):
+                    keep = n
+                    break
+            if keep is None:
+                continue                     # 预设没碰这个分类
+            if self.cfg.get(fx_kinds.multi_key_of(keep), False):
+                continue                     # 该分类允许多开
+            for n in names:
+                if n == keep:
+                    continue
+                for k in fx_kinds.off_keys(n):
+                    self.cfg[k] = False
+
+    def _restack_overlays(self):
+        """把鼠标层纠正到全屏层之上 —— 但**只在两层都是最上层时**。
+
+        任一层切到"仅桌面图层"后就成了 WorkerW 的子窗口（WS_CHILD）。此时把
+        另一个顶层窗插到"别人的子窗口"之后，语义是未定义的（Windows 只保证
+        同父窗口之间的相对位置），实测可能把鼠标层压到壁纸之下、鼠标特效整个
+        消失。两层不在同一 z 序空间时，先后已由各自层级决定（桌面层本来就该在
+        下面），不需要也不能纠正。
+        """
+        if len(self.overlays) < 2:
+            return False
+        ov_fs, ov_ms = self.overlays[0], self.overlays[1]
+        if (ov_fs.z_mode != fx_kinds.LAYER_TOPMOST
+                or ov_ms.z_mode != fx_kinds.LAYER_TOPMOST):
+            return False
+        return ov_ms.place_above(ov_fs.hwnd)
 
     # ---------------------------------------------------------------- 自动保存
     def _autosave_loop(self):
@@ -567,6 +656,7 @@ class App:
         # 留下阴魂不散的残留键。
         self.cfg.update({k: v for k, v in p.items()
                          if not k.startswith("_") and k in DEFAULTS})
+        self._normalize_exclusive(prefer=p)   # 预设整块写入、绕过 set()，这里收拢
         self.snapshot = dict(self.cfg)
         self._autosave_dirty = True
 
@@ -638,19 +728,30 @@ class App:
         from fx_winlayer import Overlay
         from fx_scene import Scene
 
-        ov = Overlay()
-        ov.create()
-        self.overlay = ov
-        w, h = ov.w, ov.h
+        # 两层各一个覆盖窗口：全屏特效层 / 鼠标特效层。两层的显示层级由用户
+        # 分别设定（最上层 / 仅桌面图层），一个窗口做不到两种 z 序，必须分开。
+        ov_fs = Overlay(fx_kinds.LAYER_TOPMOST)
+        ov_fs.create()
+        ov_ms = Overlay(fx_kinds.LAYER_TOPMOST)
+        ov_ms.create()
+        self.overlay = ov_fs
+        self.overlays = [ov_fs, ov_ms]
+        w, h = ov_fs.w, ov_fs.h
 
-        # 场景合成器：雨 / 雪 / 涟漪 / 闪电 / 鼠标都收进一个可组合的场景
+        # 场景合成器：全部特效收进一个可组合的场景，但**按层分流输出**（见
+        # Scene.step）。物理只推进一步，两张缓冲共用同一份模拟状态。
         scene = Scene(w, h)
-        scene.set_origin(ov.x, ov.y)
+        scene.set_origin(ov_fs.x, ov_fs.y)
 
         last = time.perf_counter()
         frame = 0
         fps_ema = 60.0
-        _last_top = 0.0  # 上次"钉顶"时刻；见 ov.keep_on_top 注释
+        _last_top = 0.0     # 上次"钉顶"时刻；见 ov.keep_on_top 注释
+        _last_alive = 0.0   # 上次"桌面层存活自检"时刻
+        z_applied = (None, None)   # 已施加的 (全屏层, 鼠标层) 层级
+        # 上一帧该层是否**有内容**。用于空层跳过呈现（见第 5 步注释）：
+        # 有 -> 空 的那一帧还要补提交一次，把上一帧的像素擦掉。
+        fs_dirty = ms_dirty = True
 
         while not self.stop_evt.is_set():
             t0 = time.perf_counter()
@@ -659,48 +760,110 @@ class App:
             cfg = self.snapshot
 
             if self.paused:
-                if self.overlay is not None:
+                for ov in (ov_fs, ov_ms):
                     try:
                         ov.u32[:] = 0
                         ov.present()
                     except Exception:
                         pass
-                ov.pump()
+                    ov.pump()
                 self.paused_idle = True
                 time.sleep(0.05)
                 continue
 
             try:
-                resized = False
-                if frame % 30 == 0 and ov.resize_if_needed():
-                    w, h = ov.w, ov.h
-                    scene.resize(w, h)
-                    scene.set_origin(ov.x, ov.y)
-                    resized = True
-                frame += 1
-
-                # 周期性把叠加层钉回最上层：被其它置顶窗口（全屏视频/画中画等）
-                # 盖住后 ≤0.5s 内自动复位；NOACTIVATE 不抢焦点。
-                # keep_on_top 内部会先判定"是否真被盖"，未被盖是空操作 ——
-                # 无条件抢顶会跟面板的置顶保活互抢，造成周期性 z 序翻转闪烁。
-                # 刚重建过 DIB 的帧要跳过：那一瞬间 _hdc_mem 还挂着占位位图，
-                # 此时再改 z 序容易让 DWM 取到无效内容。
                 now = time.perf_counter()
+
+                # 1) 桌面层存活自检（低频）：桌面层是资源管理器壁纸窗口的
+                #    **子窗口**，资源管理器一重启就会被连带销毁、画面定格。
+                rebuilt = False
+                if now - _last_alive > 1.0:
+                    _last_alive = now
+                    for ov in (ov_fs, ov_ms):
+                        if ov.z_mode == fx_kinds.LAYER_DESKTOP:
+                            try:
+                                if ov.ensure_alive():
+                                    rebuilt = True
+                            except Exception as exc:
+                                self.report_error("layer-alive", exc)
+
+                # 2) 屏幕尺寸变化（改分辨率 / 插拔显示器）
+                resized = False
+                if rebuilt or frame % 30 == 0:
+                    changed = False
+                    for ov in (ov_fs, ov_ms):
+                        if ov.resize_if_needed():
+                            changed = True
+                    if rebuilt or changed:
+                        w, h = ov_fs.w, ov_fs.h
+                        scene.resize(w, h)
+                        scene.set_origin(ov_fs.x, ov_fs.y)
+                        resized = True
+
+                # 3) 显示层级：用户改了立即生效，不必重启
+                modes = (cfg.get("layer_fullscreen", fx_kinds.LAYER_TOPMOST),
+                         cfg.get("layer_mouse", fx_kinds.LAYER_TOPMOST))
+                modes_changed = modes != z_applied
+                if modes_changed:
+                    z_applied = modes
+                    for ov, m in zip((ov_fs, ov_ms), modes):
+                        try:
+                            ov.apply_z_mode(m)
+                        except Exception as exc:
+                            self.report_error("layer", exc)
+                    # 鼠标层恒在全屏层之上（两层都是最上层时才纠正，见 _restack_overlays）
+                    self._restack_overlays()
+
+                # 4) 周期性把"最上层"的层钉回置顶：被其它置顶窗口（全屏视频/
+                #    画中画等）盖住后 ≤0.5s 内自动复位；NOACTIVATE 不抢焦点。
+                #    keep_on_top 内部会先判定"是否真被盖"，未被盖是空操作 ——
+                #    无条件抢顶会跟面板的置顶保活互抢，造成周期性 z 序翻转闪烁。
+                #    刚重建过 DIB 的帧要跳过：那一瞬间 _hdc_mem 还挂着占位位图，
+                #    此时再改 z 序容易让 DWM 取到无效内容。
+                #    桌面层的窗口不参与抢顶（它本来就该待在下面）。
                 if resized:
                     _last_top = now
                 elif now - _last_top > 0.5:
                     _last_top = now
-                    ov.keep_on_top()
+                    moved = False
+                    for ov in (ov_fs, ov_ms):
+                        if ov.z_mode == fx_kinds.LAYER_TOPMOST:
+                            moved = ov.keep_on_top() or moved
+                    if moved:
+                        self._restack_overlays()
 
-                u32 = ov.u32
-                u32[:] = 0
-
-                # 整帧合成交给 Scene —— 哪些特效层参与由 cfg 开关决定
+                # 5) 合成并上屏：全屏层一张、鼠标层一张
+                u32_fs = ov_fs.u32
+                u32_ms = ov_ms.u32
+                u32_fs[:] = 0
+                u32_ms[:] = 0
                 scene.cfg = cfg
-                scene.step(dt, u32, w, h)
+                scene.step(dt, u32_fs, w, h, u32_ms)
 
-                ov.present()
+                # 空层跳过呈现。分成两个覆盖窗口后，每层每帧一次全屏
+                # UpdateLayeredWindow（实测约 4ms @3840x1200）—— 而常常只有一类
+                # 特效在跑，另一层是全空的，"再提交一次全 0"画面完全一样，却白付
+                # 4ms。先问场景要一个**保守**信号，信号判空的再用真实像素复核：
+                # 复核是精确的（信号错报为空也不会漏擦），信号报"有内容"时直接
+                # 提交、连扫描都省掉。
+                # 判据必须是像素而不是"有没有开特效"：涟漪池里可能还留着上一次
+                # 溅起的水花，按开关推断会把它冻在屏幕上。
+                # 有 -> 空 的那一帧必须补提交一次（把上一帧的像素擦掉），之后才
+                # 跳过；窗口重建 / 改过尺寸 / 层级切换后也要补一次，否则新 DIB 不上屏。
+                force = rebuilt or resized or modes_changed
+                fs_has, ms_has = scene.layer_activity()
+                if not fs_has:
+                    fs_has = bool(u32_fs.any())
+                if not ms_has:
+                    ms_has = bool(u32_ms.any())
+                if fs_has or fs_dirty or force:
+                    ov_fs.present()
+                    fs_dirty = fs_has
+                if ms_has or ms_dirty or force:
+                    ov_ms.present()
+                    ms_dirty = ms_has
                 self.clear_error()
+                frame += 1
             except Exception as exc:      # 单帧异常不终止整个特效
                 # 偶发单帧异常（如改分辨率瞬间 DIB 正在重建）应当容忍，
                 # 但连续失败说明彻底坏了 —— 记日志并在熔断后干净退出，
@@ -714,7 +877,8 @@ class App:
                     break
                 time.sleep(0.2)
 
-            ov.pump()
+            ov_fs.pump()
+            ov_ms.pump()
 
             # ---------------- 帧率控制与统计
             cost = time.perf_counter() - t0
@@ -727,12 +891,13 @@ class App:
             if rest > 0.001:
                 time.sleep(rest)
 
-        try:
-            ov.u32[:] = 0
-            ov.present()
-        except Exception:
-            pass
-        ov.destroy()
+        for ov in (ov_fs, ov_ms):
+            try:
+                ov.u32[:] = 0
+                ov.present()
+            except Exception:
+                pass
+            ov.destroy()
 
     def _ripple_color(self, hex_to_bgr):
         c = self.snapshot["ripple_color"]

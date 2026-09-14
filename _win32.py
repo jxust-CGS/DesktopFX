@@ -245,6 +245,19 @@ def patch_libs():
     user32.RegisterWindowMessageW.argtypes = [ctypes.c_wchar_p]
     user32.FindWindowW.restype = HWND
     user32.FindWindowW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
+    # 桌面壁纸层（WorkerW）挂载用：找子窗口 / 枚举顶层窗 / 认父
+    user32.FindWindowExW.restype = HWND
+    user32.FindWindowExW.argtypes = [HWND, HWND, ctypes.c_wchar_p, ctypes.c_wchar_p]
+    user32.SetParent.restype = HWND
+    user32.SetParent.argtypes = [HWND, HWND]
+    # 窗口样式读写：挂到桌面壁纸层要把 WS_POPUP 换成 WS_CHILD，
+    # 否则 SetParent 只改 owner 语意、GetParent 依旧返回 0。
+    user32.GetWindowLongW.restype = LONG
+    user32.GetWindowLongW.argtypes = [HWND, INT]
+    user32.SetWindowLongW.restype = LONG
+    user32.SetWindowLongW.argtypes = [HWND, INT, LONG]
+    user32.EnumWindows.restype = BOOL
+    user32.EnumWindows.argtypes = [ctypes.c_void_p, LPARAM]
     # ---------- SHELL32
     shell32.Shell_NotifyIconW.restype = BOOL
     shell32.Shell_NotifyIconW.argtypes = [DWORD, ctypes.c_void_p]

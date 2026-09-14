@@ -8,6 +8,7 @@ import numpy as np
 from _win32 import (user32, gdi32, kernel32, HANDLE, HWND, HDC, HBITMAP,
                     WPARAM, LPARAM, LRESULT, BOOL, UINT, DWORD, INT, RECT,
                     hwnd_int)
+from fx_kinds import LAYER_DESKTOP, LAYER_TOPMOST
 
 WS_POPUP = 0x80000000
 WS_EX_LAYERED = 0x00080000
@@ -26,8 +27,15 @@ SM_CYVIRTUALSCREEN = 79
 BI_RGB = 0
 DIB_RGB_COLORS = 0
 HWND_TOPMOST = wt.HWND(-1)
+HWND_NOTOPMOST = wt.HWND(-2)   # 取消置顶
+HWND_BOTTOM = wt.HWND(1)       # 沉到 z 序最底（仅桌面层级的降级方案）
 SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
+SWP_NOZORDER = 0x0004
+SWP_SHOWWINDOW = 0x0040
+GWL_STYLE = -16
+WS_CHILD = 0x40000000
+WS_POPUP_STYLE = 0x80000000
 SWP_NOACTIVATE = 0x0010
 # 不保存/恢复被遮挡处的位图：本窗口内容 100% 由 UpdateLayeredWindow 提供，
 # 让系统去 copy bits 反而会在 z 序变动时翻出无效内容（可见的一帧闪烁）。
@@ -141,8 +149,54 @@ def _register_class():
     _CLASS_REGISTERED = True
 
 
+# 给 Progman 发这条消息，资源管理器会确保"承载壁纸的 WorkerW"存在
+WM_SPAWN_WORKER = 0x052C
+SMTO_NORMAL = 0x0000
+_ENUM_CB = ctypes.WINFUNCTYPE(BOOL, HWND, LPARAM)
+
+
+def _find_wallpaper_workerw():
+    """找到"承载桌面壁纸"的那个 WorkerW；找不到返回 0。
+
+    Windows 把桌面拆成两层：Progman / SHELLDLL_DefView 放图标，另一个
+    WorkerW 放壁纸（在图标层之下）。0x052C 是让资源管理器把这个壁纸层
+    建出来的既成手法 —— 失败也不影响（返回 0 由调用方降级）。
+
+    返回的窗口**不保证覆盖整个虚拟屏**：多显示器下每块屏各自一个 WorkerW。
+    调用方必须自己核对覆盖范围，否则挂上去会让副屏特效整片消失。
+    """
+    progman = user32.FindWindowW("Progman", None)
+    if not progman:
+        return 0
+    dw = ctypes.c_size_t(0)
+    try:
+        user32.SendMessageTimeoutW(progman, WM_SPAWN_WORKER, 0, 0, SMTO_NORMAL,
+                                   1000, ctypes.byref(dw))
+    except Exception:
+        pass
+    found = []
+
+    def _cb(hwnd, _lp):
+        # 挂着 SHELLDLL_DefView（图标层）的 WorkerW 的下一个兄弟 = 壁纸层
+        if user32.FindWindowExW(hwnd, None, "SHELLDLL_DefView", None):
+            w = user32.FindWindowExW(None, hwnd, "WorkerW", None)
+            if w:
+                found.append(w)
+        return True
+
+    try:
+        cb = _ENUM_CB(_cb)      # 必须持引用：临时对象会在枚举期间被回收
+        user32.EnumWindows(cb, 0)
+    except Exception:
+        return 0
+    return hwnd_int(found[0]) if found else 0
+
+
 class Overlay:
-    def __init__(self):
+    def __init__(self, z_mode=LAYER_TOPMOST):
+        self.z_mode = z_mode
+        self._parented = False          # 是否已挂成 WorkerW 的子窗口
+        self._desktop_fallback = False  # 桌面层是否走了"沉底"降级
         self.hwnd = None
         self._hdc_screen = None
         self._hdc_mem = None
@@ -161,12 +215,21 @@ class Overlay:
         self.panel_hwnd = None
 
     def create(self):
+        self._create_window()
+        self._alloc_bitmap(self.w, self.h)
+        self.apply_z_mode(self.z_mode)
+        return self
+
+    def _create_window(self):
+        """只建窗口（不含位图）。显示层级统一由 apply_z_mode 施加。"""
         _register_class()
         show_panel_message()  # 必须在窗口创建前注册，wndproc 才知道要拦哪个号
         x, y, w, h = virtual_screen()
         self.x, self.y, self.w, self.h = x, y, w, h
+        # 刻意**不带** WS_EX_TOPMOST：层级运行时可改（最上层 / 仅桌面图层），
+        # 统一交给 SetWindowPos 施加，省得来回改扩展样式。
         self.hwnd = user32.CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             _CLASS_NAME, "DesktopFX Overlay", WS_POPUP,
             x, y, w, h, None, None, kernel32.GetModuleHandleW(None), None)
         if not self.hwnd:
@@ -176,8 +239,7 @@ class Overlay:
         user32.ShowWindow(self.hwnd, SW_SHOWNOACTIVATE)
         if not user32.IsWindowVisible(self.hwnd):
             raise OSError("overlay window is not visible after ShowWindow")
-        self._alloc_bitmap(w, h)
-        return self
+        self._parented = False
 
     def _alloc_bitmap(self, w, h):
         if self._hbmp:
@@ -215,6 +277,7 @@ class Overlay:
         if (x, y, w, h) != (self.x, self.y, self.w, self.h):
             self.x, self.y = x, y
             self._alloc_bitmap(w, h)
+            self.apply_z_mode(self.z_mode)   # 位置/层级随新尺寸一起重算
             return True
         return False
 
@@ -259,7 +322,9 @@ class Overlay:
             return False
         buf = ctypes.create_unicode_buffer(128)
         user32.GetClassNameW(h, buf, 128)
-        return buf.value not in _NON_OCCLUDERS
+        # 自家的另一层（全屏层 / 鼠标层）当然压在自己上面，不算"被外人盖住"：
+        # 否则两层会互相判定被盖、各自每 0.5s 抢一次顶，表现为周期性闪烁。
+        return buf.value not in _NON_OCCLUDERS and buf.value != _CLASS_NAME
 
     def _covered(self):
         """本窗口是否被"别人的"可见置顶窗口盖住。
@@ -292,7 +357,7 @@ class Overlay:
         每 0.5s 无条件抢一次顶，就会和面板每 2s 的抢顶互相翻转 z 序 —— 表现
         为"每隔几秒画面闪一下"。所以先判定是否真被盖，未被盖直接返回。
         """
-        if not self.hwnd:
+        if not self.hwnd or self.z_mode != LAYER_TOPMOST:
             return False
         if not self._covered():
             return False
@@ -303,6 +368,127 @@ class Overlay:
         user32.SetWindowPos(self.hwnd, after, 0, 0, 0, 0,
                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
                             | SWP_NOCOPYBITS | SWP_NOOWNERZORDER)
+        return True
+
+    # ------------------------------------------------------------ 显示层级
+    def apply_z_mode(self, mode):
+        """施加显示层级：LAYER_TOPMOST 最上层 / LAYER_DESKTOP 仅桌面图层。
+
+        桌面层优先挂到壁纸层（WorkerW 的子窗口）；挂不上就降级为"取消置顶 +
+        沉到 z 序最底"—— 两者对用户的观感一致（任何窗口都能盖住特效），
+        但降级方案保住了多显示器覆盖，所以是可接受的兜底。
+        """
+        mode = LAYER_DESKTOP if mode == LAYER_DESKTOP else LAYER_TOPMOST
+        self.z_mode = mode
+        if not self.hwnd:
+            return mode
+        if mode == LAYER_DESKTOP:
+            # 先摘掉置顶：从"最上层"切过来时 WS_EX_TOPMOST 还挂着，带着它挂
+            # 到桌面层会被忽略（桌面层窗口不该是 topmost），也容易被后续抢顶
+            # 逻辑误判。HWND_NOTOPMOST 会把这个扩展样式位清掉。
+            user32.SetWindowPos(self.hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+                                | SWP_NOCOPYBITS | SWP_NOOWNERZORDER)
+            self._desktop_fallback = not self._attach_desktop()
+            if self._desktop_fallback:
+                self._detach_parent()
+                user32.SetWindowPos(self.hwnd, HWND_BOTTOM, 0, 0, 0, 0,
+                                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+                                    | SWP_NOCOPYBITS | SWP_NOOWNERZORDER)
+        else:
+            self._desktop_fallback = False
+            self._detach_parent()
+            after = HWND(self.panel_hwnd) if self.panel_hwnd else HWND_TOPMOST
+            user32.SetWindowPos(self.hwnd, after, self.x, self.y, self.w, self.h,
+                                SWP_NOACTIVATE | SWP_NOCOPYBITS
+                                | SWP_NOOWNERZORDER | SWP_SHOWWINDOW)
+        return mode
+
+    def _attach_desktop(self):
+        """挂到桌面壁纸层。任一前提不满足就返回 False（由调用方降级）：
+
+        1. 找得到承载壁纸的 WorkerW；
+        2. 它的矩形**覆盖整个虚拟屏** —— 多显示器下每块屏一个 WorkerW，
+           只挂住主屏那个会让副屏的特效整片消失，宁可降级也不能挂。
+        """
+        workerw = _find_wallpaper_workerw()
+        if not workerw:
+            return False
+        r = RECT()
+        if not user32.GetWindowRect(HWND(workerw), ctypes.byref(r)):
+            return False
+        if not (r.left <= self.x and r.top <= self.y
+                and r.right >= self.x + self.w and r.bottom >= self.y + self.h):
+            return False
+        # 必须先改成 WS_CHILD：SetParent 不会自动改样式，而 WS_POPUP 的窗口
+        # 在系统眼里仍是"顶层窗"，GetParent 返回的是 owner（恒为 0）——
+        # 父子关系形同虚设，还可能被当成独立顶层窗重新参与 z 序竞争。
+        style = user32.GetWindowLongW(self.hwnd, GWL_STYLE)
+        ctypes.set_last_error(0)
+        user32.SetWindowLongW(self.hwnd, GWL_STYLE,
+                              (style & ~WS_POPUP_STYLE) | WS_CHILD)
+        if ctypes.get_last_error():
+            return False
+        # SetParent 的返回值是"原来的父亲"，顶层窗时就是 NULL，无法据此判断成败，
+        # 因此直接回读 GetParent 校验；不成立就回滚样式，别留下半吊子状态。
+        user32.SetParent(self.hwnd, HWND(workerw))
+        if hwnd_int(user32.GetParent(self.hwnd)) != workerw:
+            user32.SetParent(self.hwnd, None)
+            user32.SetWindowLongW(self.hwnd, GWL_STYLE, style)
+            return False
+        self._parented = True
+        # 子窗口坐标相对父窗口客户区：WorkerW 左上角通常就是虚拟屏原点，但不是
+        # 所有系统都如此，按窗口矩形差值折算。
+        user32.SetWindowPos(self.hwnd, None, self.x - r.left, self.y - r.top,
+                            self.w, self.h,
+                            SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW
+                            | SWP_NOCOPYBITS | SWP_NOOWNERZORDER)
+        return True
+
+    def _detach_parent(self):
+        """从壁纸层退出来，回到独立顶层窗口（屏幕坐标）。"""
+        if not self.hwnd or not self._parented:
+            return
+        user32.SetParent(self.hwnd, None)
+        # 与挂载时对称：清掉 WS_CHILD、改回 WS_POPUP，否则会留下一个
+        # "没有父亲却有 WS_CHILD"的窗口，系统会把它当孤儿子窗处理。
+        style = user32.GetWindowLongW(self.hwnd, GWL_STYLE)
+        user32.SetWindowLongW(self.hwnd, GWL_STYLE,
+                              (style & ~WS_CHILD) | WS_POPUP_STYLE)
+        self._parented = False
+        user32.SetWindowPos(self.hwnd, None, self.x, self.y, self.w, self.h,
+                            SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW
+                            | SWP_NOCOPYBITS | SWP_NOOWNERZORDER)
+
+    def place_above(self, other_hwnd):
+        """把本窗口插到另一个窗口的正上方（只在最上层模式下有意义）。
+
+        两层都在最上层时，钉顶保活只把"被盖住的那层"插回置顶组顶部 ——
+        反复几次后两层的先后可能翻过来（雨盖住水波）。调用方在每次层级/
+        钉顶动作之后用它统一纠正一次。
+        """
+        if not self.hwnd or not other_hwnd:
+            return False
+        return bool(user32.SetWindowPos(
+            self.hwnd, HWND(other_hwnd), 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOCOPYBITS
+            | SWP_NOOWNERZORDER))
+
+    def is_desktop_fallback(self):
+        """桌面层级是否退成了"沉底窗口"（拿不到 WorkerW 时）。供诊断/测试用。"""
+        return bool(self._desktop_fallback)
+
+    def ensure_alive(self):
+        """窗口是否还活着；死了就地重建并重新施加层级。
+
+        桌面层是 WorkerW 的**子窗口**，资源管理器重启会连它一起销毁：IsWindow
+        变假、画面定格。返回 True 表示重建过，调用方需重新读取宽高。
+        """
+        if self.hwnd and user32.IsWindow(self.hwnd):
+            return False
+        self._create_window()
+        self._alloc_bitmap(self.w, self.h)
+        self.apply_z_mode(self.z_mode)
         return True
 
     def destroy(self):
@@ -321,6 +507,7 @@ class Overlay:
         if self.hwnd:
             user32.DestroyWindow(self.hwnd)
             self.hwnd = None
+        self._parented = False
         self.buffer = None
         self.flat = None
         self.u32 = None

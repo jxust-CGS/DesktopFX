@@ -256,6 +256,234 @@ def test_real_window_geometry_sane():
     return True, "_covered() 为假（无真实窗口压在全屏 overlay 之上）"
 
 
+# ---------------------------------------------------------------- 显示层级
+_GWL = ctypes.windll.user32.GetWindowLongW
+_GWL.restype = ctypes.c_long
+_GWL.argtypes = [ctypes.c_void_p, ctypes.c_int]
+GWL_EXSTYLE = -20
+WS_EX_TOPMOST = 0x00000008
+
+
+def _is_topmost(hwnd):
+    return bool(_GWL(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST)
+
+
+def test_workerw_lookup_safe():
+    """找不到壁纸层时必须老实返回 0（调用方靠它降级），不得抛异常。"""
+    w = fw._find_wallpaper_workerw()
+    if not isinstance(w, int):
+        return False, f"返回类型不对：{type(w)}"
+    return True, f"WorkerW 查找返回 {w or '0（本机未找到，将走沉底降级）'}"
+
+
+def test_real_desktop_layer_roundtrip():
+    """真实窗口：最上层 <-> 仅桌面图层 来回切，窗口必须始终有效。
+
+    桌面层要么真挂上壁纸层（SetParent 到 WorkerW），要么明确走"沉底"降级 ——
+    不允许出现"既没挂上、又还置顶"的中间态（那等于这个设置压根没生效）。
+    """
+    try:
+        ov = fw.Overlay().create()
+    except Exception as e:
+        return None, f"SKIP（{type(e).__name__}: {e}）"
+    detail = ""
+    try:
+        if not _is_topmost(ov.hwnd):
+            return False, "默认层级（最上层）没把 WS_EX_TOPMOST 加上"
+
+        ov.apply_z_mode(fw.LAYER_DESKTOP)
+        if ov.z_mode != fw.LAYER_DESKTOP:
+            return False, f"层级没切过去：{ov.z_mode}"
+        if not user32.IsWindow(ov.hwnd):
+            return False, "切到桌面层后窗口失效"
+        if _is_topmost(ov.hwnd):
+            return False, "桌面层窗口仍带 WS_EX_TOPMOST —— 设置没真正生效"
+        if ov._parented:
+            # 必须真的建立起父子关系：只说"挂上了"不算数 —— WS_POPUP 的窗口
+            # 即便 SetParent 过，GetParent 也返回 owner（恒为 0）。
+            parent = hwnd_int(user32.GetParent(ov.hwnd))
+            if not parent:
+                return False, "报告已挂壁纸层，但 GetParent 为 0（父子关系没建立）"
+            buf = ctypes.create_unicode_buffer(64)
+            user32.GetClassNameW(parent, buf, 64)
+            if buf.value != "WorkerW":
+                return False, f"挂到的不是 WorkerW，而是 {buf.value or '?'}"
+            detail = f"已挂到壁纸层 WorkerW={parent}"
+        elif ov.is_desktop_fallback():
+            detail = "未找到可用壁纸层，已降级为沉底窗口"
+        else:
+            return False, "既没挂上壁纸层、也没走降级 —— 层级状态不明"
+        ov.u32[:] = 0
+        ov.present()          # 桌面层仍旧要能上屏
+
+        ov.apply_z_mode(fw.LAYER_TOPMOST)
+        if ov.z_mode != fw.LAYER_TOPMOST or not _is_topmost(ov.hwnd):
+            return False, "切回最上层失败"
+        if ov.ensure_alive():
+            return False, "窗口明明活着，ensure_alive 却报告重建"
+        if user32.GetParent(ov.hwnd):
+            return False, "切回最上层后仍然挂在别的窗口下"
+    finally:
+        ov.destroy()
+    return True, f"最上层 <-> 仅桌面图层 往返正常；{detail}"
+
+
+def test_real_two_overlay_render_loop():
+    """端到端：真实渲染循环起两个覆盖层，两层各画各的，且能运行时切换层级。
+
+    只起渲染线程（不碰托盘 / 面板），也**不落盘**（不走 quit()）。
+    注意逐帧统计必须挂在 Scene.step 上：从外部读 ov.u32 会读到"已清零、
+    还没画完"的瞬时状态（鼠标层的聚光灯要画 ~10ms，这期间全屏层就是空的）。
+    """
+    import threading
+    import time
+
+    import desktop_fx as d
+    import fx_scene
+
+    stats = []
+    orig = fx_scene.Scene.step
+
+    def _spy(self, dt, u32, w, h, u32_mouse=None):
+        orig(self, dt, u32, w, h, u32_mouse)
+        stats.append((int((u32 > 0).sum()),
+                      -1 if u32_mouse is None else int((u32_mouse > 0).sum())))
+
+    fx_scene.Scene.step = _spy
+    app = None
+    try:
+        app = d.App()
+        app.cfg.update(dict(rain_enabled=True, rain_amount=220, splash=False,
+                            snow_enabled=False, petal_enabled=False,
+                            meteor_enabled=False, spotlight_enabled=True,
+                            spotlight_dim=0.15, paint_enabled=False,
+                            wave_enabled=False, ripple_enabled=False))
+        app.snapshot = dict(app.cfg)
+        app._thread = threading.Thread(target=app._render_loop, name="probe",
+                                       daemon=True)
+        app._thread.start()
+
+        deadline = time.time() + 10
+        while time.time() < deadline and len(app.overlays) < 2:
+            time.sleep(0.1)
+        time.sleep(1.2)
+        if len(app.overlays) != 2:
+            return None, f"SKIP/FAIL 覆盖层数量={len(app.overlays)}（窗口建不起来？）"
+        fs_max = max((s[0] for s in stats), default=0)
+        ms_max = max((s[1] for s in stats), default=0)
+        if fs_max <= 0:
+            return False, "全屏特效层没有画任何东西"
+        if ms_max <= 0:
+            return False, "鼠标特效层没有画任何东西"
+
+        ov_fs, ov_ms = app.overlays
+        if user32.GetParent(ov_ms.hwnd):
+            return False, "鼠标层默认不该挂在别的窗口下"
+
+        app.snapshot = dict(app.snapshot, layer_mouse="desktop")
+        deadline = time.time() + 6
+        while time.time() < deadline and ov_ms.z_mode != fw.LAYER_DESKTOP:
+            time.sleep(0.1)
+        if ov_ms.z_mode != fw.LAYER_DESKTOP or not user32.IsWindow(ov_ms.hwnd):
+            return False, "运行时切到「仅桌面图层」没生效"
+        if _is_topmost(ov_ms.hwnd):
+            return False, "桌面层的鼠标层仍带 WS_EX_TOPMOST"
+
+        app.snapshot = dict(app.snapshot, layer_mouse="topmost")
+        deadline = time.time() + 6
+        while time.time() < deadline and ov_ms.z_mode != fw.LAYER_TOPMOST:
+            time.sleep(0.1)
+        if ov_ms.z_mode != fw.LAYER_TOPMOST or not _is_topmost(ov_ms.hwnd):
+            return False, "运行时切回「最上层」失败"
+        if user32.GetParent(ov_ms.hwnd):
+            return False, "切回最上层后仍挂在壁纸层下"
+        if app.last_error:
+            return False, f"渲染循环报错：{app.last_error}"
+    finally:
+        if app is not None:
+            app.stop_evt.set()
+            if app._thread is not None:
+                app._thread.join(timeout=3)
+        fx_scene.Scene.step = orig
+    return True, (f"两层各画各的（全屏≈{fs_max}px / 鼠标≈{ms_max}px），"
+                  f"层级运行时往返切换正常")
+
+
+def test_real_empty_layer_skip():
+    """空层跳过呈现：只在"真有像素"或"刚由有变空/窗口重建"时才提交。
+
+    分两层后每层每帧一次全屏 UpdateLayeredWindow 约 4ms，而常态是只有一类特效
+    在跑、另一层全空 —— 白白提交一次全 0 画面完全一样。这条测试锁住两件事：
+      1. 鼠标层确实**没有内容时不提交**（否则优化被改回去也没人发现）；
+      2. 内容一出现立刻恢复提交（跳过逻辑不能把有内容的帧也吞掉）。
+    判据必须是缓冲区真实像素，所以这里开雨但关掉溅水花 —— 水花会往涟漪池里
+    落点，把鼠标层弄成"有内容"。
+    """
+    import threading
+    import time
+
+    import desktop_fx as d
+    import fx_winlayer
+
+    counts = {"fs": 0, "ms": 0}
+    holder = {}
+    orig = fx_winlayer.Overlay.present
+
+    def _spy(self):
+        ovs = holder.get("app").overlays if holder.get("app") else []
+        key = "fs" if (len(ovs) > 0 and self.hwnd == ovs[0].hwnd) else "ms"
+        counts[key] += 1
+        return orig(self)
+
+    fx_winlayer.Overlay.present = _spy
+    app = None
+    try:
+        app = d.App()
+        holder["app"] = app
+        app.cfg.update(dict(rain_enabled=True, rain_amount=200, splash=False,
+                            snow_enabled=False, petal_enabled=False,
+                            meteor_enabled=False, spotlight_enabled=False,
+                            paint_enabled=False, wave_enabled=False,
+                            win_ripple_enabled=False, ripple_enabled=False))
+        app.snapshot = dict(app.cfg)
+        app._thread = threading.Thread(target=app._render_loop, name="probe",
+                                       daemon=True)
+        app._thread.start()
+
+        deadline = time.time() + 10
+        while time.time() < deadline and len(app.overlays) < 2:
+            time.sleep(0.1)
+        if len(app.overlays) != 2:
+            return None, "SKIP（覆盖层建不起来）"
+        time.sleep(0.8)                 # 预热：让"由有变空"的补提交走完
+        counts["fs"] = counts["ms"] = 0
+        time.sleep(1.2)
+        fs_idle, ms_idle = counts["fs"], counts["ms"]
+        if fs_idle < 20:
+            return False, f"全屏层有内容却几乎没提交（{fs_idle} 次/1.2s）"
+        if ms_idle > 2:
+            return False, (f"鼠标层全空仍在每帧提交（{ms_idle} 次/1.2s，"
+                           f"说明空层跳过没生效）")
+
+        counts["ms"] = 0                # 开聚光灯 -> 鼠标层立刻该有内容
+        app.snapshot = dict(app.snapshot, spotlight_enabled=True, spotlight_dim=0.5)
+        deadline = time.time() + 5
+        while time.time() < deadline and counts["ms"] < 15:
+            time.sleep(0.1)
+        if counts["ms"] < 15:
+            return False, f"鼠标层有内容后没有恢复提交（仅 {counts['ms']} 次）"
+        if app.last_error:
+            return False, f"渲染循环报错：{app.last_error}"
+    finally:
+        fx_winlayer.Overlay.present = orig
+        if app is not None:
+            app.stop_evt.set()
+            if app._thread is not None:
+                app._thread.join(timeout=3)
+    return True, (f"空鼠标层 1.2s 仅提交 {ms_idle} 次（全屏层 {fs_idle} 次），"
+                  f"开启聚光灯后立即恢复提交")
+
+
 def main():
     tests = [
         test_steady_state_is_noop,
@@ -271,6 +499,10 @@ def main():
         test_occluder_found_past_helpers,
         test_real_window_steady_state,
         test_real_window_geometry_sane,
+        test_workerw_lookup_safe,
+        test_real_desktop_layer_roundtrip,
+        test_real_two_overlay_render_loop,
+        test_real_empty_layer_skip,
     ]
     failed = 0
     skipped = 0

@@ -9,7 +9,9 @@ Checks
   2. launch           : os.startfile() == what Windows Explorer does on double-click
   3. alive            : pythonw.exe process appears and survives
   4. actually drawing : the overlay window (class DesktopFXOverlayCls) exists
-  5. single instance  : a second launch must not create a second overlay
+  5. single instance  : a second launch must not create a second instance
+                        （注意：一个实例现在有**两个**覆盖窗口 ——
+                          全屏特效层 + 鼠标特效层，判据是"数量没变"）
 """
 import ctypes
 import glob
@@ -242,9 +244,14 @@ def main():
     print()
     print("== 3. overlay actually rendered ==")
     wins = count_overlay_windows()
-    if wins:
-        print(f"  [OK] overlay window present (class={OVERLAY_CLASS}, "
-              f"hwnd=0x{wins[0]:x})")
+    # 一个实例建**两个**覆盖窗口：全屏特效层 + 鼠标特效层。少一个说明第二层
+    # 没建起来（渲染线程会因此直接挂掉），不能只判"有没有窗口"。
+    if len(wins) >= 2:
+        print(f"  [OK] 覆盖层齐全：{len(wins)} 个窗口（全屏特效层 + 鼠标特效层）"
+              f"  首个 hwnd=0x{wins[0]:x}")
+    elif wins:
+        print(f"  [FAIL] 只有 {len(wins)} 个覆盖窗口（预期 2 个：全屏层 + 鼠标层）")
+        ok = False
     else:
         print(f"  [FAIL] no window of class {OVERLAY_CLASS}")
         ok = False
@@ -275,17 +282,19 @@ def main():
 
     print()
     print("== 4. single-instance guard ==")
+    before_wins = len(wins)
+    before_procs = len(procs)
     os.startfile(bat)
     time.sleep(4.0)
     wins2 = count_overlay_windows()
     n2 = len(list_procs("pythonw.exe"))
-    if len(wins2) > 1:
-        print(f"  [FAIL] second launch created another overlay "
-              f"({len(wins2)} overlay windows, {n2} pythonw)")
+    if len(wins2) > before_wins or n2 > before_procs:
+        print(f"  [FAIL] second launch created another instance "
+              f"(overlay {before_wins}->{len(wins2)}, pythonw {before_procs}->{n2})")
         ok = False
     else:
-        print(f"  [OK] still exactly {len(wins2)} overlay after a second "
-              f"double-click ({n2} pythonw.exe)")
+        print(f"  [OK] second double-click added nothing "
+              f"(overlay {len(wins2)}, pythonw {n2})")
 
     print()
     print("== cleanup ==")
