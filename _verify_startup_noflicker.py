@@ -2,7 +2,8 @@
 """启动无闪动：构造期间窗口必须全程不可见，__init__ 末尾才一次性显示。
 
 机制：ControlPanel.__init__ 一开始 withdraw()，所有 _build / _fit_height 的
-flush（逐页测高度等）都发生在窗口隐藏期；只有 __init__ 末尾才 deiconify + lift。
+flush（一次性堆叠测各页高度、应用最终高度、切页局部布局）都发生在窗口隐藏期；
+只有 __init__ 末尾才 deiconify + lift。
 本脚本在导入期给 tk.Misc.update_idletasks 打桩，记录每次 flush 时顶层窗口的
 mapped 状态；构造完成后断言：
   ① 构造期间有 flush（证明拦到了构建过程）且全程不可见；

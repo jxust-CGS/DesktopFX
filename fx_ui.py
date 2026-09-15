@@ -457,10 +457,10 @@ class ControlPanel:
         self.root = tk.Tk()
         self.root.title("桌面特效")
         self.root.configure(bg=BG)
-        # 构造期间先把窗口藏起来：窗口在第一次 update_idletasks 时就会上屏，而
-        # _build / _fit_height 里要 flush 很多次（逐页测高度），不藏起来就会把
-        # “全部界面演一遍”的过程裸露出来。全部准备好后在 __init__ 末尾 deiconify
-        # 一次性显示最终成品。
+        # 构造期间先把窗口藏起来：页面被放进 canvas 的 window item，其尺寸只能
+        # 在布局 pass（update_idletasks）里算出来，所以构造仍需 1~2 次 flush 来
+        # 测各页高度、应用最终窗口高。这些 flush 全程在 withdraw 状态下进行，
+        # 窗口不会上屏；全部就绪后 __init__ 末尾 deiconify + lift 一次性显示成品。
         self.root.withdraw()
         self.root.overrideredirect(True)
         self.root.attributes("-alpha", 0.97)
@@ -696,9 +696,9 @@ class ControlPanel:
             f.pack_forget()
         self._show_page(self._load_last_page())
 
-        tip = tk.Label(root, text="托盘图标右键可唤出菜单    Ctrl+Alt+R 快速暂停",
-                       bg=BG, fg=SUB, font=FONT_SMALL)
-        tip.pack(pady=(0, 10))
+        self._tip = tk.Label(root, text="托盘图标右键可唤出菜单    Ctrl+Alt+R 快速暂停",
+                             bg=BG, fg=SUB, font=FONT_SMALL)
+        self._tip.pack(pady=(0, 10))
 
     # ------------------------------------------------------------ 侧栏/导航
     def _nav_group(self, side, text):
@@ -810,23 +810,21 @@ class ControlPanel:
         滚轮于是能把顶部拉走，看着莫名其妙。让窗口跟着内容长高（不超出屏幕）
         能从根上避免；真的装不下（屏幕不够高）时才滚动。
         """
-        hs = {}
-        for name, f in self._pages.items():
-            for g in self._pages.values():
-                g.pack_forget()
-            f.pack(fill="x")
-            self._canvas.update_idletasks()
-            hs[name] = int(f.winfo_reqheight())
-        self._show_page(self._active)              # 恢复当前页（顺带复位滚动）
-        # chrome = 窗口高 - 内容区高（标题栏 42 + 底部提示条 + 间距）。
-        # **只在第一次实测、之后复用缓存**：窗口被外部改过尺寸后，canvas 的
-        # winfo_height() 不一定及时跟着变（update_idletasks/update 都不保险），
-        # 再测会得到负数 —— 窗口于是少了一整条标题栏的高度。而首次调用时窗口
-        # 刚建好、布局已稳定，那一次是准的。
+        # 堆叠 pack 全部页面，单次 flush 即可测量每页自然高度（canvas window item
+        # 的尺寸只在布局 pass 里算出，但 10 页只需一次 flush，不必逐页 pack+flush
+        # —— 旧实现每页一次、共 10 次，是 23 次刷新里的大头）。flush 时窗口处于
+        # withdraw 状态，不会上屏。
+        for f in self._pages.values():
+            f.pack()
+        self.root.update_idletasks()
+        hs = {n: int(f.winfo_reqheight()) for n, f in self._pages.items()}
+        # chrome = 标题栏(固定 42) + 底部提示条(自身高度 + 下边距 10)。
+        # 用「固定值 + 提示条请求高度」解析算出，不依赖窗口实际像素：构造期窗口
+        # 处于 withdraw，winfo_height() 是占位值 1，直接相减会得到 chrome≈42 的
+        # 假值，tallest 页会被算短 30+ 像素而误触发滚动。提示条是 root 的直接子
+        # 控件，其 reqheight 在未 flush 时即可得（探针验证 = 23）。
         if getattr(self, "_chrome", None) is None:
-            self.root.update_idletasks()
-            self._chrome = max(42, self.root.winfo_height()
-                               - self._canvas.winfo_height())
+            self._chrome = 42 + self._tip.winfo_reqheight() + 10
         chrome = self._chrome
         content = max(hs.values()) if hs else 0
         self._content_h = content
@@ -837,7 +835,11 @@ class ControlPanel:
         if h != self.H or int(self.root.winfo_height()) != h:
             self.H = h
             self._center()
-            self.root.update_idletasks()
+            self.root.update_idletasks()     # 落实最终高度（仍在 withdraw 期，
+                                            # 仅写 geometry，不触发可视上屏）
+        # 恢复当前页（pack fill + 复位滚动）；滚动区交给 <Configure> 绑定自愈，
+        # 此处不再 flush。
+        self._show_page(self._active)
 
     def _show_page(self, name):
         for n, f in self._pages.items():
@@ -860,6 +862,9 @@ class ControlPanel:
                 info["line"].config(bg=SIDEBAR_BG)
                 info["icon"].config(bg=SIDEBAR_BG)
                 info["icon"].set_color(SUB)
+        # 切页后强制 canvas 局部布局一次，让滚动区（scrollregion）立即基于新页
+        # 内容算准——滚轮处理是同步读滚动区的，若等事件循环自愈，切页当帧滚轮
+        # 会读到旧区域。只 flush canvas 子树（不是整窗），开销极小、不会重映射窗口。
         self._canvas.update_idletasks()
         self._canvas.yview_moveto(0)
         self._sync_scroll()
@@ -963,7 +968,8 @@ class ControlPanel:
                 cells[name] = cell
         else:
             self._hide_preset_section(page_key)
-        pf.update_idletasks()
+        # 不 flush：新增/移除单元格后，inner 的 <Configure> 会在下一轮布局时
+        # 自动重算 scrollregion，无需在此强制整窗布局。
 
     def _make_preset_cell(self, pf, name):
         """构造单个预设单元格（含可选的删除按钮）。"""
@@ -1009,7 +1015,7 @@ class ControlPanel:
         cells[name] = cell
         # 从无到有时把分区与标题也亮出来
         self._show_preset_section(page)
-        pf.update_idletasks()
+        # 不 flush：见 _refresh_presets 说明，scrollregion 由 <Configure> 自愈。
 
     def _save_preset_dialog(self, page_key):
         top = tk.Toplevel(self.root)
@@ -1077,7 +1083,7 @@ class ControlPanel:
             for i, n in enumerate(names):
                 cells[n].grid(row=i // 3, column=i % 3, padx=4, pady=4, sticky="ew")
                 pf.grid_columnconfigure(i % 3, weight=1)
-            pf.update_idletasks()
+        # 不 flush：scrollregion 由 inner 的 <Configure> 自愈。
         if not cells:
             self._hide_preset_section(page)
 
