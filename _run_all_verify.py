@@ -28,6 +28,7 @@ FAST = [
     "_verify_layer_switch.py",    # 层级开关端到端（34s）
     "_verify_taskbar.py",        # 避让任务栏（4s）
     "_verify_ui_runtime.py",      # 面板运行时冒烟（8s）
+    "_verify_startup_noflicker.py",  # 启动无闪动：构造期全程隐藏（1s）
 ]
 
 # 已知慢的：性能基准、长跑稳定性、全预设烟雾、以及要真拉起程序的几个。

@@ -144,6 +144,8 @@ python _verify_launcher.py # 双击全链路验证（含路径存在性、goto �
 
 程序启动后会在屏幕中央出现一块 **Linear / Raycast 风格的深色工具面板**：
 
+> 启动时面板先隐藏、全部构建完成后再一次性显示，不会出现「逐页闪过 / 先出现再变外观」的闪动（详见 `_verify_startup_noflicker.py`）。
+
 ![控制面板 - 颜料盘页](docs/images/panel-paint.png)
 
 - **视觉**：深色底色 + 卡片式分组 + 单一青色强调色，数值统一使用等宽字体避免抖动；
@@ -267,6 +269,7 @@ DesktopFX/
 ├── _verify_dpi.py          # DPI 感知声明验证
 ├── _verify_launcher.py     # 双击入口端到端：文件卫生/启动/渲染/单实例
 ├── _verify_ui_runtime.py    # 面板运行时冒烟：侧栏遍历 / 预设就地刷新 / 滚动，真实 Tk 下实例化
+├── _verify_startup_noflicker.py  # 启动无闪动：构造期窗口全程隐藏、__init__ 末尾才一次性显示，高度不跳变
 ├── _verify_single_instance.py # 互斥体跨进程语义 + 跨进程唤醒消息
 ├── _verify_error_reporting.py # 故障可见性：落盘/去重/熔断/UI 横幅/上报路径自保
 ├── _verify_tray.py         # 托盘：TaskbarCreated 重挂 / 开机竞态 / 真机图标可见

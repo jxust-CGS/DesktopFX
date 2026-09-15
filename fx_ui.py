@@ -457,6 +457,11 @@ class ControlPanel:
         self.root = tk.Tk()
         self.root.title("桌面特效")
         self.root.configure(bg=BG)
+        # 构造期间先把窗口藏起来：窗口在第一次 update_idletasks 时就会上屏，而
+        # _build / _fit_height 里要 flush 很多次（逐页测高度），不藏起来就会把
+        # “全部界面演一遍”的过程裸露出来。全部准备好后在 __init__ 末尾 deiconify
+        # 一次性显示最终成品。
+        self.root.withdraw()
         self.root.overrideredirect(True)
         self.root.attributes("-alpha", 0.97)
         self.root.attributes("-topmost", True)
@@ -479,6 +484,9 @@ class ControlPanel:
         self._apply_dwm()
         self._raise_top()
         self._poll()
+        # 构造期间窗口一直 withdraw，到这里才一次性显示最终成品，避免启动闪动
+        self.root.deiconify()
+        self.root.lift()
 
     # ------------------------------------------------------------ 窗口
     def _center(self):
@@ -502,14 +510,22 @@ class ControlPanel:
             return 0
 
     def _apply_dwm(self):
-        """尝试启用 Win11 圆角 + 亚克力背景；失败时静默回退。"""
+        """尝试启用 Win11 圆角 + 亚克力背景；失败时静默回退。
+
+        构造期间（窗口 withdraw 时）先同步做一遍，这样窗口在 __init__ 末尾
+        deiconify 一次性出现时外观就已经是最终态，不会“先出现、再变圆角/模糊”。
+        再 after(50) 补一遍兜底：个别系统要求窗口可见后才肯接受亚克力。
+        """
         def _try():
-            from _win32 import set_window_rounded, set_window_acrylic
-            h = self._hwnd()
-            if h:
-                # 色调与窗口背景接近，只取轻微模糊
-                set_window_rounded(h)
-                set_window_acrylic(h, rgba=(11, 14, 20, 210))
+            try:
+                from _win32 import set_window_rounded, set_window_acrylic
+                h = self._hwnd()
+                if h:
+                    set_window_rounded(h)
+                    set_window_acrylic(h, rgba=(11, 14, 20, 210))
+            except Exception:
+                pass
+        _try()
         self.root.after(50, _try)
 
     def _raise_top(self):
