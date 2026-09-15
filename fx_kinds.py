@@ -27,24 +27,18 @@ EFFECTS = {
     "落樱":     dict(cat="全屏特效", layer="fullscreen", enable="petal_enabled"),
     "流星雨":   dict(cat="全屏特效", layer="fullscreen", enable="meteor_enabled"),
     # ---- 鼠标特效：由光标位置/动作驱动 ----
-    # 鼠标层特效全部依赖浮在最上层：聚光灯压暗全屏、真实水波抓屏折射、颜料盘
-    # 跟随光标作画、涟漪 / 窗口水波在光标处扩散 —— 沉到桌面层（壁纸之下）会被
-    # 所有窗口挡死、等于隐形。故 behind_ok=False：该层不允许「仅桌面图层」档。
-    "聚光灯":   dict(cat="鼠标特效", layer="mouse", enable="spotlight_enabled",
-                   behind_ok=False),
-    "颜料盘":   dict(cat="鼠标特效", layer="mouse", enable="paint_enabled",
-                   behind_ok=False),
+    # 这一层的特效普遍依赖浮在最上层（聚光灯压暗全屏、真实水波抓屏折射），
+    # 选了「仅桌面图层」后会被窗口遮住 —— 那是该档位的语义，不是故障。
+    "聚光灯":   dict(cat="鼠标特效", layer="mouse", enable="spotlight_enabled"),
+    "颜料盘":   dict(cat="鼠标特效", layer="mouse", enable="paint_enabled"),
     # 涟漪有主开关 ripple_enabled（"跟随移动 / 点击扩散"只是它的两种触发方式），
     # 否则它在配置里恒为"开着"，同类互斥会一直把它当占用者、把别的特效顶掉。
-    "涟漪":     dict(cat="鼠标特效", layer="mouse", enable="ripple_enabled",
-                   behind_ok=False),
-    "真实水波": dict(cat="鼠标特效", layer="mouse", enable="wave_enabled",
-                   behind_ok=False),
+    "涟漪":     dict(cat="鼠标特效", layer="mouse", enable="ripple_enabled"),
+    "真实水波": dict(cat="鼠标特效", layer="mouse", enable="wave_enabled"),
     # ---- 其他特效：既不由鼠标驱动，也不是整屏氛围 ----
     # 窗口水波画进**鼠标层**：它复用的是涟漪池（RippleField），而涟漪池整体
     # 画在鼠标层上 —— 拆成两层会让窗口水波和鼠标涟漪打架（同一池子只能画一处）。
-    "窗口水波": dict(cat="其他特效", layer="mouse", enable="win_ripple_enabled",
-                   behind_ok=False),
+    "窗口水波": dict(cat="其他特效", layer="mouse", enable="win_ripple_enabled"),
 }
 
 # 层 -> (层级配置键, 多开配置键)
@@ -128,28 +122,6 @@ def layer_key_of(page):
     if layer is None:
         return None
     return LAYER_KEYS[layer][0]
-
-
-# 配置键 -> 渲染层槽位（"layer_mouse" -> "mouse"）。UI 拿到的是配置键，
-# 判定该层能否沉到桌面层需要槽位，所以这里反向建一张表。
-_KEY_TO_SLOT = {v[0]: s for s, v in LAYER_KEYS.items()}
-
-
-def layer_slot_of_key(key):
-    return _KEY_TO_SLOT.get(key)
-
-
-def layer_supports_desktop(layer):
-    """该渲染层是否允许切到「仅桌面图层」。
-
-    仅当该层内**每个**特效都能沉到壁纸之下还看得见才允许。鼠标层特效
-    （聚光灯压暗全屏 / 真实水波抓屏折射 / 颜料盘 / 涟漪 / 窗口水波）全部依赖
-    浮在最上层，沉下去会被所有窗口挡死、等于隐形 —— 用户一旦切过去就"看不到
-    效果"，却找不到原因。所以该层永远不允许这一档，从根上堵死这个无效状态，
-    而不是等用户切了再补救。
-    """
-    return all(info.get("behind_ok", True)
-               for _, info in EFFECTS.items() if info.get("layer") == layer)
 
 
 def nav_order():

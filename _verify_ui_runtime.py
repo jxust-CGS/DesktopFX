@@ -113,11 +113,9 @@ def main():
     assert app.cfg["layer_fullscreen"] == "desktop", app.cfg["layer_fullscreen"]
     p._ctrls["layer_fullscreen"]["on"](False)
     assert app.cfg["layer_fullscreen"] == "topmost"
-    # 鼠标层不支持桌面档（根因修复）：即便 cfg 写成 desktop，UI 也只认最上层
-    assert p._ctrls["layer_mouse"]["supports_desktop"] is False
     app.cfg["layer_mouse"] = "desktop"          # cfg -> UI 的同步方向
     p._sync_from_cfg()
-    assert p._ctrls["layer_mouse"]["var"].get() is False
+    assert p._ctrls["layer_mouse"]["var"].get() is True
     app.cfg["layer_mouse"] = "topmost"
     p._sync_from_cfg()
     assert p._ctrls["layer_mouse"]["var"].get() is False

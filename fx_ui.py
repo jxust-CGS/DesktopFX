@@ -229,7 +229,7 @@ class _Toggle(tk.Canvas):
     H = 22
     R = 9
 
-    def __init__(self, parent, variable, command=None, disabled=False, **kw):
+    def __init__(self, parent, variable, command=None, **kw):
         kw.setdefault("highlightthickness", 0)
         kw.setdefault("bd", 0)
         kw.setdefault("bg", CARD)
@@ -238,15 +238,12 @@ class _Toggle(tk.Canvas):
         super().__init__(parent, **kw)
         self.var = variable
         self.command = command
-        self.disabled = disabled
         self._img = None  # 持有 PhotoImage 引用，防止被 GC
         self.bind("<Button-1>", self._toggle)
         self.var.trace_add("write", lambda *a: self._redraw())
         self._redraw()
 
     def _toggle(self, _e):
-        if self.disabled:
-            return
         self.var.set(not self.var.get())
         if self.command:
             self.command(self.var.get())
@@ -254,15 +251,9 @@ class _Toggle(tk.Canvas):
     def _redraw(self):
         self.delete("all")
         on = bool(self.var.get())
-        dis = self.disabled
-        # 禁用态：无论开关位置都画成静音的"关"外观（灰描边、灰旋钮）
-        pill_fill = ACCENT if (on and not dis) else TRACK
-        pill_outline = None if (on and not dis) else LINE
-        knob_fill = WHITE if (on and not dis) else SUB
-        if dis:
-            pill_fill = LINE
-            pill_outline = None
-            knob_fill = SUB
+        pill_fill = ACCENT if on else TRACK
+        pill_outline = None if on else LINE
+        knob_fill = WHITE if on else SUB
         w, h = self.W, self.H
         cy = h // 2
         ss = _AA_SS
@@ -1334,23 +1325,12 @@ class ControlPanel:
         关＝最上层（默认），开＝仅桌面图层。两侧文字跟着开关染色，不用点开
         就知道当前在哪一档。
 
-        根因修复（见 fx_kinds.layer_supports_desktop）：鼠标层特效全部依赖浮在
-        最上层（聚光灯压暗全屏 / 真实水波抓屏折射 / 颜料盘 / 涟漪 / 窗口水波），
-        一旦沉到桌面层（壁纸之下）就会被所有窗口挡死、等于隐形。所以这一层**根本
-        不提供「仅桌面图层」档**——开关置灰、点击无效，而不是让用户切过去后
-        对着一个"看不到效果"的窗口发懵。全屏层（雨/雪/落樱/流星雨）挂在壁纸上
-        本就可见，仍保留该档。
+        「仅桌面图层」= 把这一层画到壁纸层上（SetParent 到 WorkerW）。它会被
+        任何窗口遮住，所以"桌面被窗口盖满时看不见"是这一档的正常表现。真正会
+        坏的是挂载本身 —— SetParent 会废掉分层表面，见
+        fx_winlayer.Overlay._rebuild_layered_surface。
         """
         app = self.app
-        slot = fx_kinds.layer_slot_of_key(key)
-        supports = fx_kinds.layer_supports_desktop(slot)
-        # 历史配置若把"不支持桌面档"的层写成了 desktop，归一化回最上层，
-        # 否则渲染循环会把这个特效塞进一个永远看不见的窗口。
-        if not supports and app.cfg.get(key) == fx_kinds.LAYER_DESKTOP:
-            app.cfg[key] = fx_kinds.LAYER_TOPMOST
-            app.snapshot[key] = fx_kinds.LAYER_TOPMOST
-            app._autosave_dirty = True
-
         row = tk.Frame(parent, bg=CARD)
         row.pack(fill="x", padx=16, pady=8)
         tk.Label(row, text=label, bg=CARD, fg=TEXT,
@@ -1360,68 +1340,27 @@ class ControlPanel:
         lbl_desk = tk.Label(right, text="仅桌面图层", bg=CARD, fg=SUB,
                             font=FONT_SMALL)
         lbl_desk.pack(side="right", padx=(8, 0))
-        # 不支持桌面档：该选项置灰并挂提示，说明为什么不能选
-        if not supports:
-            lbl_desk.config(fg=SUB)
-            self._mk_tooltip(
-                lbl_desk,
-                "鼠标层特效需浮在最上层才看得见（聚光灯/真实水波/颜料盘/涟漪），"
-                "沉到桌面层会被窗口挡住，故不提供此档。")
-
-        var = tk.BooleanVar(value=False if not supports
-                            else str(app.cfg.get(key)) == "desktop")
+        var = tk.BooleanVar(value=str(app.cfg.get(key)) == "desktop")
 
         def repaint():
             on = bool(var.get())
-            if not supports:
-                lbl_top.config(fg=ACCENT)      # 唯一可用档，恒高亮
-                lbl_desk.config(fg=SUB)        # 不可用档，静音
-                return
             lbl_top.config(fg=ACCENT if not on else SUB)
             lbl_desk.config(fg=ACCENT if on else SUB)
 
         def _on(v):
-            if not supports:
-                return  # 该层根本不支持桌面档，忽略任何切过去的尝试
             app.set(key, "desktop" if v else "topmost")
             repaint()
 
-        _Toggle(right, var, command=_on, disabled=not supports).pack(
-            side="right", padx=8)
+        _Toggle(right, var, command=_on).pack(side="right", padx=8)
         lbl_top = tk.Label(right, text="最上层", bg=CARD, fg=ACCENT,
                            font=FONT_SMALL)
         lbl_top.pack(side="right")
         repaint()
         # 注册写入回调：测试可以直接驱动开关，不必去翻 widget 树
         self._ctrls[key] = {"kind": "layer", "var": var, "repaint": repaint,
-                            "on": _on, "supports_desktop": supports}
+                            "on": _on}
 
     # ------------------------------------------------------------ 控件原语
-    def _mk_tooltip(self, widget, text):
-        """给控件挂一个轻量悬浮提示（无第三方依赖）。"""
-        tip = [None]
-
-        def enter(e):
-            if tip[0]:
-                return
-            x = e.widget.winfo_rootx() + 12
-            y = e.widget.winfo_rooty() + e.widget.winfo_height() + 2
-            t = tk.Toplevel(e.widget)
-            t.wm_overrideredirect(True)
-            t.wm_geometry(f"+{x}+{y}")
-            tk.Label(t, text=text, bg="#222222", fg="#ffffff",
-                     font=FONT_SMALL, padx=6, pady=3,
-                     relief="flat", borderwidth=0).pack()
-            tip[0] = t
-
-        def leave(_e):
-            if tip[0]:
-                tip[0].destroy()
-                tip[0] = None
-
-        widget.bind("<Enter>", enter)
-        widget.bind("<Leave>", leave)
-
     def _toggle(self, parent, label, key):
         """通用开关行：名称 …… 开关（开/关）。"""
         app = self.app
@@ -1564,10 +1503,7 @@ class ControlPanel:
             elif c["kind"] == "toggle":
                 c["var"].set(bool(v))
             elif c["kind"] == "layer":   # 层级是字符串键，开关只反映"是否桌面层"
-                # 不支持桌面档的层（鼠标层）即使 cfg 里是 desktop 也不能拨到开，
-                # 否则会绕过开关的禁用态，重新制造"特效沉到桌面层看不见"的无效状态。
-                c["var"].set(bool(c.get("supports_desktop", True))
-                            and str(v) == "desktop")
+                c["var"].set(str(v) == "desktop")
                 c["repaint"]()
         for refresh in self._swatches.values():
             refresh()

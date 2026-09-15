@@ -657,6 +657,22 @@ class Overlay:
                                 | SWP_NOOWNERZORDER | SWP_SHOWWINDOW)
         return mode
 
+    def _rebuild_layered_surface(self):
+        """重装 WS_EX_LAYERED，迫使系统重建分层表面。
+
+        **SetParent 会把分层表面弄死**（真机实测，2026-09-15）：
+        把分层窗口挂成 WorkerW 的子窗口（或摘回来）之后，UpdateLayeredWindow
+        依旧返回成功，IsWindowVisible / 屏幕矩形 / WS_EX_TOPMOST 全部正常，
+        但窗口**再也不出现在屏幕上** —— 用户看到的就是"切到桌面层后特效消失，
+        切回最上层也恢复不了"。把 WS_EX_LAYERED 摘掉再装回去，系统会重建分层
+        表面，画面立刻回来（实测：0/6 → 6/6 采样点可见）。
+
+        挂载 / 解挂之后都必须走一遍：两个方向都是 SetParent，同一条根因。
+        """
+        ex = user32.GetWindowLongW(self.hwnd, GWL_EXSTYLE)
+        user32.SetWindowLongW(self.hwnd, GWL_EXSTYLE, ex & ~WS_EX_LAYERED)
+        user32.SetWindowLongW(self.hwnd, GWL_EXSTYLE, ex)
+
     def _attach_desktop(self):
         """挂到桌面壁纸层。任一前提不满足就返回 False（由调用方降级）：
 
@@ -691,6 +707,7 @@ class Overlay:
         if hwnd_int(user32.GetParent(self.hwnd)) != workerw:
             user32.SetParent(self.hwnd, None)
             user32.SetWindowLongW(self.hwnd, GWL_STYLE, style)
+            self._rebuild_layered_surface()   # 这一步的 SetParent 也会废掉分层表面
             return False
         self._parented = True
         # 子窗口坐标相对父窗口**客户区**：WorkerW 的客户区原点通常就是虚拟屏
@@ -702,6 +719,8 @@ class Overlay:
                             self.w, self.h,
                             SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW
                             | SWP_NOCOPYBITS | SWP_NOOWNERZORDER)
+        # SetParent 之后必须重建分层表面，否则窗口再也不上屏（见该方法注释）
+        self._rebuild_layered_surface()
         return True
 
     def _detach_parent(self):
@@ -719,6 +738,8 @@ class Overlay:
         user32.SetWindowPos(self.hwnd, None, self.x, self.y, self.w, self.h,
                             SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW
                             | SWP_NOCOPYBITS | SWP_NOOWNERZORDER)
+        # 与挂载对称：这里的 SetParent 同样会废掉分层表面（见该方法注释）
+        self._rebuild_layered_surface()
 
     def place_above(self, other_hwnd):
         """把本窗口插到另一个窗口的**正上方**（只在最上层模式下有意义）。

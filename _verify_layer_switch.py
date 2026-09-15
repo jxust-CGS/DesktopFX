@@ -102,6 +102,38 @@ def _wait_desktop_settled(ov, timeout=8.0):
     return _wait(ok, timeout=timeout)
 
 
+def _probe_fs_visible(ov_fs, seconds=0.45):
+    """把全屏层缓冲刷成不透明品红，上屏后把**屏幕像素**读回来。
+
+    返回 (命中数, 采样数)。这是唯一能抓住"窗口在、标志位全对、但屏幕上没有它"
+    的判据 —— 读窗口状态（可见性 / 矩形 / 置顶位 / 父亲）一律查不出来。
+    """
+    import fx_scene
+
+    orig = fx_scene.Scene.step
+
+    def _solid(sc, dt, u32, w, h, u32_mouse=None):
+        u32[:] = 0xFFFF00FF          # DIB 里的 0xAARRGGBB = 不透明品红
+        if u32_mouse is not None:
+            u32_mouse[:] = 0
+
+    fx_scene.Scene.step = _solid
+    try:
+        time.sleep(seconds)          # 让渲染循环把这一帧合成并上屏
+        hdc = fw.user32.GetDC(None)
+        try:
+            vx, vy, vw, vh = fw.virtual_screen()
+            pts = [(vx + int(vw * f), vy + int(vh * g))
+                   for f in (0.15, 0.5, 0.85) for g in (0.25, 0.5, 0.75)]
+            hits = sum(1 for x, y in pts
+                       if fw.gdi32.GetPixel(hdc, x, y) == 0x00FF00FF)
+        finally:
+            fw.user32.ReleaseDC(None, hdc)
+    finally:
+        fx_scene.Scene.step = orig
+    return hits, len(pts)
+
+
 def _labels_of(page):
     """按创建顺序收集页面里的 Label 文本，用于检查开关两侧的染色。"""
     out = []
@@ -292,124 +324,45 @@ def test_ui_toggle_writes_cfg_and_snapshot():
             tg = _find_toggle(panel._pages["其它"], ctrl["on"])
             if tg is None:
                 return False, f"{key} 这一行没有可点击的胶囊开关"
-            supports = ctrl["supports_desktop"]
 
-            if supports:
-                # 支持桌面档：点击能切过去、也能切回来
-                tg._toggle(None)                  # 开 = 仅桌面图层
-                if not ctrl["var"].get():
-                    return False, f"{key} 点击后开关变量仍是关"
-                if app.cfg[key] != fx_kinds.LAYER_DESKTOP:
-                    return False, f"{key} 开关打开后 cfg 是 {app.cfg[key]!r}"
-                if app.snapshot.get(key) != fx_kinds.LAYER_DESKTOP:
-                    return False, (f"{key} 改了 cfg 但 snapshot 没跟上"
-                                   f"（渲染线程读 snapshot，会表现为开关无效）")
-                if tops[idx].cget("fg") == fx_ui.ACCENT:
-                    return False, f"{key} 切到桌面层后「最上层」仍被高亮"
-                if desks[idx].cget("fg") != fx_ui.ACCENT:
-                    return False, f"{key} 切到桌面层后「仅桌面图层」没被高亮"
-                tg._toggle(None)                  # 关 = 最上层
-                if ctrl["var"].get():
-                    return False, f"{key} 再点一次开关变量仍是开"
-                if app.cfg[key] != fx_kinds.LAYER_TOPMOST:
-                    return False, f"{key} 开关关闭后 cfg 是 {app.cfg[key]!r}"
-                if app.snapshot.get(key) != fx_kinds.LAYER_TOPMOST:
-                    return False, f"{key} 切回最上层后 snapshot 没跟上"
-                if tops[idx].cget("fg") != fx_ui.ACCENT:
-                    return False, f"{key} 切回最上层后「最上层」没被高亮"
-                if desks[idx].cget("fg") == fx_ui.ACCENT:
-                    return False, f"{key} 切回最上层后「仅桌面图层」仍被高亮"
-            else:
-                # 不支持桌面档（鼠标层）：开关禁用，点击无效，cfg 恒为最上层。
-                # 这正是根因修复 —— 不让用户切进一个"特效被窗口挡死、看不见"的档。
-                if not tg.disabled:
-                    return False, f"{key} 不支持桌面档却没把开关置灰"
-                tg._toggle(None)                  # 点了也白点
-                if ctrl["var"].get():
-                    return False, f"{key} 禁用开关被点击后竟变成开"
-                if app.cfg[key] != fx_kinds.LAYER_TOPMOST:
-                    return False, f"{key} 禁用档下 cfg 不是最上层：{app.cfg[key]!r}"
-                if app.snapshot.get(key) != fx_kinds.LAYER_TOPMOST:
-                    return False, f"{key} 禁用档下 snapshot 不是最上层"
-                if tops[idx].cget("fg") != fx_ui.ACCENT:
-                    return False, f"{key} 禁用档下「最上层」没恒高亮"
-                if desks[idx].cget("fg") == fx_ui.ACCENT:
-                    return False, f"{key} 禁用档下「仅桌面图层」竟被高亮"
+            tg._toggle(None)                      # 开 = 仅桌面图层
+            if not ctrl["var"].get():
+                return False, f"{key} 点击后开关变量仍是关"
+            if app.cfg[key] != fx_kinds.LAYER_DESKTOP:
+                return False, f"{key} 开关打开后 cfg 是 {app.cfg[key]!r}"
+            if app.snapshot.get(key) != fx_kinds.LAYER_DESKTOP:
+                return False, (f"{key} 改了 cfg 但 snapshot 没跟上"
+                               f"（渲染线程读 snapshot，会表现为开关无效）")
+            if tops[idx].cget("fg") == fx_ui.ACCENT:
+                return False, f"{key} 切到桌面层后「最上层」仍被高亮"
+            if desks[idx].cget("fg") != fx_ui.ACCENT:
+                return False, f"{key} 切到桌面层后「仅桌面图层」没被高亮"
+
+            tg._toggle(None)                      # 关 = 最上层
+            if ctrl["var"].get():
+                return False, f"{key} 再点一次开关变量仍是开"
+            if app.cfg[key] != fx_kinds.LAYER_TOPMOST:
+                return False, f"{key} 开关关闭后 cfg 是 {app.cfg[key]!r}"
+            if app.snapshot.get(key) != fx_kinds.LAYER_TOPMOST:
+                return False, f"{key} 切回最上层后 snapshot 没跟上"
+            if tops[idx].cget("fg") != fx_ui.ACCENT:
+                return False, f"{key} 切回最上层后「最上层」没被高亮"
+            if desks[idx].cget("fg") == fx_ui.ACCENT:
+                return False, f"{key} 切回最上层后「仅桌面图层」仍被高亮"
 
         # 反向：cfg 被外部改（预设 / 手改文件）后面板要跟着走
-        # 鼠标层不支持桌面档：即便 cfg 写成 desktop，面板也只认最上层（根因修复）
         app.cfg["layer_mouse"] = fx_kinds.LAYER_DESKTOP
         panel._sync_from_cfg()
-        if panel._ctrls["layer_mouse"]["var"].get() is not False:
-            return False, "鼠标层 cfg=desktop，面板开关竟被拨到桌面档（应禁用）"
-        # 全屏层仍正常同步
-        app.cfg["layer_fullscreen"] = fx_kinds.LAYER_DESKTOP
-        panel._sync_from_cfg()
-        if panel._ctrls["layer_fullscreen"]["var"].get() is not True:
-            return False, "全屏层 cfg=desktop 没同步成桌面档"
+        if panel._ctrls["layer_mouse"]["var"].get() is not True:
+            return False, "cfg → 面板方向没同步（开关没被拨到桌面层）"
         # 脏值进 cfg 时面板不能假装它是桌面层
-        app.cfg["layer_fullscreen"] = "Desktop"
+        app.cfg["layer_mouse"] = "Desktop"
         panel._sync_from_cfg()
-        if panel._ctrls["layer_fullscreen"]["var"].get() is not False:
+        if panel._ctrls["layer_mouse"]["var"].get() is not False:
             return False, "cfg 里的脏值被面板当成了桌面层"
     finally:
         panel.root.destroy()
     return True, "两个开关点击后都写回 cfg + snapshot，染色双向正确，脏值不误判"
-
-
-# ------------------------------------------------------------------ 5b. 档位分级禁用（根因修复回归）
-def test_layer_desktop_option_gated_for_mouse():
-    """根因修复回归：鼠标层特效全依赖浮在最上层，其「仅桌面图层」档必须禁用。
-
-    - fx_kinds.layer_supports_desktop 对 fullscreen=True / mouse=False；
-    - 面板上鼠标层开关 disabled=True、全屏层 disabled=False；
-    - 历史 config 把 layer_mouse 写成 desktop 时，建面板应归一化回最上层。
-    这条补的是"用户一切换就看不到效果"的根因：鼠标层根本不该提供这档。
-    """
-    if not fx_kinds.layer_supports_desktop("fullscreen"):
-        return False, "全屏层本应允许桌面档，却被判为不支持"
-    if fx_kinds.layer_supports_desktop("mouse"):
-        return False, ("鼠标层含聚光灯/真实水波等必须在最上层的特效，"
-                       "不应允许桌面档")
-
-    # 模拟历史脏配置：鼠标层曾被写成 desktop
-    app = d.App()
-    app.cfg["layer_mouse"] = fx_kinds.LAYER_DESKTOP
-    app.snapshot = dict(app.cfg)
-    panel = fx_ui.ControlPanel(app)
-    try:
-        panel._show_page("其它")
-        panel.root.update_idletasks()
-        # 归一化：建面板后鼠标层应回到最上层
-        if app.cfg["layer_mouse"] != fx_kinds.LAYER_TOPMOST:
-            return False, (f"历史 layer_mouse=desktop 没被归一化，仍是 "
-                           f"{app.cfg['layer_mouse']!r}")
-        if app.snapshot.get("layer_mouse") != fx_kinds.LAYER_TOPMOST:
-            return False, "归一化没同步到 snapshot（渲染线程读 snapshot）"
-        ctrl_fs = panel._ctrls["layer_fullscreen"]
-        ctrl_ms = panel._ctrls["layer_mouse"]
-        if ctrl_fs["supports_desktop"] is not True:
-            return False, "全屏层开关不应被禁用"
-        if ctrl_ms["supports_desktop"] is not False:
-            return False, "鼠标层开关应为不支持桌面档"
-        tg_ms = _find_toggle(panel._pages["其它"], ctrl_ms["on"])
-        if tg_ms is None:
-            return False, "鼠标层没有可点击的胶囊开关"
-        if not tg_ms.disabled:
-            return False, "鼠标层「仅桌面图层」开关应当置灰"
-        tg_fs = _find_toggle(panel._pages["其它"], ctrl_fs["on"])
-        if tg_fs is None:
-            return False, "全屏层没有可点击的胶囊开关"
-        if tg_fs.disabled:
-            return False, "全屏层「仅桌面图层」开关不应被禁用"
-        # 点禁用的鼠标层开关：cfg 不动、var 不动
-        tg_ms._toggle(None)
-        if app.cfg["layer_mouse"] != fx_kinds.LAYER_TOPMOST:
-            return False, "点了禁用的鼠标层开关，cfg 竟被改动了"
-    finally:
-        panel.root.destroy()
-    return True, ("全屏层可切桌面档、鼠标层禁切；历史 layer_mouse=desktop "
-                  "已归一化回最上层")
 
 
 # ------------------------------------------------------------------ 6~10. 真机
@@ -601,6 +554,49 @@ def test_real_roundtrip_back_to_topmost(app):
     return True, "两层都还原为置顶独立窗口，矩形=虚拟屏，鼠标层重新压在全屏层之上"
 
 
+def test_real_roundtrip_still_visible_on_screen(app):
+    """往返切换后窗口必须**真的还在屏幕上** —— 这条专门盯 SetParent。
+
+    真机实测（2026-09-15）：把分层窗口 SetParent 到壁纸层（或摘回来）之后，
+    UpdateLayeredWindow 依旧返回成功，IsWindowVisible / 屏幕矩形 /
+    WS_EX_TOPMOST / 父亲 全部正常，但窗口**再也不出现在屏幕上** —— 用户看到
+    的就是"切到桌面层后特效消失，切回最上层也恢复不了"。
+
+    这正是"只查窗口状态查不出来"的那类 bug：旧用例把可见性、矩形、置顶位、
+    所有权都查了一遍仍然全绿。所以这里必须把像素从屏幕上读回来。
+    """
+    ov_fs = app.overlays[0]
+    app.snapshot = dict(app.snapshot,
+                        layer_fullscreen=fx_kinds.LAYER_TOPMOST)
+    if not _wait(lambda: ov_fs.z_mode == fx_kinds.LAYER_TOPMOST):
+        return False, f"全屏层没回到最上层：{ov_fs.z_mode}"
+    base_hits, total = _probe_fs_visible(ov_fs)
+    if base_hits <= 0:
+        # 最上层都看不见，说明环境里有别的置顶窗压在采样点上 —— 结论不成立，
+        # 别报假失败（真机上确实可能发生）
+        return None, (f"环境里另有置顶窗遮挡（基线 {base_hits}/{total}），"
+                      f"无法判定")
+
+    app.snapshot = dict(app.snapshot,
+                        layer_fullscreen=fx_kinds.LAYER_DESKTOP)
+    if not _wait_desktop_settled(ov_fs):
+        return False, (f"全屏层没落到桌面层：矩形 {_screen_rect(ov_fs.hwnd)}"
+                       f" 虚拟屏 {fw.virtual_screen()}")
+    app.snapshot = dict(app.snapshot,
+                        layer_fullscreen=fx_kinds.LAYER_TOPMOST)
+    if not _wait(lambda: ov_fs.z_mode == fx_kinds.LAYER_TOPMOST):
+        return False, f"全屏层没切回最上层：{ov_fs.z_mode}"
+
+    hits, total = _probe_fs_visible(ov_fs)
+    if hits <= 0:
+        return False, (
+            f"往返切换后窗口报告自己在上屏，但屏幕上没有它（{hits}/{total} 采样点）"
+            f"—— SetParent 废掉了分层表面，"
+            f"见 fx_winlayer.Overlay._rebuild_layered_surface")
+    return True, (f"最上层 ⇄ 仅桌面图层 往返后仍真实可见"
+                  f"（{hits}/{total} 采样点读到颜色，基线 {base_hits}/{total}）")
+
+
 def test_real_desktop_layer_survives_rebuild():
     """桌面层是 WorkerW 的子窗口，资源管理器重启会连它一起销毁。
 
@@ -697,7 +693,6 @@ def main():
     run("档位落盘与回读", test_config_persist)
     run("旧配置缺键向后兼容", lambda: test_config_backward_compat(tmp_factory))
     run("界面开关写回 cfg+snapshot", test_ui_toggle_writes_cfg_and_snapshot)
-    run("鼠标层桌面档被禁用（根因修复）", test_layer_desktop_option_gated_for_mouse)
 
     loop = Loop()
     try:
@@ -711,6 +706,8 @@ def main():
             run("混合档位互不干扰", lambda: test_real_mixed_modes(app))
             run("桌面层不参与抢顶", lambda: test_real_desktop_skips_raise(app))
             run("切回最上层完全还原", lambda: test_real_roundtrip_back_to_topmost(app))
+            run("往返后仍真实上屏（屏幕像素）",
+                lambda: test_real_roundtrip_still_visible_on_screen(app))
     finally:
         loop.stop()
 
