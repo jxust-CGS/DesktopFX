@@ -7,7 +7,7 @@
 桌面特效脚本大多要建真窗口、动真 z 序，同样经不起并行。
 
 用法（按改动范围选，别一律跑全量）：
-    python _run_all_verify.py --fast     # 核心回归，约 1 分钟 —— 日常收尾默认用这个
+    python _run_all_verify.py --fast     # 核心回归，约 1.5 分钟 —— 日常收尾默认用这个
     python _run_all_verify.py --skip-slow  # 全部但要略过已知慢的，约 3 分钟
     python _run_all_verify.py            # 全部，约 11 分钟（含性能/长跑基准）
 
@@ -21,13 +21,15 @@ import subprocess
 import sys
 import time
 
-# 核心回归：覆盖"改了容易坏、坏了用户立刻能看出来"的那几块，约 1 分钟。
+# 核心回归：覆盖"改了容易坏、坏了用户立刻能看出来"的那几块，约 1.5 分钟。
 FAST = [
     "_verify_kinds.py",          # 特效分类表自洽（2s）
     "_verify_zorder.py",         # 置顶保活 / 插入锚点（9s）
     "_verify_layer_switch.py",    # 层级开关端到端（34s）
     "_verify_taskbar.py",        # 避让任务栏（4s）
     "_verify_ui_runtime.py",      # 面板运行时冒烟（8s）
+    "_verify_ui_resize.py",       # 窗口可缩放 / 尺寸记忆 / 提示迁移（16s）
+    "_verify_layer_skip.py",      # 层判空的安全不变量，无窗口（22s）
     "_verify_startup_noflicker.py",  # 启动无闪动：构造期全程隐藏（1s）
 ]
 
@@ -41,6 +43,7 @@ SLOW = [
     "_verify_tray.py",           # 真机拉起程序（39s）
     "_verify_wave.py",           # 32s
     "_verify_launcher.py",       # 真机拉起程序（12s）
+    "_verify_render_loop.py",    # 真实渲染循环的阶段耗时拆解（10s，只测不判，人工看）
 ]
 
 

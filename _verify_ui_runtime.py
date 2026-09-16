@@ -6,6 +6,14 @@ import tkinter as tk
 import desktop_fx as d
 import fx_ui
 
+# 隔离 UI 状态文件。这两个脚本原来直接 os.remove(fx_ui._UI_STATE_PATH) 来
+# "清理测试痕迹"，而 ui_state.json 现在装的是**用户真实记住的窗口尺寸和上次
+# 停留页** —— 跑一次测试就把用户设置清掉了。改成写临时文件。
+import os as _os2
+import tempfile as _tf
+fx_ui._UI_STATE_PATH = _os2.path.join(_tf.mkdtemp(prefix="fx_uistate_"),
+                                      "ui_state.json")
+
 
 class _StubApp:
     def __init__(self):
@@ -148,6 +156,17 @@ def main():
     p._show_page("颜料盘")
     p.root.geometry(f"{p.W}x620")
     p.root.update_idletasks()
+    # 压矮之后**必须把布局跑完再发滚轮**：update_idletasks 只跑空闲任务、不处理
+    # 窗口的 Configure，内容区的实际高度这时还是压矮前的旧值。
+    # （早先这里不 update 也能过，是因为内容区恰好停在更早一代的旧高度 —— 742
+    #  那一版 —— 比滚动区矮，于是"滚得动"。那是巧合，不是这条断言想验的东西。
+    #  窗口支持缩放之后内容区会及时跟上窗口尺寸，量到的就是"装得下"，此时滚不
+    #  动反而是正确的。所以这里补一次 update，把断言钉在"布局落定后的真实状态"。）
+    p.root.update()
+    assert p._canvas.winfo_height() < p._pages["颜料盘"].winfo_reqheight(), (
+        "压矮后内容区仍没跟上窗口尺寸："
+        f"{p._canvas.winfo_height()} vs "
+        f"{p._pages['颜料盘'].winfo_reqheight()}")
     assert p._need_scroll(), "压矮窗口后颜料盘页应当需要滚动"
     deep = p._pages["颜料盘"]
     for _ in range(6):

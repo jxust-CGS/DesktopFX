@@ -15,6 +15,13 @@ import tkinter as tk
 import desktop_fx as d
 import fx_ui
 
+# 隔离 UI 状态文件：脚本末尾会 os.remove 它来"清理"，而 ui_state.json 现在
+# 装着用户真实记住的窗口尺寸与上次停留页，不能拿用户的文件做清理对象。
+import os as _os0
+import tempfile as _tf0
+fx_ui._UI_STATE_PATH = _os0.path.join(_tf0.mkdtemp(prefix="fx_uistate_"),
+                                      "ui_state.json")
+
 _FLUSH_STATES = []
 
 

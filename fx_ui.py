@@ -453,9 +453,18 @@ class _NavIcon(tk.Canvas):
 
 # ------------------------------------------------------------------ 面板
 class ControlPanel:
-    W, H = 564, 742
-    _MIN_H = 520            # 窗口最小高度（内容再少也别比这矮）
-    _SCREEN_FRAC = 0.92     # 窗口最高不超过屏幕高度的这个比例
+    W_DEF, H_DEF = 564, 742   # 首次运行时的窗口尺寸（高度随后按内容自适应）
+    # 最小宽度不由"好看"决定，而由布局本身决定：逐页量过自然宽度（reqwidth），
+    # 最宽的一行是「落樱」的颜色行（长标签"边缘颜色(翻面泛白)" + 6 个色块 +
+    # 调色/取色），336 内容宽 + 卡片与页面留白 64 = 400，加侧栏 120 就是 520。
+    # 再窄这行就会被挤掉一部分（Tk 的 Label 不换行、也不缩，超出部分直接被裁）。
+    # _verify_ui_resize.py 第 8 组断言把这条钉死：W_MIN 下不许有任何一页被挤。
+    W_MIN = 520
+    H_MIN = 420               # 最小高度：再矮就只剩两三行设置
+    _SCREEN_FRAC = 0.92       # 窗口不超过屏幕的这个比例
+    _CHROME = 42              # 标题栏高度：内容区 = 窗口高 − 它
+    GRIP = 6                  # 边缘缩放手柄厚度
+    GRIP_CORNER = 12          # 角落缩放手柄边长
 
     def __init__(self, app):
         self.app = app
@@ -471,6 +480,20 @@ class ControlPanel:
         self.root.attributes("-alpha", 0.97)
         self.root.attributes("-topmost", True)
         self._drag = (0, 0)
+        self._rz = None         # 正在拖拽的缩放手柄方向（None = 没在缩放）
+        self._hints = []        # 说明文字 Label：窗口宽度变了要重算折行宽度
+        self._size_rows = {}    # "win_w"/"win_h" -> {"var","label"}（窗口尺寸数值行）
+        self._grip = {}         # 边缘/角落缩放手柄
+        self._chrome = self._CHROME
+
+        # 窗口尺寸属于**界面偏好**（不是特效配置），和"上次停留的页面"一起放
+        # ui_state.json。特效配置 config.json 会被预设批量改写，尺寸混进去会
+        # 被预设顺手改掉。
+        self._ui = self._read_ui_state()
+        self._user_w = self._ui_int("win_w")   # None = 没自定义过，用默认值
+        self._user_h = self._ui_int("win_h")   # None = 高度按内容自适应
+        self.W = self._clamp_w(self._user_w or self.W_DEF)
+        self.H = self._clamp_h(self._user_h or self.H_DEF)
 
         # 控件注册表：用于预设切换时就地刷新
         self._ctrls = {}        # key -> {"kind","var",...}
@@ -494,12 +517,224 @@ class ControlPanel:
         self.root.lift()
 
     # ------------------------------------------------------------ 窗口
-    def _center(self):
+    def _center_xy(self, w, h):
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
-        x = max(0, (sw - self.W) // 2)
-        y = max(0, (sh - self.H) // 2 - 20)
+        return max(0, (sw - w) // 2), max(0, (sh - h) // 2 - 20)
+
+    def _center(self):
+        x, y = self._center_xy(self.W, self.H)
         self.root.geometry(f"{self.W}x{self.H}+{x}+{y}")
+
+    def _cap_w(self):
+        return max(self.W_MIN, int(self.root.winfo_screenwidth() * self._SCREEN_FRAC))
+
+    def _cap_h(self):
+        return max(self.H_MIN, int(self.root.winfo_screenheight() * self._SCREEN_FRAC))
+
+    def _clamp_w(self, w):
+        return int(max(self.W_MIN, min(int(w), self._cap_w())))
+
+    def _clamp_h(self, h):
+        return int(max(self.H_MIN, min(int(h), self._cap_h())))
+
+    def _clamp_pos(self, x, y, w, h):
+        """窗口不许整个跑到虚拟桌面之外。
+
+        **不能用主屏尺寸当边界**：本机副屏在主屏左侧，虚拟桌面原点是
+        (-1920, 0)，窗口停在负坐标是正常的。winfo_vroot* 给的正是 Tk 自己
+        坐标系下的虚拟桌面范围，和 winfo_x() 同一套，可以直接比。
+        """
+        vx = self.root.winfo_vrootx()
+        vy = self.root.winfo_vrooty()
+        vw = self.root.winfo_vrootwidth()
+        vh = self.root.winfo_vrootheight()
+        return (min(max(int(x), vx), max(vx, vx + vw - w)),
+                min(max(int(y), vy), max(vy, vy + vh - h)))
+
+    def _apply_geometry(self, w, h):
+        """把窗口改成 w×h（夹取到合法范围）。
+
+        已经上屏时**保持左上角不动** —— 拖拽缩放时若重新居中，窗口会跟着手
+        乱跳。构造期窗口还在 withdraw（未上屏），此时才按屏幕居中。
+        """
+        w, h = self._clamp_w(w), self._clamp_h(h)
+        if self.root.winfo_ismapped():
+            x, y = self.root.winfo_x(), self.root.winfo_y()
+        else:
+            x, y = self._center_xy(w, h)
+        x, y = self._clamp_pos(x, y, w, h)
+        self.W, self.H = w, h
+        self.root.geometry(f"{w}x{h}+{x}+{y}")
+        self._apply_wraplength(w)
+        self._layout_grips(w, h)
+
+    # ------------------------------------------------------------ 拖拽缩放
+    _GRIP_CURSOR = {
+        "n": "sb_v_double_arrow", "s": "sb_v_double_arrow",
+        "w": "sb_h_double_arrow", "e": "sb_h_double_arrow",
+        "nw": "size_nw_se", "se": "size_nw_se",
+        "ne": "size_ne_sw", "sw": "size_ne_sw",
+    }
+
+    def _build_grips(self):
+        """窗口四边/四角的拖拽缩放手柄。
+
+        本窗口是 overrideredirect（无系统边框），Windows 不会给原生缩放边框，
+        只能自己铺 8 条细边。它们只占最外圈 6px（角落 12px），压在内容的外侧
+        留白上（内容两侧本来就有 16px padx），不会盖住任何控件；底色与窗口
+        一致，正常看不见，只靠鼠标形状提示。
+
+        位置每次尺寸变化时按实际宽高显式摆放（_layout_grips）——不依赖
+        place 的 relwidth/负 width 叠加语义，那套写法各版本 Tk 说法不一。
+        """
+        for edge in ("n", "s", "w", "e", "nw", "ne", "sw", "se"):
+            g = tk.Frame(self.root, bg=BG, cursor=self._GRIP_CURSOR[edge])
+            g.bind("<ButtonPress-1>",
+                   lambda e, k=edge: self._rz_begin(e, k))
+            g.bind("<B1-Motion>", self._rz_motion)
+            g.bind("<ButtonRelease-1>", self._rz_end)
+            self._grip[edge] = g
+        self._layout_grips(self.W, self.H)
+
+    def _layout_grips(self, w, h):
+        if not self._grip:
+            return
+        e, c = self.GRIP, self.GRIP_CORNER
+        w, h = int(w), int(h)
+        spots = {
+            "n":  (c, 0, w - 2 * c, e),
+            "s":  (c, h - e, w - 2 * c, e),
+            "w":  (0, c, e, h - 2 * c),
+            "e":  (w - e, c, e, h - 2 * c),
+            "nw": (0, 0, c, c),
+            "ne": (w - c, 0, c, c),
+            "sw": (0, h - c, c, c),
+            "se": (w - c, h - c, c, c),
+        }
+        for k, (x, y, gw, gh) in spots.items():
+            self._grip[k].place(x=max(0, x), y=max(0, y),
+                                width=max(1, gw), height=max(1, gh))
+
+    def _rz_begin(self, e, edge):
+        self._rz = (edge, e.x_root, e.y_root,
+                    self.root.winfo_x(), self.root.winfo_y(), self.W, self.H)
+        return "break"
+
+    def _rz_motion(self, e):
+        if not self._rz:
+            return
+        edge, x0, y0, wx, wy, w0, h0 = self._rz
+        dx, dy = e.x_root - x0, e.y_root - y0
+        left, top, w, h = wx, wy, w0, h0
+        if "e" in edge:
+            w = w0 + dx
+        if "w" in edge:
+            w = w0 - dx
+        if "s" in edge:
+            h = h0 + dy
+        if "n" in edge:
+            h = h0 - dy
+        # 先夹尺寸，再把"被拖的那条边"落到新位置 —— 对边必须钉住不动，
+        # 否则拖西边会让整窗平移（看着像在拖窗口而不是在改大小）。
+        w, h = self._clamp_w(w), self._clamp_h(h)
+        if "w" in edge:
+            left = wx + w0 - w
+        if "n" in edge:
+            top = wy + h0 - h
+        left, top = self._clamp_pos(left, top, w, h)
+        self.W, self.H = w, h
+        self.root.geometry(f"{w}x{h}+{left}+{top}")
+        self._apply_wraplength(w)
+        self._layout_grips(w, h)
+
+    def _rz_end(self, _e):
+        if not self._rz:
+            return
+        edge = self._rz[0]
+        self._rz = None
+        # 只记**真正被拖到的方向**：拖左右边时高度保持原模式（可能是"按内容
+        # 自适应"），不该因为顺手拖了宽度就把高度也钉死。
+        dims = []
+        if "e" in edge or "w" in edge:
+            dims.append("win_w")
+        if "n" in edge or "s" in edge:
+            dims.append("win_h")
+        self._remember_size(dims)
+
+    def _apply_wraplength(self, w):
+        """窗口宽度变了就重算说明文字的折行宽度。
+
+        `_hint` 的 wraplength 原来写死 372（对应窗口 564）。窗口能缩放之后，
+        写死的值在变宽时浪费空间（说明文字折成一堆短行）、变窄时溢出被裁。
+        按当前宽度实时算：卡片内可用宽 = 窗口 − 侧栏 120 − 页面留白 32 −
+        卡片内留白 32，再留 8px 余量，避免最后一个字单独折到下一行。
+        """
+        wl = max(160, int(w) - 192)
+        for lb in self._hints:
+            try:
+                lb.config(wraplength=wl)
+            except Exception:
+                pass
+        eb = getattr(self, "err_bar", None)
+        if eb is not None:
+            try:
+                eb.config(wraplength=max(160, int(w) - 20))
+            except Exception:
+                pass
+
+    def _set_size(self, win_w=None, win_h=None):
+        dims = []
+        if win_w is not None:
+            dims.append("win_w")
+        if win_h is not None:
+            dims.append("win_h")
+        self._apply_geometry(win_w if win_w is not None else self.W,
+                             win_h if win_h is not None else self.H)
+        self._remember_size(dims)
+
+    def _remember_size(self, dims=("win_w", "win_h")):
+        """把指定方向记为用户指定值，并落盘。
+
+        拖拽/拉滑块**结束**时才调用（不是每帧），避免移动过程中反复写文件。
+        """
+        if "win_w" in dims:
+            self._user_w = int(self.W)
+            self._ui["win_w"] = self._user_w
+        if "win_h" in dims:
+            self._user_h = int(self.H)
+            self._ui["win_h"] = self._user_h
+        self._save_ui_state()
+        self._sync_size_rows()
+
+    def _sync_size_rows(self):
+        for key, c in self._size_rows.items():
+            v = int(self.W if key == "win_w" else self.H)
+            try:
+                c["var"].set(float(v))
+                c["label"].config(text=f"{v} 像素")
+            except Exception:
+                pass
+
+    def _size_auto_h(self):
+        """高度回到"按内容自适应"（宽度仍记着当前值）。"""
+        self._user_h = None
+        self._ui.pop("win_h", None)
+        self._user_w = int(self.W)
+        self._ui["win_w"] = self._user_w
+        self._save_ui_state()
+        self._fit_height()
+        self._sync_size_rows()
+
+    def _size_reset(self):
+        """两个方向都回到默认：宽度用默认值，高度按内容自适应。"""
+        self._user_w = self._user_h = None
+        self._ui.pop("win_w", None)
+        self._ui.pop("win_h", None)
+        self.W, self.H = self.W_DEF, self.H_DEF
+        self._save_ui_state()
+        self._fit_height()
+        self._sync_size_rows()
 
     def _hwnd(self):
         """面板真正的顶层 hwnd。
@@ -561,7 +796,11 @@ class ControlPanel:
         # 两次之间的窗口期里会把面板压下去，面板一被压住就不能再给覆盖层当
         # 天花板 —— 覆盖层此时会退回"插到置顶组顶部"（见 Overlay._anchor），
         # 所以不再是硬依赖，但面板勤快一点能让"面板浮在特效之上"这件事更稳。
-        self.root.after(1000, self._raise_top)
+        # 退出中不再续期：窗口销毁后 Tcl 解释器还会把已排队的 after 跑一遍，
+        # 报一串 "invalid command name ..._raise_top"（验证脚本连开多个面板时
+        # 尤其吵），而且对一个正在关闭的面板去抢置顶本身也没意义。
+        if not getattr(self, "_quitting", False):
+            self.root.after(1000, self._raise_top)
 
     def _start_move(self, e):
         self._drag = (e.x_root, e.y_root)
@@ -701,9 +940,11 @@ class ControlPanel:
             f.pack_forget()
         self._show_page(self._load_last_page())
 
-        self._tip = tk.Label(root, text="托盘图标右键可唤出菜单    Ctrl+Alt+R 快速暂停",
-                             bg=BG, fg=SUB, font=FONT_SMALL)
-        self._tip.pack(pady=(0, 10))
+        # 原先贴在窗口最底部的"托盘图标右键可唤出菜单 / Ctrl+Alt+R 快速暂停"
+        # 提示条已挪进「其他设置」页（见 _page_other 的「快捷操作」卡片）——
+        # 那行灰字常年占着窗口底部，窗口一缩就成了最先被挤掉的东西。
+        # 手柄最后铺，保证压在内容之上（place 的堆叠顺序 = 创建顺序）。
+        self._build_grips()
 
     # ------------------------------------------------------------ 侧栏/导航
     def _nav_group(self, side, text):
@@ -772,14 +1013,19 @@ class ControlPanel:
         self._canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
 
     def _view_h(self):
-        """内容区可用高度 = 窗口高 − chrome（标题栏 + 底部提示条）。
+        """内容区可用高度 = 窗口高 − chrome（标题栏 + 错误横幅）。
 
         **不要直接读 `canvas.winfo_height()`**：窗口尺寸变化后，canvas 的实际
         高度要等 Tk 处理完下一次 Configure 才跟上，在那之前读到的是旧值 ——
         自适应算窗口高度、判断要不要滚动时都会用错。
         """
-        return max(0, int(self.root.winfo_height())
-                   - getattr(self, "_chrome", 74))
+        h = int(self.root.winfo_height()) - self._chrome
+        # 错误横幅出现时也会占掉一条，不算进来的话"装得下"会被高估，
+        # 滚轮就被误判成无需滚动、内容再也滚不到（横幅是临时出现的，容易漏）。
+        eb = getattr(self, "err_bar", None)
+        if eb is not None and eb.winfo_ismapped():
+            h -= int(eb.winfo_reqheight())
+        return max(0, h)
 
     def _need_scroll(self):
         """当前页装不下、真的需要滚动吗？
@@ -807,13 +1053,16 @@ class ControlPanel:
             self._canvas.configure(scrollregion=(bb[0], top, bb[2], bottom))
 
     def _fit_height(self):
-        """按内容把窗口调高到"最长的那个页面刚好装得下"，上限为屏幕的 92%。
+        """定下窗口尺寸：宽度用默认值或用户记忆值，高度**按内容自适应**。
 
-        窗口尺寸本来写死 564x742，而各页内容高度差很大（下雨 ~594、颜料盘
-        ~717）。只要系统缩放不是 100%（字体按 DPI 放大、控件整体变高）或者
-        用户多存了几个自定义预设，连"下雨"这种要素很少的页面都会溢出 ——
-        滚轮于是能把顶部拉走，看着莫名其妙。让窗口跟着内容长高（不超出屏幕）
-        能从根上避免；真的装不下（屏幕不够高）时才滚动。
+        各页内容高度差很大（下雨 ~633、真实水波 ~872）。只要系统缩放不是
+        100%（字体按 DPI 放大、控件整体变高）或者用户多存了几个自定义预设，
+        连"下雨"这种要素很少的页面都会溢出 —— 滚轮于是能把顶部拉走，看着莫
+        名其妙。让窗口跟着内容长高（不超出屏幕）能从根上避免；真的装不下
+        （屏幕不够高）时才滚动。
+
+        **用户显式调过高度（win_h）时不再自适应** —— 那时候"装得下"是他的
+        选择，装不下就滚动（滚轮路径已由 _need_scroll 守好）。
         """
         # 堆叠 pack 全部页面，单次 flush 即可测量每页自然高度（canvas window item
         # 的尺寸只在布局 pass 里算出，但 10 页只需一次 flush，不必逐页 pack+flush
@@ -823,24 +1072,19 @@ class ControlPanel:
             f.pack()
         self.root.update_idletasks()
         hs = {n: int(f.winfo_reqheight()) for n, f in self._pages.items()}
-        # chrome = 标题栏(固定 42) + 底部提示条(自身高度 + 下边距 10)。
-        # 用「固定值 + 提示条请求高度」解析算出，不依赖窗口实际像素：构造期窗口
-        # 处于 withdraw，winfo_height() 是占位值 1，直接相减会得到 chrome≈42 的
-        # 假值，tallest 页会被算短 30+ 像素而误触发滚动。提示条是 root 的直接子
-        # 控件，其 reqheight 在未 flush 时即可得（探针验证 = 23）。
-        if getattr(self, "_chrome", None) is None:
-            self._chrome = 42 + self._tip.winfo_reqheight() + 10
-        chrome = self._chrome
         content = max(hs.values()) if hs else 0
         self._content_h = content
-        cap = int(self.root.winfo_screenheight() * self._SCREEN_FRAC)
-        h = max(self._MIN_H, min(content + chrome, cap))
-        # 不能只在 `h != self.H` 时才应用：窗口高度可能被外部改过（测试里压矮
-        # 造溢出、将来若支持拖拽缩放），而 H 没变 -> 就恢复不回来了。
-        if h != self.H or int(self.root.winfo_height()) != h:
-            self.H = h
-            self._center()
-            self.root.update_idletasks()     # 落实最终高度（仍在 withdraw 期，
+        if self._user_h:
+            h = self._clamp_h(self._user_h)
+        else:
+            h = self._clamp_h(max(self.H_MIN, content + self._chrome))
+        w = self._clamp_w(self._user_w or self.W_DEF)
+        # 不能只在 `w/h != self.W/self.H` 时才应用：窗口尺寸可能被外部改过
+        # （测试里压矮造溢出、用户拖过了）而 W/H 没变 -> 就恢复不回来了。
+        if (w != self.W or h != self.H
+                or int(self.root.winfo_height()) != h):
+            self._apply_geometry(w, h)
+            self.root.update_idletasks()     # 落实最终尺寸（构造期仍在 withdraw，
                                             # 仅写 geometry，不触发可视上屏）
         # 恢复当前页（pack fill + 复位滚动）；滚动区交给 <Configure> 绑定自愈，
         # 此处不再 flush。
@@ -874,23 +1118,43 @@ class ControlPanel:
         self._canvas.yview_moveto(0)
         self._sync_scroll()
 
-    def _load_last_page(self):
+    def _read_ui_state(self):
         try:
             with open(_UI_STATE_PATH, "r", encoding="utf-8") as f:
                 d = json.load(f)
-            name = d.get("last_page")
-            if name in self._pages:
-                return name
+            return d if isinstance(d, dict) else {}
+        except Exception:
+            return {}
+
+    def _ui_int(self, key):
+        """读一个正整数偏好；缺失或非法一律返回 None（= 用默认值）。"""
+        try:
+            v = int(self._ui.get(key))
+        except (TypeError, ValueError):
+            return None
+        return v if v > 0 else None
+
+    def _save_ui_state(self):
+        """整体重写 ui_state.json。
+
+        内存里始终持有一份 self._ui，所以每次写都包含全部键（上次页面 +
+        窗口宽高），不会像原来那样把其它键覆盖掉。
+        """
+        try:
+            with open(_UI_STATE_PATH, "w", encoding="utf-8") as f:
+                json.dump(self._ui, f, ensure_ascii=False)
         except Exception:
             pass
+
+    def _load_last_page(self):
+        name = self._ui.get("last_page")
+        if name in self._pages:
+            return name
         return "下雨"
 
     def _save_last_page(self, name):
-        try:
-            with open(_UI_STATE_PATH, "w", encoding="utf-8") as f:
-                json.dump({"last_page": name}, f, ensure_ascii=False)
-        except Exception:
-            pass
+        self._ui["last_page"] = name
+        self._save_ui_state()
 
     def _page_head(self, parent, text):
         """页头大标题 + 左侧强调色短标线。
@@ -1297,12 +1561,81 @@ class ControlPanel:
         # 覆盖窗是置顶窗、任务栏不是，所以特效默认会被画在任务栏上 ——
         # 真实水波那种整片明暗条纹糊在任务栏上就是用户报的"残影"。
         c4 = tk.Frame(p, bg=CARD)
-        c4.pack(fill="x", padx=16, pady=(0, 16))
+        c4.pack(fill="x", padx=16, pady=(0, 8))
         self._card_title(c4, "任务栏")
         self._hint(c4, "任务栏永远浮在特效之前（含副屏任务栏）；"
                        "关掉后特效会盖在任务栏上。")
         self._toggle(c4, "不在任务栏上绘制", "avoid_taskbar")
+
+        # ---- 窗口尺寸 ----
+        # 尺寸是界面偏好，存 ui_state.json（不是特效配置）。
+        c5 = tk.Frame(p, bg=CARD)
+        c5.pack(fill="x", padx=16, pady=(0, 8))
+        self._card_title(c5, "窗口尺寸")
+        self._hint(c5, "拖拽窗口的任意一条边或角也能改；调整后会记住。")
+        self._size_slider(c5, "窗口宽度", "win_w", self.W_MIN, self._cap_w())
+        self._size_slider(c5, "窗口高度", "win_h", self.H_MIN, self._cap_h())
+        srow = tk.Frame(c5, bg=CARD)
+        srow.pack(fill="x", padx=16, pady=(0, 12))
+        self._mini_btn(srow, "按内容自适应高度", self._size_auto_h)
+        self._mini_btn(srow, "恢复默认尺寸", self._size_reset)
+
+        # ---- 快捷操作 ----
+        # 原先贴在窗口最底部的那行提示挪进来；拆成两行更好读，也顺便把
+        # "托盘右键"和"快捷键"两件事分开说清。
+        c6 = tk.Frame(p, bg=CARD)
+        c6.pack(fill="x", padx=16, pady=(0, 16))
+        self._card_title(c6, "快捷操作")
+        self._key_row(c6, "托盘图标右键", "唤出菜单")
+        self._key_row(c6, "Ctrl+Alt+R", "快速暂停")
         return p
+
+    def _size_slider(self, parent, label, key, lo, hi):
+        """窗口宽/高的数值调节行。
+
+        写的是 ui_state（界面偏好）而不是 app.cfg —— 特效配置会被预设批量
+        改写，窗口尺寸混进去会被预设顺手改掉。所以这一行不走 _slider。
+        """
+        f = tk.Frame(parent, bg=CARD)
+        f.pack(fill="x", padx=16, pady=8)
+        f.grid_columnconfigure(1, weight=1)
+        tk.Label(f, text=label, bg=CARD, fg=TEXT,
+                 font=FONT_LABEL).grid(row=0, column=0, sticky="w")
+        var = tk.DoubleVar(value=float(self.W if key == "win_w" else self.H))
+        val = tk.Label(f, text="", bg=CARD, fg=ACCENT, font=FONT_NUM)
+
+        def on(*_):
+            v = int(round(var.get()))
+            val.config(text=f"{v} 像素")
+            self._set_size(**{key: v})
+
+        _Slider(f, lo, hi, 1, var, command=on,
+                width=120).grid(row=0, column=1, sticky="ew", padx=(14, 10))
+        val.grid(row=0, column=2, sticky="e")
+        # 这里**不能**调 on()：构造期调一次就会把尺寸当成"用户自定义"落盘，
+        # 首次运行也会被写死成默认值，之后就永远失去内容自适应。
+        val.config(text=f"{int(var.get())} 像素")
+        self._size_rows[key] = {"var": var, "label": val}
+
+    def _mini_btn(self, parent, text, cmd):
+        """卡片里的小动作按钮，与颜色行的「调色/取色」同一套扁平样式。"""
+        b = tk.Button(parent, text=text, bd=0, relief="flat", bg=BTN, fg=SUB,
+                      font=FONT_SMALL, cursor="hand2", padx=10, pady=4,
+                      activebackground=BTN_H, activeforeground=TEXT,
+                      command=cmd)
+        b.pack(side="left", padx=(0, 8))
+        b.bind("<Enter>", lambda e: b.config(bg=BTN_H, fg=TEXT))
+        b.bind("<Leave>", lambda e: b.config(bg=BTN, fg=SUB))
+        return b
+
+    def _key_row(self, card, keys, desc):
+        """「按键 …… 说明」行：按键用等宽字 + 强调色，说明用次级灰。"""
+        row = tk.Frame(card, bg=CARD)
+        row.pack(fill="x", padx=16, pady=4)
+        tk.Label(row, text=keys, bg=CARD, fg=ACCENT, font=FONT_NUM,
+                 anchor="w").pack(side="left")
+        tk.Label(row, text=desc, bg=CARD, fg=SUB, font=FONT_SMALL,
+                 anchor="w").pack(side="right")
 
     def _card_title(self, card, text):
         """卡片内的小标题，与「预设方案」标题同一套样式。"""
@@ -1312,11 +1645,15 @@ class ControlPanel:
 
     def _hint(self, card, text):
         """设置项下方的说明文字：用次级灰，避免和主标签抢注意力。"""
-        # wraplength 必须 ≤ 卡片内可用宽度（卡片 412 − 两侧 padx 32 = 380）：
-        # 给大了会让最后一个字单独折到下一行，出现"）。"这种孤字。
-        tk.Label(card, text=text, bg=CARD, fg=SUB, font=FONT_SMALL,
-                 anchor="w", justify="left", wraplength=372).pack(
-            fill="x", padx=16, pady=(0, 4))
+        # wraplength 必须 ≤ 卡片内可用宽度（窗口 564 时：卡片 412 − 两侧
+        # padx 32 = 380）：给大了会让最后一个字单独折到下一行，出现"）。"这种
+        # 孤字。窗口现在可缩放，所以注册进 _hints，宽度一变由
+        # _apply_wraplength 统一重算 —— 否则窗口缩小后说明文字会溢出被裁。
+        lb = tk.Label(card, text=text, bg=CARD, fg=SUB, font=FONT_SMALL,
+                      anchor="w", justify="left",
+                      wraplength=max(160, self.W - 192))
+        lb.pack(fill="x", padx=16, pady=(0, 4))
+        self._hints.append(lb)
 
     def _layer_row(self, parent, label, key):
         """层级行：名称 …… 最上层 (开关) 仅桌面图层。
