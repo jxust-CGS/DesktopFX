@@ -11,6 +11,8 @@
    边速度，10Hz 采样算出的速度既不准、注入又一串一串地来（看着就一顿一顿）。
 3. **活塞物理**：向右拖 -> 右边隆起、左边塌陷；向下拖 -> 下边隆起；拉宽 ->
    右边隆起；缩窄 -> 右边塌陷。**这一个式子同时覆盖平移与改尺寸**。
+   注入**只往窗外**：扰动带只铺窗口外侧，并且连速度场一起写（单向行波初值），
+   所以不存在"一半往窗里钻"的反向波 —— 里侧逐格为零，跑几十步也不许漏。
 4. **量级正确**：注入量正比于速度（快拖浪更大），且**与帧率无关**
    （同一段位移，30/60/120 帧/秒注入的总量一致）。
 5. **静止 = 死水**：窗口不动就一点不注入（泡着不动的石头不搅水）。
@@ -65,12 +67,14 @@ def base_cfg(**over):
 def edge_val(wf, axis, coord, lo, hi):
     """取某条边扰动带上的**代表值**（取绝对值最大的那一格，带符号）。
 
-    法向在 `coord` 附近扫一片（±10 格）找峰 —— 带骑在"这一帧行程的中点"上
-    （见 `Scene._win_perturb`），与端点最多差半帧位移，所以不能只盯着一格看。
+    法向在 `coord` 附近扫一片找峰。搜索半径不能太小：带骑在"这一帧行程的中点"
+    上（见 `Scene._win_perturb`），与端点最多差半帧位移；包又是**两端归零**的，
+    峰值还在窗缘外 `band/2` 处。两者叠加，高速拖动时峰离端点可达 40px 以上
+    （曾经用 10 格 = 24px，量到的只是包的斜坡）。
     切向只取 `[lo, hi]` 的中段 —— 避开两端收口处（那里按设计要归零）。
     """
     c = wf.cell
-    r = 10
+    r = 22
     if axis == 0:                       # 竖直边：法向是 x
         ci = int(round(coord / c))
         a0, a1 = max(0, ci - r), min(wf.gw, ci + r + 1)
@@ -85,6 +89,23 @@ def edge_val(wf, axis, coord, lo, hi):
     if flat.size == 0:
         return 0.0
     return float(flat[int(np.argmax(np.abs(flat)))])
+
+
+def seg_peak(wf, axis, a_px, b_px, lo, hi, pad=20):
+    """法向 `[a_px, b_px]` 整段里、切向中段的 |位移| 峰值。
+
+    比"盯住某一个格点"稳得多：扫过时每帧前进的距离可能大于一个格（30 帧/秒下
+    快拖一帧就是 30px），被跳过的格拿不到注入，测点是不是落在采样点上全凭运气。
+    峰值取整段就不吃这个亏。`pad` 要盖过切向收口（一个 `band` ≈ 18 格）。
+    """
+    c = wf.cell
+    i0, i1 = int(min(a_px, b_px) / c), int(max(a_px, b_px) / c) + 1
+    j0, j1 = int(lo / c) + pad, int(hi / c) - pad + 1
+    if axis == 0:
+        blk = wf.height[max(0, j0):j1, max(0, i0):min(wf.gw, i1)]
+    else:
+        blk = wf.height[max(0, i0):min(wf.gh, i1), max(0, j0):j1]
+    return float(np.abs(blk).max()) if blk.size else 0.0
 
 
 def dome_center(wf, rect):
@@ -239,7 +260,7 @@ def test_null_foreground_window():
 
 
 # ------------------------------------------------------------------ 2. 活塞物理
-def _push(wf, old, new, dt=0.016, strength=1.0, width=22.0):
+def _push(wf, old, new, dt=0.016, strength=1.0, width=44.0):
     """按 **Scene 的接线方式**注入：带骑在行程中点（中点法，见 `_win_perturb`）。"""
     inv = 1.0 / dt
     mid = tuple(0.5 * (a + b) for a, b in zip(old, new))
@@ -250,7 +271,7 @@ def _push(wf, old, new, dt=0.016, strength=1.0, width=22.0):
         strength, dt, width)
 
 
-def _sweep(v, dist, dt, strength=1.0, width=22.0, seed=5,
+def _sweep(v, dist, dt, strength=1.0, width=44.0, seed=5,
            rect=(400.0, 300.0, 700.0, 500.0)):
     """让窗（矩）形边以速度 v 扫过 dist 像素，返回水面。"""
     wf = WaterRippleField(W, H, seed=seed)
@@ -267,22 +288,91 @@ def _sweep(v, dist, dt, strength=1.0, width=22.0, seed=5,
 
 def test_push_band_nonzero():
     """回归：`_push_band` 曾把**格索引**直接拿去减**像素**（两种轴向都错），
-    整条带恒为 0 —— 窗口怎么拖都不起浪，而且查不出异常。"""
+    整条带恒为 0 —— 窗口怎么拖都不起浪，而且查不出异常。
+
+    顺带钉住"**只铺外侧**"：`out_sign=+1` 的边只许往 +法向写、`-1` 只许往
+    −法向写，窗口里侧（另一侧）必须**逐格为零**，而不是"很小"。这条不是美观
+    问题 —— 里侧那半截波会穿透窗口画到它上面，用户看到的就是"内外同时起波"。
+    """
     for axis, coord, lo, hi in ((0, 300.0, 200.0, 400.0),
                                 (1, 250.0, 150.0, 450.0)):
-        wf = WaterRippleField(W, H, seed=3)
-        hit = wf._push_band(axis, coord, lo, hi, 0.05, 22.0)
-        if not hit:
-            return False, f"axis={axis} band reported no hit"
-        if not np.any(wf.height):
-            return False, f"axis={axis} band wrote nothing (index/pixel mixup)"
-        val = edge_val(wf, axis, coord, lo, hi)
-        if abs(val - 0.05) > 0.01:
-            return False, f"axis={axis} band peak {val:.4f} != 0.05"
-        # 带外（切向两端更远处）必须是平的：硬边会激起网格噪声
-        if np.abs(wf.height).sum() <= 0.0:
-            return False, f"axis={axis} zero energy"
-    return True, "竖直/水平边注入带都非零且峰值正确"
+        for out in (+1, -1):
+            wf = WaterRippleField(W, H, seed=3)
+            hit = wf._push_band(axis, coord, lo, hi, 0.05, 44.0, out)
+            if not hit:
+                return False, f"axis={axis} out={out} band reported no hit"
+            if not np.any(wf.height):
+                return False, (f"axis={axis} out={out} band wrote nothing "
+                               f"(index/pixel mixup)")
+            val = edge_val(wf, axis, coord, lo, hi)
+            if abs(val - 0.05) > 0.01:
+                return False, f"axis={axis} out={out} band peak {val:.4f} != 0.05"
+            # 外侧第一个格的索引：格心 (i+0.5)·cell 正好越过 coord 那一个。
+            # 里侧 = 它的另一侧，一格都不许有位移。
+            k0 = int(np.ceil(coord / wf.cell - 0.5))
+            h = wf.height
+            if axis == 0:
+                inner = h[:, :k0] if out > 0 else h[:, k0:]
+            else:
+                inner = h[:k0, :] if out > 0 else h[k0:, :]
+            if inner.size and float(np.abs(inner).max()) != 0.0:
+                return False, (f"axis={axis} out={out} 窗口里侧被注入了位移 "
+                               f"({float(np.abs(inner).max()):.4f})，水应在窗外")
+    return True, "竖直/水平边 × 两个外侧方向：带非零、峰值正确、里侧逐格为零"
+
+
+def test_band_is_one_way():
+    """"波只往外"—— "窗口波纹向外即可，不要同时向内"这条需求的钉子。
+
+    只把静位移包摆到外侧**不够**：波动方程里一个静止的包必然一分为二，另一半
+    照样往窗口里钻（这正是用户看到"同时向内"的成因）。所以这里跑几十步再量：
+    窗口里侧的位移要比外侧小得多，并且整个波包的**重心**要随步数一路往外挪。
+    """
+    coord, lo, hi, bw, amp = 450.0, 250.0, 450.0, 44.0, 0.16
+    for axis, out in ((0, +1), (0, -1), (1, +1), (1, -1)):
+        wf = WaterRippleField(W, H, seed=41)
+        if not wf._push_band(axis, coord, lo, hi, amp, bw, out):
+            return False, f"axis={axis} out={out} 注入失败"
+
+        def spec(f):
+            """沿法向的 |位移| 剖面（axis=0 法向是 x 列，=1 是 y 行）。"""
+            return np.abs(f).sum(axis=1) if axis == 1 else np.abs(f).sum(axis=0)
+
+        def centroid(f):
+            a = spec(f)
+            tot = float(a.sum())
+            if tot <= 0.0:
+                return None
+            idx = np.arange(a.size, dtype=np.float64)
+            return float((idx * a).sum() / tot) * wf.cell
+
+        def side_peak(f, a_px, b_px):
+            c = wf.cell
+            n = f.shape[0] if axis == 1 else f.shape[1]
+            i0 = max(0, int(min(a_px, b_px) / c))
+            i1 = min(n, int(max(a_px, b_px) / c) + 1)
+            blk = f[i0:i1, :] if axis == 1 else f[:, i0:i1]
+            return float(np.abs(blk).max()) if blk.size else 0.0
+
+        c0 = centroid(wf.height)
+        for _ in range(45):
+            wf.step(wf.k, wf.damp)
+        c1 = centroid(wf.height)
+        if c0 is None or c1 is None:
+            return False, f"axis={axis} out={out} 场变成了空"
+        pk_in = side_peak(wf.height, coord, coord - out * 250.0)
+        pk_out = side_peak(wf.height, coord, coord + out * 250.0)
+        if pk_out <= 1e-4:
+            return False, f"axis={axis} out={out} 窗外侧没有波 ({pk_out:.5f})"
+        if pk_in > 0.2 * pk_out:
+            return False, (f"axis={axis} out={out} 有 {pk_in / pk_out:.0%} 的波漏进"
+                           f"了窗口里侧 (in={pk_in:.4f}, out={pk_out:.4f})")
+        if (c1 - c0) * out < 1.0:
+            return False, (f"axis={axis} out={out} 波没有向外走 "
+                           f"(重心 {c0:.1f} -> {c1:.1f} px)")
+        if not np.all(np.isfinite(wf.height)):
+            return False, f"axis={axis} out={out} 出现 NaN / Inf"
+    return True, "四条边 × 两个方向：波只朝窗外走，里侧漏量 < 20%，重心单调外移"
 
 
 def test_piston_direction():
@@ -349,7 +439,7 @@ def test_static_window_is_dead_water():
     """窗口静止 -> 一点不注入，水面保持绝对零（不是"很小"）。"""
     wf = WaterRippleField(W, H, seed=11)
     rect = (400.0, 300.0, 700.0, 500.0)
-    hit = wf.push_rect(rect, (0.0, 0.0, 0.0, 0.0), 1.0, 0.016, 22.0)
+    hit = wf.push_rect(rect, (0.0, 0.0, 0.0, 0.0), 1.0, 0.016, 44.0)
     if hit:
         return False, "静止窗口被报成有扰动"
     if float(np.abs(wf.height).max()) != 0.0:
@@ -357,10 +447,41 @@ def test_static_window_is_dead_water():
     if wf._alive:
         return False, "静止窗口把水面标成了活跃"
     # 强度 0 也不注入（面板拉到 0 = 关）
-    hit = wf.push_rect(rect, (2500.0, 2500.0, 2500.0, 2500.0), 0.0, 0.016, 22.0)
+    hit = wf.push_rect(rect, (2500.0, 2500.0, 2500.0, 2500.0), 0.0, 0.016, 44.0)
     if hit or float(np.abs(wf.height).max()) != 0.0:
         return False, "强度为 0 时仍在注入"
     return True, "静止 / 强度 0 -> 绝对零位移"
+
+
+def test_band_shapes_agree_on_area():
+    """两种包形（`_PUSH_EDGE_ZERO` 开/关）的**积分完全相同**。
+
+    窗缘即峰值：`∫₀¹cos(t·π/2)dt = 2/π`；两端归零：`∫₀¹sin(πt)dt = 2/π`。
+    所以"改成两端归零"只动了两件事 —— 窗缘处连不连续、浪峰在哪儿 —— 不改浪的
+    大小。顺带保证 `_PUSH_EDGE_ZERO=False` 那条分支不是死代码。
+    """
+    tot = {}
+    for zero in (False, True):
+        wf = WaterRippleField(W, H, seed=7)
+        wf._PUSH_EDGE_ZERO = zero           # 实例属性盖住类常量，只影响这一个场
+        if not wf._push_band(0, 450.0, 250.0, 450.0, 0.1, 44.0, +1):
+            return False, f"两端归零={zero} 注入失败"
+        tot[zero] = float(np.abs(wf.height).sum())
+        if zero:
+            # 两端归零：窗缘第一格几乎是 0（值连续），峰值在窗外 band/2 处
+            head = wf.height[:, int(450.0 / wf.cell)]
+            if float(np.abs(head).max()) > 0.15 * 0.1:
+                return False, f"两端归零的包在窗缘处没归零 ({np.abs(head).max():.4f})"
+        else:
+            head = wf.height[:, int(450.0 / wf.cell)]
+            if float(np.abs(head).max()) < 0.9 * 0.1:
+                return False, f"窗缘即峰值的包在窗缘处不够高 ({np.abs(head).max():.4f})"
+    ratio = tot[True] / tot[False]
+    if not (0.85 < ratio < 1.18):
+        return False, (f"两种包形积分不一致 (两端归零/窗缘峰值 = {ratio:.3f})，"
+                       f"换包形会改浪的大小")
+    return True, (f"两种包形积分一致 (比 {ratio:.3f})，"
+                  f"窗缘处一个连续、一个取峰值，都符合预期")
 
 
 def test_amplitude_follows_speed():
@@ -372,24 +493,28 @@ def test_amplitude_follows_speed():
     peaks = {}
     for v in (300.0, 600.0, 900.0, 1800.0):
         wf, end = _sweep(v, dist, 1.0 / 60.0)
-        peaks[v] = edge_val(wf, 0, end - 0.4 * dist, 300.0, 500.0)
+        # 取"右缘扫过的整段"里的峰值：单点取样会被每帧步长跳过去。
+        peaks[v] = seg_peak(wf, 0, 400.0, end + 60.0, 300.0, 500.0)
     if not all(p > 0 for p in peaks.values()):
         return False, f"各速度下都应隆起: {peaks}"
     vals = [peaks[v] for v in (300.0, 600.0, 900.0, 1800.0)]
     for a, b in zip(vals, vals[1:]):
         if b <= a:
             return False, f"幅度不随速度单调增: {vals}"
-    # 线性段：速度翻倍 -> 幅度翻倍（离散采样带来的约 5% 偏差，给 25% 余量）
+    # 线性段：速度翻倍 -> 幅度翻倍（离散采样带来的偏差，给 25% 余量）
     if not (1.5 < vals[1] / vals[0] < 2.5):
         return False, f"线性段比例不对 (300->600): {vals}"
     # 超过参考速度后饱和：两倍速度不许再明显变大
     if vals[3] / vals[2] > 1.15:
         return False, f"超过参考速度后未饱和: {vals}"
-    # 与解析值对一下量级：带是"骑在边上、两侧各 half_w"的余弦包，边扫过一个格
-    # 点时它要跨过 2·half_w 才会走完，于是累积量 = (2/π)·A·clip(v/V_REF)。
-    ref = 2.0 * WaterRippleField._PUSH_AMP / np.pi
+    # 与解析值对一下量级：带只铺到**窗外** half_w，边扫过一个格点时它在 `W/(v·dt)`
+    # 帧里一直覆盖这个格点，于是累积位移 = `A/π · clip(v/V_REF)`。
+    # 旧写法是"两侧各 W 的对称包" -> `2A/π`；现在改成**单侧 + 单向**，两者正好
+    # 互相抵消：向外那半的峰值仍是 A/π，用户看到的浪一样大，只是窗口里侧不再有
+    # 那半截内向的波。
+    ref = WaterRippleField._PUSH_AMP / np.pi
     if not (0.7 < vals[2] / ref < 1.6):
-        return False, f"饱和幅度 {vals[2]:.4f} 与 2A/π={ref:.4f} 量级不符"
+        return False, f"饱和幅度 {vals[2]:.4f} 与 A/π={ref:.4f} 量级不符"
     return True, ("幅度随速度增并饱和: "
                   + ", ".join(f"{int(v)}->{peaks[v]:.4f}" for v in peaks))
 
@@ -408,7 +533,7 @@ def test_frame_rate_independent():
     out = {}
     for fps in (30, 60, 120):
         wf, end = _sweep(v, dist, 1.0 / fps)
-        out[fps] = edge_val(wf, 0, end - 0.4 * dist, 300.0, 500.0)
+        out[fps] = seg_peak(wf, 0, 400.0, end + 60.0, 300.0, 500.0)
     lo, hi = min(out.values()), max(out.values())
     if lo <= 0:
         return False, f"未起浪: {out}"
@@ -416,6 +541,74 @@ def test_frame_rate_independent():
         return False, f"帧率相关性过大 ({hi / lo:.3f}×): {out}"
     return True, "30/60/120 帧/秒注入一致: " + ", ".join(
         f"{k}->{val:.4f}" for k, val in out.items())
+
+
+def _old_band(wf, coord, lo, hi, amp, half_w):
+    """HEAD 版 `_push_band`（两侧各 `half_w` 的余弦包、只写位移）的等价复现。
+
+    留着它只为一件事：回答"换模型会不会换手感"。旧写法注入的静位移包会
+    **一分为二**，向外那半只剩一半；新写法注入量减半、但不再分裂。
+    """
+    c = wf.cell
+    a0 = max(0, int(np.floor((coord - half_w) / c)))
+    a1 = min(wf.gw, int(np.ceil((coord + half_w) / c)) + 1)
+    b0 = max(0, int(np.floor((lo - half_w) / c)))
+    b1 = min(wf.gh, int(np.ceil((hi + half_w) / c)) + 1)
+    f = np.float32
+    pa = np.abs((np.arange(a0, a1, dtype=np.float32) + f(0.5)) * f(c)
+                - f(coord)) / f(half_w)
+    pa = np.cos(np.clip(pa, 0.0, 1.0) * f(np.pi * 0.5))
+    pb = (np.arange(b0, b1, dtype=np.float32) + f(0.5)) * f(c)
+    pb = np.maximum(np.maximum(f(lo) - pb, pb - f(hi)), 0.0) / f(half_w)
+    pb = np.cos(np.clip(pb, 0.0, 1.0) * f(np.pi * 0.5))
+    wf.height[b0:b1, a0:a1] += f(amp) * np.multiply.outer(pb, pa)
+    wf._alive = True
+
+
+def test_outward_wave_strength_matches_old_model():
+    """换模型不该换手感：**窗外那道浪的高度**要和旧的对称包写法一致（差 ≤ 30%）。
+
+    旧：两侧各 `B/2` 的余弦包、只写位移 —— 静位移包随后一分为二，向外那半只剩
+        一半，另一半钻进窗口里（用户看到的"同时向内"）。
+    新：单侧的 `B`、两端归零、连速度场一起写 —— 注入量减半（分母 2B 而不是 2·B/2），
+        但整包向外走，不再分裂。
+
+    两边"注入量 × 分裂系数"乘积相同，所以浪的观感不变。这条断言就是钉住那个
+    乘积：谁要是只改了一边（比如把 `_PUSH_AMP` 调回旧系数、或者去掉单向化），
+    浪就会莫名其妙大一倍 —— 而"大一倍"在肉眼下只是"最近好像更明显了"。
+    """
+    x1, y0, y1 = 700.0, 300.0, 500.0       # 只做右边缘，切向 200px 的一段
+    dist, v, dt = 120.0, 900.0, 1.0 / 60.0
+    band = WaterRippleField._PUSH_W_DEF
+    sp = min(v / WaterRippleField._PUSH_V_REF, 1.0)
+    amp_old = (WaterRippleField._PUSH_AMP / (2.0 * (band * 0.5)) * dt * sp * v)
+    amp_new = (WaterRippleField._PUSH_AMP / (2.0 * band) * dt * sp * v)
+
+    def run(use_new):
+        wf = WaterRippleField(W, H, seed=53)
+        n = max(1, int(round(dist / (v * dt))))
+        step = dist / n
+        pos = x1
+        for _ in range(n):
+            nxt = pos + step
+            coord = 0.5 * (pos + nxt)          # 与 Scene 一样骑在行程中点
+            if use_new:
+                wf._push_band(0, coord, y0, y1, amp_new, band, +1)
+            else:
+                _old_band(wf, coord, y0, y1, amp_old, band * 0.5)
+            pos = nxt
+        for _ in range(45):
+            wf.step(wf.k, wf.damp)
+        return seg_peak(wf, 0, x1, 880.0, y0, y1)
+
+    s_old, s_new = run(False), run(True)
+    if s_old <= 1e-4 or s_new <= 1e-4:
+        return False, f"两侧都该有波 (old={s_old:.5f}, new={s_new:.5f})"
+    ratio = s_new / s_old
+    if not (0.7 < ratio < 1.3):
+        return False, (f"窗外波高与旧写法不一致 (新/旧 = {ratio:.2f}，"
+                       f"旧 {s_old:.4f} / 新 {s_new:.4f})")
+    return True, f"新/旧 窗外波高 = {ratio:.2f}（旧 {s_old:.4f} / 新 {s_new:.4f}）"
 
 
 def test_dome_minimize_restore():
@@ -674,11 +867,14 @@ def main():
         test_probe_scan_marks_mover,
         test_null_foreground_window,
         test_push_band_nonzero,
+        test_band_is_one_way,
+        test_band_shapes_agree_on_area,
         test_piston_direction,
         test_resize_is_same_formula,
         test_static_window_is_dead_water,
         test_amplitude_follows_speed,
         test_frame_rate_independent,
+        test_outward_wave_strength_matches_old_model,
         test_dome_minimize_restore,
         test_push_energy_bounded,
         test_scene_change_perturbs_shared_surface,

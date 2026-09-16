@@ -409,10 +409,18 @@ class WaterRippleField:
     # 窗口是水面上的障碍物：它**不动时水面是平的**，一移动才把水挤开。所以注入量
     # 正比于边的**法向速度**，而不是"窗口在不在"。下面几个常数只影响量级：
     _PUSH_V_REF = 900.0             # 参考速度（像素/秒）：拖动窗口的典型速度
-    _PUSH_AMP = 0.14                # 参考速度下，船首那道浪最终积起来的高度
-    _PUSH_W_DEF = 22.0              # 边缘扰动带的基础宽度（像素）
+    _PUSH_AMP = 0.14                # 参考速度下，窗外那道浪的峰值
+    _PUSH_W_DEF = 44.0              # 边缘扰动带的**完整宽度**（像素，只铺窗外那一侧）
     _PUSH_W_MIN = 1.6               # 扰动带不得窄于这么多个格 —— 再窄网格表示不出软包
     _DOME_AMP = 0.10                # 最小化 / 恢复时整块水面抬升或塌陷的幅度
+
+    # `_push_band` 单向化时用的"每步位移"系数：g 每步增量是 `k·(四邻平均 − h)`，而
+    # `四邻平均 − h = 0.25·∇²h`；对照 `h[n+1] = 2h[n] − h[n−1] + c²∇²h` 得 `c = 0.5√k`。
+    _PUSH_C_COEF = 0.5
+    # 包的两端是否归零。窗内是平水（0），若包在窗缘处直接取峰值，那里就有一个
+    # **空间跳变**，它本身会向内辐射一片波；改成两端归零的包，窗缘处与静止水面
+    # 连续，向内就没了这个源。代价是浪峰从窗缘外移 `B/2`（约 22px）。
+    _PUSH_EDGE_ZERO = True
 
     # ---------------------------------------------------------- 生命周期
     def __init__(self, w, h, seed=0):
@@ -508,16 +516,24 @@ class WaterRippleField:
 
         ### 每帧注入多少：既跟速度走，又不依赖帧率
 
-        设扰动带半宽 `W`（像素）。边扫过某个格点时，它在 `2W/(v·dt)` 帧里一直
-        覆盖这个格点，于是逐帧注入量取
+        设扰动带宽度 `B`（像素，**只往窗外那一侧铺**，默认 44 ≈ 旧写法两侧相加）。
+        边扫过某个格点时，它在 `B/(v·dt)` 帧里一直覆盖这个格点，于是逐帧注入量取
 
-            amp_frame = A · clip(v / V_REF) · (v·dt) / (2W)
+            amp_frame = A · clip(v / V_REF) · (v·dt) / (2B)
 
-        累积到扫完之后正好是 `(2/π) · A · clip(v / V_REF)` —— 与帧率**无关**
-        （带是两侧各 W 的余弦包，边扫过一个格点要跨过 2W，积分出 2/π 这个系数），
-        且快的拖动起浪更大（真实船波的弗劳德数也是这个方向），超过 V_REF 后饱和。
-        若简单地"每帧注入一个常数"，30 帧/秒的机器上边在带里停留的帧数减半，
-        浪就莫名弱一半。
+        累积到扫完之后是 `A · clip(v / V_REF) / π` —— 与帧率**无关**，且快的拖动
+        起浪更大（真实船波的弗劳德数也是这个方向），超过 V_REF 后饱和。若简单地
+        "每帧注入一个常数"，30 帧/秒的机器上边在带里停留的帧数减半，浪就莫名弱
+        一半。
+
+        **为什么带只铺单侧、却仍取 44 宽**：带太窄会在快速拖动时"漏格"——边缘
+        一帧跨 30px，而带只有 22px，中间就留下一条没被扫到的缝，浪变成虚线。
+        旧写法两侧各 22、加起来正好 44；现在整条 44 都铺在窗外，空间覆盖不变。
+
+        **为什么是 A/π 而不是 2A/π**：包只铺单侧（`∫₀¹cos(t·π/2)dt = 2/π`），
+        而注入又是**单向**的（见 `_push_band`）。两者正好互相抵消 —— 旧写法是
+        "两侧对称的静位移包、随后一分为二"，向外那半的峰值同样是 A/π。所以用户
+        看到的浪**强度分毫不差**，只是窗口里侧不再有那半截内向的波。
 
         调用方**必须把带骑在"这一帧行程的中点"上**（见 `Scene._win_perturb`）：
         取端点等于用左端点法做积分，帧率越低每帧跨得越远、注入越被高估。
@@ -526,8 +542,8 @@ class WaterRippleField:
         if x1 <= x0 or y1 <= y0:
             return False
         c = self.cell
-        half_w = max(float(width_px) if width_px > 0.0 else self._PUSH_W_DEF,
-                     self._PUSH_W_MIN * c)
+        band = max(float(width_px) if width_px > 0.0 else self._PUSH_W_DEF,
+                   self._PUSH_W_MIN * c)
         # 屏幕外的部分不用注入；先把矩形收进网格范围（大窗口常常只露出一部分）
         x0 = float(np.clip(x0, 0.0, self.w))
         x1 = float(np.clip(x1, 0.0, self.w))
@@ -537,12 +553,17 @@ class WaterRippleField:
             return False
         dt = max(float(dt), 1.0 / 240.0)
         vx0, vx1, vy0, vy1 = (float(v) for v in edge_v)
-        scale = float(strength) * self._PUSH_AMP / (2.0 * half_w) * dt
+        # 分母 2B：包只铺单侧、扫过时的积分是 `2B/π`（旧写法两侧各 B/2、积分也是
+        # `2B/π`），于是这里每帧注入的峰值与旧写法一致；差别只在"不再一分为二"，
+        # 所以窗外那道浪的高度与从前**完全一样**，少掉的是钻进窗口里的另一半。
+        scale = float(strength) * self._PUSH_AMP / (2.0 * band) * dt
         hit = False
-        for axis, coord, lo, hi, vn in ((0, x0, y0, y1, -vx0),
-                                        (0, x1, y0, y1, vx1),
-                                        (1, y0, x0, x1, -vy0),
-                                        (1, y1, x0, x1, vy1)):
+        # out 是这条边的**外侧方向**，也就是波该去的方向：左 −1、右 +1、上 −1、下 +1。
+        # 隔壁那条边永远在另一侧，所以"推出去的水"不会泼到窗口里。
+        for axis, coord, lo, hi, vn, out in ((0, x0, y0, y1, -vx0, -1),
+                                             (0, x1, y0, y1, vx1, +1),
+                                             (1, y0, x0, x1, -vy0, -1),
+                                             (1, y1, x0, x1, vy1, +1)):
             sp = float(np.clip(abs(vn) / self._PUSH_V_REF, 0.0, 1.0))
             if sp <= 0.0:
                 continue
@@ -550,54 +571,105 @@ class WaterRippleField:
             amp = scale * sp * vn
             if abs(amp) < 1e-7:
                 continue
-            if self._push_band(axis, coord, lo, hi, amp, half_w):
+            if self._push_band(axis, coord, lo, hi, amp, band, out):
                 hit = True
         if hit:
             self._alive = True
         return hit
 
-    def _push_band(self, axis, coord, lo, hi, amp, half_w):
-        """沿一条直线边注入一条软包带。axis=0 竖直边（法向沿 x），1 水平边（法向沿 y）。
+    def _push_band(self, axis, coord, lo, hi, amp, band, out_sign=1):
+        """沿一条直线边注入一条软包带：**只铺窗口外侧**，而且是**单向行波**。
 
-        法向：以这条边的位置为中心、两侧各 `half_w` 的升余弦（边上为 1，±half_w
-        处归零）—— 位移正好骑在边上、两侧对称，就是"活塞推水时留下的那道隆起"。
-        切向：`[lo, hi]` 内恒为 1，两端各 `half_w` 内收口，角上才不会切出一条硬边。
+        `out_sign` = 这条边的外侧方向（= 波要去的方向）：左/上为 −1，右/下为 +1。
 
-        用软包带而不是沿边撒一串落点：落点间距必然大于波半径，波前会变成一串
-        珠子；带既连成一条，又处处一阶连续（硬边会激起网格噪声，见 `test_no_grid_artifact`）。
+        ### 一、只铺外侧，且两端归零
+
+        包从边缘起、向**外**铺满 `band`，窗口里侧一点不写。窗内那些格（格心落在
+        `coord` 内侧）直接排除掉，而不是被 `clip` 夹成 0 —— 夹出来的 0 会让
+        `cos(0) = 1`，在窗口里反手糊上一个峰值。
+
+        包形默认**两端归零**（`sin`，峰值落在窗外 `band/2` 处）。这一点比"只铺
+        外侧"还要紧：窗内是平水，包若在窗缘处直接取峰值，那里就留下一个**空间
+        跳变**，它自己会向内辐射一片波 —— 实测里侧漏量 128%（比外侧还多），
+        改成两端归零后立刻掉到 8.5%。代价只是浪峰从窗缘外移约 22px，看着更像
+        船首前方那道弓形波。`_PUSH_EDGE_ZERO=False` 可切回"窗缘即峰值"，两种
+        形状的积分完全相同（见 `test_band_shapes_agree_on_area`）。
+
+        ### 二、单向：静止位移包会一分为二
+
+        只铺外侧**不够**。往波场里丢一个静止的位移包，它必然分裂成左右各半的反向
+        行波（这是波动方程的通解形状，跟包摆在哪儿无关）—— 另一半照样钻进窗口里，
+        看着还是"内外同时起波"。要整包朝外走，得连**速度场**一起给：
+
+        设注入的位移包 `f(i)`（i 是法向格索引）。右行波满足 `h[i](n+1) = h[i−c](n)`，
+        `c` = 每步走过的格数，泰勒展开就是
+
+            g = h[i−c] − h[i] ≈ −c · ∂f/∂i
+
+        于是同时写 `height += f` 与 `vel += −c·out_sign·∂f/∂i`，注入的就是一列
+        朝外走的行波，窗口里侧保持平水。对负的塌陷包（船尾空腔）同样成立：它也是
+        朝外走的，只是相位反半个波。
+
+        **`c` 是 `0.5·√k` 而不是 `√k`**：本格式的 `g` 每步增量是 `k·(四邻平均 − h)`，
+        而 `四邻平均 − h = 0.25·∇²h`；对照 `h[n+1] = 2h[n] − h[n−1] + c²∇²h` 得
+        `c² = 0.25k`。写成 `√k` 会让注入的"伴随速度"大一倍，波非但不单向、还比
+        真实传播快一倍地泄漏回窗口里（实测里侧漏量 74%）。
+
+        ### 三、切向收口
+
+        切向 `[lo, hi]` 内恒为 1，两端各 `band` 内收口，角上才不会切出一条硬边。
+        用软包带而不是沿边撒一串落点：落点间距必然大于波半径，波前会变成一串珠子；
+        带既连成一条，又处处一阶连续（硬边会激起网格噪声，见 `test_no_grid_artifact`）。
         """
         c = self.cell
+        s = 1 if out_sign >= 0 else -1
         lim_a, lim_b = (self.gw, self.gh) if axis == 0 else (self.gh, self.gw)
-        a0 = max(0, int(np.floor((coord - half_w) / c)))
-        a1 = min(lim_a, int(np.ceil((coord + half_w) / c)) + 1)
-        b0 = max(0, int(np.floor((lo - half_w) / c)))
-        b1 = min(lim_b, int(np.ceil((hi + half_w) / c)) + 1)
+        # 只在外侧那 band 里：s=+1 -> [coord, coord+band]，s=-1 -> [coord-band, coord]
+        na, nb = (coord, coord + band) if s > 0 else (coord - band, coord)
+        a0 = max(0, int(np.floor(na / c)))
+        a1 = min(lim_a, int(np.ceil(nb / c)) + 1)
+        b0 = max(0, int(np.floor((lo - band) / c)))
+        b1 = min(lim_b, int(np.ceil((hi + band) / c)) + 1)
         if a1 <= a0 or b1 <= b0:
             return False
-        hw = np.float32(half_w)
+        bd = np.float32(band)
+        cf = np.float32(c)
+        half_pi = np.float32(np.pi * 0.5)
         # **两个轴都先换成像素再比** —— `coord` / `lo` / `hi` 都是像素，格索引
         # 直接拿去减会差出一个 `cell` 的倍数（曾经漏了这一下，整条带恒为 0）。
         # 格中心 = idx·cell + cell/2。
-        pa = np.arange(a0, a1, dtype=np.float32)
-        pa = pa * np.float32(c) + np.float32(0.5 * c)
-        # 法向：到边的距离 / half_w
-        pa = np.abs(pa - np.float32(coord)) / hw
-        np.clip(pa, 0.0, 1.0, out=pa)
-        # 切向：到 [lo, hi] 的距离 / half_w（区间内为 0 -> 包值为 1）
-        pb = np.arange(b0, b1, dtype=np.float32)
-        pb = pb * np.float32(c) + np.float32(0.5 * c)
+        pa_px = (np.arange(a0, a1, dtype=np.float32) + np.float32(0.5)) * cf
+        # 向外为正：t<0 是窗口里侧、t>1 是带外，两处都不注入（水只往外跑）
+        t = (pa_px - np.float32(coord)) * np.float32(s) / bd
+        inside = (t >= 0.0) & (t <= 1.0)
+        t = np.clip(t, 0.0, 1.0)
+        if self._PUSH_EDGE_ZERO:
+            # 两端归零的包：窗缘处与静止的水面连续（值与法向斜率都不跳），
+            # 不会向内辐射；峰值落在窗外 `band/2` 处（≈ 船首前方那道弓形波）。
+            pa = np.sin(t * np.pi)
+            dpa = np.cos(t * np.pi) * np.float32(np.pi * s * c / band)
+        else:
+            # 窗缘处直接取峰值的包：积分与上面完全相同，但窗缘有一个空间跳变。
+            pa = np.cos(t * half_pi)
+            dpa = -np.sin(t * half_pi) * half_pi * np.float32(s * c / band)
+        pa[~inside] = 0.0
+        dpa[~inside] = 0.0
+        # 切向：到 [lo, hi] 的距离 / band（区间内为 0 -> 包值为 1）
+        pb = (np.arange(b0, b1, dtype=np.float32) + np.float32(0.5)) * cf
         pb = np.maximum(np.maximum(np.float32(lo) - pb, pb - np.float32(hi)),
-                        0.0) / hw
+                        0.0) / bd
         np.clip(pb, 0.0, 1.0, out=pb)
-        half_pi = np.float32(np.pi * 0.5)
-        pa = np.cos(pa * half_pi)          # 升余弦：t=0 处 1、t=1 处 0
         pb = np.cos(pb * half_pi)
+        # 每步位移（格）= `_PUSH_C_COEF·√k`，见上面第二条说明。
+        c_step = np.float32(self._PUSH_C_COEF * np.sqrt(max(self.k, 0.0)))
+        a_s = np.float32(amp)
+        g_s = (-c_step * np.float32(s) * a_s)            # 单向化：vel += −c·out·∂f/∂i
         if axis == 0:      # 竖直边：法向是 x，所以 outer 的行是 y、列是 x
-            prof = np.multiply.outer(pb, pa)
-            self.height[b0:b1, a0:a1] += np.float32(amp) * prof
+            self.height[b0:b1, a0:a1] += a_s * np.multiply.outer(pb, pa)
+            self.vel[b0:b1, a0:a1] += g_s * np.multiply.outer(pb, dpa)
         else:              # 水平边：法向是 y，行正是 y
-            prof = np.multiply.outer(pa, pb)
-            self.height[a0:a1, b0:b1] += np.float32(amp) * prof
+            self.height[a0:a1, b0:b1] += a_s * np.multiply.outer(pa, pb)
+            self.vel[a0:a1, b0:b1] += g_s * np.multiply.outer(dpa, pb)
         return True
 
     def dome_rect(self, rect, amp):
