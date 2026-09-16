@@ -141,13 +141,14 @@ DEFAULTS = {
     "spotlight_radius": 220.0,
     "spotlight_dim": 0.6,
     "spotlight_color": "#05070A",
-    # ---- 窗口水波（窗口移动/最小化/恢复时触发涟漪，复用涟漪池）----
+    # ---- 窗口水波（窗口移动 / 缩放 / 最小化 / 恢复时扰动水面）----
+    # 它**不自己画**：窗口只是水面的一个扰动源 —— 和鼠标共用同一片水（见
+    # WaterRippleField.push_rect / dome_rect），所以这里只剩"扰动多大、多宽"
+    # 两个旋钮。水面的观感（波速 / 余波时长 / 光照 / 浓度 / 高光颜色）统一在
+    # 「真实水波」页设置，一个桌面只有一片水，两处各调一套只会打架。
     "win_ripple_enabled": False,
-    "win_ripple_size": 1.0,
-    "win_ripple_life": 1.0,
-    "win_ripple_strength": 0.7,
-    "win_ripple_color": "#7FE7FF",
-    "win_ripple_edge_density": 12,
+    "win_ripple_size": 1.0,          # 扰动范围：边缘扰动带宽度、塌陷区大小
+    "win_ripple_strength": 0.7,      # 扰动强度：注入水面的位移幅度
     # ---- 特效分层与多开（面板「其它设置」页）----
     # 全屏特效层 / 鼠标特效层各是一个独立覆盖窗口，层级各自设定：
     #   topmost = 始终浮在窗口之上（默认）；desktop = 仅桌面图层，任何窗口
@@ -300,12 +301,16 @@ PRESETS = {
               wave_step=14, wave_move=True, wave_click=True, wave_ambient=0.9,
               wave_light=225, wave_contrast=0.70, wave_shading=0.44,
               wave_highlight=0.68, wave_color="#FFFFFF", wave_opacity=0.20),
+    # 「水面」= 只有窗口扰动的那一档。窗口水波共用「真实水波」的水面，所以这份
+    # 预设把水面的观感一并写全（波速偏缓、余波偏长），否则它会跟着用户上一次在
+    # 「真实水波」页调出的参数走、换台机器就不是同一个效果了。
     "水面": dict(rain_enabled=False, snow_enabled=False,
+              petal_enabled=False, meteor_enabled=False,
               win_ripple_enabled=True, win_ripple_size=1.2,
-              win_ripple_life=1.1, win_ripple_strength=0.8,
-              win_ripple_color="#7FE7FF", win_ripple_edge_density=16,
-              ripple_move=True, ripple_click=True,
-              ripple_color="#7FE7FF", ripple_opacity=0.7),
+              win_ripple_strength=0.8,
+              wave_speed=170, wave_persist=0.45, wave_size=24, wave_strength=0.07,
+              wave_light=225, wave_contrast=0.40, wave_shading=0.30,
+              wave_highlight=0.40, wave_color="#FFFFFF", wave_opacity=0.11),
 }
 
 # 预设方案下沉到各特效页内部：每个特效页显示自己的预设方案

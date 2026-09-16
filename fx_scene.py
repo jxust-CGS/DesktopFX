@@ -57,13 +57,10 @@ class Scene:
         self._wave_acc = 0.0            # 鼠标行程累加（按间距落点）
         self._wave_amb = 0.0            # 环境自动滴落的计时
 
-        # 窗口水波跨帧状态
-        self._win_moving = False
-        self._win_move_t = 0.0          # 距上次 move 事件的累计时间
-        self._win_last_rect = None
+        # 窗口水波跨帧状态。它现在**不再自带画法**：窗口只是水面的一个扰动源，
+        # 和鼠标共用同一片水面（self.wave），于是颜色 / 波速 / 余波 / 光照都由
+        # 「真实水波」页那一套参数统一决定 —— 一个桌面本来就只有一片水。
         self._win_events = []           # 测试可注入合成事件，绕过真实窗口枚举
-        self._last_win_color = None
-        self._win_ripple_color_cache = hex_to_bgr("#7FE7FF")
 
     def set_origin(self, x, y):
         self.ov_x, self.ov_y = x, y
@@ -91,15 +88,17 @@ class Scene:
         # 一开，鼠标层就永远上屏** —— 哪怕场上一个波都没有，也每帧白付约 5.9ms。
         # 实测用户配置（真实水波 + 雪）只有 49 帧/秒、12.5% 掉帧，其中鼠标层
         # 那 5.7ms 全是空转。改成读特效**自身的状态**：
-        #   - 真实水波 `_alive`：draw() 开头就用它早退，精确；
+        #   - 水波 `_alive`：draw() 开头就用它早退，精确。真实水波与窗口水波
+        #     **共用这一片水**（窗口只往里注入位移、不自己画），所以一个信号
+        #     同时覆盖两者，两个开关任开其一都按它判；
         #   - 颜料盘 `_dirty`：颜料散尽时 draw() 自己会清零，精确；
-        #   - 窗口水波不直接出图（它把涟漪扔进涟漪池），池子的 active 已覆盖；
         #   - 聚光灯恒画满屏压暗，只有它继续按开关判（开 = 真有内容）。
         # 这样收紧是**安全**的：调用方的像素复核只会把 False 翻成 True，
         # 判空判错了也不会把上一帧冻在桌面上。
         ms = bool(cfg.get("spotlight_enabled", False)
                   or self.paint._dirty
-                  or (cfg.get("wave_enabled", False) and self.wave._alive)
+                  or ((cfg.get("wave_enabled", False)
+                       or cfg.get("win_ripple_enabled", False)) and self.wave._alive)
                   or self.ripples.active.any())
         return fs, ms
 
@@ -143,31 +142,22 @@ class Scene:
         # 鼠标坐标最先更新：聚光灯与鼠标涟漪都要用到当前光标
         dist = self.mouse.update(dt, self.ov_x, self.ov_y)
 
-        # ---------------- 窗口水波（窗口移动 / 最小化 / 恢复触发，复用涟漪池）
-        if cfg.get("win_ripple_enabled", False):
+        # ---------------- 窗口水波（窗口移动 / 缩放 / 最小化 / 恢复 -> 扰动水面）
+        # 窗口是水面上的障碍物，把它当活塞：四条边各按**自身速度**推水（见
+        # WaterRippleField.push_rect）。它**不自己画**，只往水里注入位移 ——
+        # 绘制由下面共用的那一段水面统一负责，所以窗口水波与鼠标水波永远是
+        # 同一片水、同一套光照，而不是两个各画各的独立效果。
+        win_on = bool(cfg.get("win_ripple_enabled", False))
+        if win_on:
             if self._win_events:
                 events = self._win_events
                 self._win_events = []
             else:
                 events = self.win.update(dt)
-            moved = False
-            for et, rect in events:
-                if et == "move":
-                    moved = True
-                    self._win_last_rect = rect
-                    self._win_perimeter_ripples(rect, cfg)
-                elif et in ("minimize", "restore"):
-                    self._win_splash(rect, cfg, big=True)
-            if moved:
-                self._win_moving = True
-                self._win_move_t = 0.0
-            else:
-                self._win_move_t += dt
-                if self._win_moving and self._win_move_t > 0.2:
-                    # 拖动结束（停止移动超过 0.2s）-> 落点大爆发，如石子入水
-                    self._win_moving = False
-                    if self._win_last_rect:
-                        self._win_splash(self._win_last_rect, cfg, big=True)
+            for ev in events:
+                self._win_perturb(ev, cfg)
+        else:
+            self.win.reset()
 
         # ---------------- 聚光灯（背景压暗，最先画，让其它特效叠在上面）
         if cfg.get("spotlight_enabled", False):
@@ -286,15 +276,29 @@ class Scene:
         self.ripples.update(dt)
         self.ripples.draw(buf_ms, w, h)
 
-        # ---------------- 真实水波（独立开关，与上面的彩色涟漪正交）
+        # ---------------- 水面（真实水波 / 窗口水波 **共用同一片水**）
         # 排在最后 = 最上层：它写的是半透明**暗**像素（波谷），被别层压住就看不出来了。
-        if cfg.get("wave_enabled", False):
+        # 水面在场 = 真实水波开着（鼠标扰动）**或** 窗口水波开着（窗口扰动）。
+        # 它们不是两个各画各的效果：桌面本来就只有一片水，鼠标划过和窗口推过都该
+        # 落在同一张水面上，也自然共用同一套光照 / 波速 / 余波 / 颜色参数。
+        wave_on = bool(cfg.get("wave_enabled", False)) or win_on
+        if wave_on:
             if self._last_wave_color != cfg["wave_color"]:
                 self.wave.set_color(cfg["wave_color"])
                 self._last_wave_color = cfg["wave_color"]
-            self._wave_trigger(cfg, dist, w, h, dt)
+            if cfg.get("wave_enabled", False):
+                self._wave_trigger(cfg, dist, w, h, dt)
             self.wave.update(dt, cfg)
-            self.wave.draw(buf_ms, w, h, cfg)
+            # 鼠标层这帧是否**只有水波**：缓冲区是空的，就能整片直写上屏，
+            # 省掉"逐像素比掩码"（3.3M 像素下 7.0ms vs 1.0ms）。
+            # 判据一律取**保守**的一侧：误判成 False 只是慢一点，误判成 True
+            # 会把同一层上别人的像素整片抹掉。旧单缓冲签名（u32_mouse=None）
+            # 里这张缓冲还装着雨雪等全屏特效，一律不许直写。
+            self.wave.draw(buf_ms, w, h, cfg, solo=(
+                u32_mouse is not None
+                and not cfg.get("spotlight_enabled", False)
+                and not self.paint._dirty
+                and not self.ripples.active.any()))
         elif self.wave._alive:
             # 关闭时清场：否则重新打开时会冒出上一次留下的波
             self.wave.reset()
@@ -337,51 +341,48 @@ class Scene:
             self._wave_amb = 0.0
 
     # ------------------------------------------------------------ 窗口水波
-    def _win_ripple_color(self, cfg):
-        c = cfg.get("win_ripple_color", "#7FE7FF")
-        if self._last_win_color != c:
-            self._win_ripple_color_cache = hex_to_bgr(c)
-            self._last_win_color = c
-        return self._win_ripple_color_cache
+    # 量级常数只有一份，定义在 WaterRippleField 里（那里是物理所在），这里引用它
+    # 而不是各写一遍 22.0 / 0.10 —— 两处各写一个数，改一处忘一处就是"手感变了
+    # 但没人知道为什么"。
+    _WIN_BAND_PX = WaterRippleField._PUSH_W_DEF   # 扰动带基础宽度（再乘 win_ripple_size）
+    _WIN_DOME = WaterRippleField._DOME_AMP        # 最小化 / 恢复的塌陷 / 抬升幅度
 
-    def _win_perimeter_ripples(self, rect, cfg):
-        """沿窗口四条边采样若干点，各发一圈小涟漪 -> 水波从窗缘向外推。"""
-        x0, y0, x1, y1 = rect
-        w = x1 - x0
-        h = y1 - y0
-        if w <= 0 or h <= 0:
+    def _win_perturb(self, ev, cfg):
+        """把一条窗口事件变成水面上的扰动。
+
+        三类事件各自的物理图像：
+
+        * **change**（移动或缩放）：窗口像活塞，四条边各按**自身速度**推水。
+          朝哪边走，哪边的前缘就隆起、后缘就塌陷 —— 船首波与船尾迹一起出现。
+          平移与改尺寸走的是同一条公式（见 `WaterRippleField.push_rect`）。
+        * **minimize**：窗口离开水面，水从四周合拢去填它占的位置（水面塌陷）。
+        * **restore**：窗口重新压回水面，把水向外推开。
+
+        共同点：**只有速度才产生波**。窗口静止时水面是平的 —— 哪怕它就浮在水上，
+        泡着不动的石头也不搅水。所以这里没有任何"定时器"式的持续注入。
+        """
+        strength = float(cfg.get("win_ripple_strength", 0.7))
+        if strength <= 0.0:
             return
-        col = self._win_ripple_color(cfg)
-        strength = float(cfg["win_ripple_strength"]) * 0.5      # 持续波弱一些
-        life = float(cfg["win_ripple_life"]) * 0.7
-        size = float(cfg["win_ripple_size"])
-        rmax = max(18.0, min(160.0, (w + h) * 0.06 * size))
-        per_edge = max(1, int(cfg["win_ripple_edge_density"]) // 4)
-        pts = []
-        for i in range(per_edge):
-            t = (i + 1) / (per_edge + 1)
-            pts.append((x0 + w * t, y0))
-            pts.append((x0 + w * t, y1))
-            pts.append((x0, y0 + h * t))
-            pts.append((x1, y0 + h * t))
-        for (px, py) in pts:
-            self.ripples.spawn(px, py, rmax, life, strength, col, r0=2.0, squash=0.85)
-
-    def _win_splash(self, rect, cfg, big=False):
-        """在窗口中心放一团（大）涟漪。big=True 用于松手 / 最小化 / 恢复。"""
-        x0, y0, x1, y1 = rect
-        cx = (x0 + x1) * 0.5
-        cy = (y0 + y1) * 0.5
-        w = x1 - x0
-        h = y1 - y0
-        col = self._win_ripple_color(cfg)
-        size = float(cfg["win_ripple_size"])
-        if big:
-            rmax = max(60.0, min(360.0, (w + h) * 0.22 * size))
-            life = float(cfg["win_ripple_life"]) * 1.15
-            strength = float(cfg["win_ripple_strength"])
-        else:
-            rmax = max(40.0, min(220.0, (w + h) * 0.14 * size))
-            life = float(cfg["win_ripple_life"])
-            strength = float(cfg["win_ripple_strength"]) * 0.8
-        self.ripples.spawn(cx, cy, rmax, life, strength, col, r0=3.0, squash=0.9)
+        kind = ev[0]
+        if kind == "change":
+            old, new, edt = ev[1], ev[2], ev[3]
+            if edt <= 1e-6:
+                return
+            inv = 1.0 / edt
+            # 扰动带骑在**这一帧扫过区间的中点**上。边在 dt 里从 old 走到 new，
+            # 水面"看到"的是这段行程的平均像，不是一个端点 —— 取中点等于数值
+            # 积分里的中点法（二阶精度）。
+            # 曾把带钉在行程末端（= 左端点法）：帧率越低、每帧跨得越远，注入
+            # 越被高估 —— 实测同一个拖动手势 30 帧/秒比 120 帧/秒强 1.4 倍。
+            self.wave.push_rect(
+                (0.5 * (old[0] + new[0]), 0.5 * (old[1] + new[1]),
+                 0.5 * (old[2] + new[2]), 0.5 * (old[3] + new[3])),
+                ((new[0] - old[0]) * inv, (new[2] - old[2]) * inv,
+                 (new[1] - old[1]) * inv, (new[3] - old[3]) * inv),
+                strength, edt,
+                self._WIN_BAND_PX * float(cfg.get("win_ripple_size", 1.0)))
+        elif kind == "minimize":
+            self.wave.dome_rect(ev[1], -self._WIN_DOME * strength)
+        elif kind == "restore":
+            self.wave.dome_rect(ev[1], self._WIN_DOME * strength)

@@ -1475,11 +1475,15 @@ class ControlPanel:
         c = tk.Frame(p, bg=CARD)
         c.pack(fill="x", padx=16, pady=(0, 8))
         self._toggle(c, "启用窗口水波", "win_ripple_enabled")
-        self._slider(c, "波大小", "win_ripple_size", 0.4, 3.0, 0.1, "{:.1f} 倍")
-        self._slider(c, "存续时间", "win_ripple_life", 0.3, 2.5, 0.05, "{:.2f} 秒")
-        self._slider(c, "浓度", "win_ripple_strength", 0.05, 1.0, 0.01, "{:.0%}")
-        self._slider(c, "边缘密度", "win_ripple_edge_density", 4, 40, 1, "{:.0f} 点")
-        self._swatch(c, "涟漪颜色", "win_ripple_color", RIPPLE_COLORS)
+        self._slider(c, "扰动强度", "win_ripple_strength", 0.05, 1.0, 0.01, "{:.0%}")
+        self._slider(c, "扰动范围", "win_ripple_size", 0.4, 3.0, 0.1, "{:.1f} 倍")
+        self._hint(c, "把窗口当成浮在水面上的东西：移动或缩放时它推开水——"
+                      "朝哪边走，哪边的前缘就涌起、后缘就塌陷，拖过去的是一道浪；"
+                      "最小化时水从四周合拢填掉它，恢复时再把水压开。")
+        self._hint(c, "只有速度才会起波：窗口静静放着时水面是平的，"
+                      "这和真实水面一致。")
+        self._hint(c, "它和「真实水波」共用同一片水面，"
+                      "水面的波速、余波时长、光照与浓度都在那一页设置。")
         self._save_bar(c, "窗口水波")
         self._preset_block(p, "窗口水波")
         return p

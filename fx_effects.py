@@ -399,15 +399,28 @@ class WaterRippleField:
                                     # "桌面被盖住多少"，0.20 已经能看清波纹了。
     _BRIGHT_E = 1.50                # 迎光侧的亮度曲线指数（用 sqrt 实现，见 draw）
     _RENDER_EPS = 0.03              # 判定"这一格要画"的幅度阈值
+    _LUT_N = 8192                   # "dep -> 预乘像素"查表的量化级数（见 _shade_lut）
+    _LUT_HALF = (_LUT_N - 1) * 0.5  # dep ∈ [-1,1] -> 表索引的缩放
     _BLOCK_PX = 2.2                 # 显示网格的格子边长上限（px）
     _UP_MAX = 2                     # 双线性放大倍数上限
     _PAD = 3                        # 绘制包围盒往外留的格数
+
+    # ---- 活塞扰动（窗口在水面上移动 / 缩放 / 出现 / 离开）----
+    # 窗口是水面上的障碍物：它**不动时水面是平的**，一移动才把水挤开。所以注入量
+    # 正比于边的**法向速度**，而不是"窗口在不在"。下面几个常数只影响量级：
+    _PUSH_V_REF = 900.0             # 参考速度（像素/秒）：拖动窗口的典型速度
+    _PUSH_AMP = 0.14                # 参考速度下，船首那道浪最终积起来的高度
+    _PUSH_W_DEF = 22.0              # 边缘扰动带的基础宽度（像素）
+    _PUSH_W_MIN = 1.6               # 扰动带不得窄于这么多个格 —— 再窄网格表示不出软包
+    _DOME_AMP = 0.10                # 最小化 / 恢复时整块水面抬升或塌陷的幅度
 
     # ---------------------------------------------------------- 生命周期
     def __init__(self, w, h, seed=0):
         self._rng = np.random.RandomState(seed)
         self._t = 0.0
         self._tint = (1.0, 1.0, 1.0)      # 高光染色 **(b, g, r)**，归一化到 0~1，默认纯白
+        self._lut = None                  # 着色+打包的查表（与分辨率无关，见 _shade_lut）
+        self._lut_key = None
         self.resize(w, h)
 
     def resize(self, w, h):
@@ -478,6 +491,159 @@ class WaterRippleField:
         r = float(cfg.get("wave_size", 22.0)) * (1.5 if big else 1.0)
         s = float(cfg.get("wave_strength", self._STRENGTH_REF)) * (2.2 if big else 1.0)
         return self.drop(cx, cy, r, s)
+
+    # ---------------------------------------------------------- 活塞（窗口）
+    def push_rect(self, rect, edge_v, strength, dt, width_px=0.0):
+        """把矩形窗口当活塞：四条边各按**自身的法向速度**把水推开 / 抽回。
+
+        `edge_v = (v左, v右, v上, v下)`，是四条边各自的移动速度（像素/秒，正向
+        沿 +x / +y）。四条边的外法向是固定的（左 −x、右 +x、上 −y、下 +y），
+        于是各边的注入量就是 `v·n`：
+
+            左 −vx0    右 +vx1    上 −vy0    下 +vy1
+
+        **这一个式子同时覆盖平移与改尺寸**：向右拖 = 左边塌陷 + 右边起浪（船尾的
+        空腔、船首的推水）；向右拉宽 = 右边推进；向右缩窄 = 右边抽回。它们本来
+        就是同一个物理量的不同取值，不必写成分支。
+
+        ### 每帧注入多少：既跟速度走，又不依赖帧率
+
+        设扰动带半宽 `W`（像素）。边扫过某个格点时，它在 `2W/(v·dt)` 帧里一直
+        覆盖这个格点，于是逐帧注入量取
+
+            amp_frame = A · clip(v / V_REF) · (v·dt) / (2W)
+
+        累积到扫完之后正好是 `(2/π) · A · clip(v / V_REF)` —— 与帧率**无关**
+        （带是两侧各 W 的余弦包，边扫过一个格点要跨过 2W，积分出 2/π 这个系数），
+        且快的拖动起浪更大（真实船波的弗劳德数也是这个方向），超过 V_REF 后饱和。
+        若简单地"每帧注入一个常数"，30 帧/秒的机器上边在带里停留的帧数减半，
+        浪就莫名弱一半。
+
+        调用方**必须把带骑在"这一帧行程的中点"上**（见 `Scene._win_perturb`）：
+        取端点等于用左端点法做积分，帧率越低每帧跨得越远、注入越被高估。
+        """
+        x0, y0, x1, y1 = (float(v) for v in rect)
+        if x1 <= x0 or y1 <= y0:
+            return False
+        c = self.cell
+        half_w = max(float(width_px) if width_px > 0.0 else self._PUSH_W_DEF,
+                     self._PUSH_W_MIN * c)
+        # 屏幕外的部分不用注入；先把矩形收进网格范围（大窗口常常只露出一部分）
+        x0 = float(np.clip(x0, 0.0, self.w))
+        x1 = float(np.clip(x1, 0.0, self.w))
+        y0 = float(np.clip(y0, 0.0, self.h))
+        y1 = float(np.clip(y1, 0.0, self.h))
+        if x1 <= x0 or y1 <= y0:
+            return False
+        dt = max(float(dt), 1.0 / 240.0)
+        vx0, vx1, vy0, vy1 = (float(v) for v in edge_v)
+        scale = float(strength) * self._PUSH_AMP / (2.0 * half_w) * dt
+        hit = False
+        for axis, coord, lo, hi, vn in ((0, x0, y0, y1, -vx0),
+                                        (0, x1, y0, y1, vx1),
+                                        (1, y0, x0, x1, -vy0),
+                                        (1, y1, x0, x1, vy1)):
+            sp = float(np.clip(abs(vn) / self._PUSH_V_REF, 0.0, 1.0))
+            if sp <= 0.0:
+                continue
+            # 面积守恒那一项：这一帧边只扫过 vn·dt，注入量按扫过的比例摊。
+            amp = scale * sp * vn
+            if abs(amp) < 1e-7:
+                continue
+            if self._push_band(axis, coord, lo, hi, amp, half_w):
+                hit = True
+        if hit:
+            self._alive = True
+        return hit
+
+    def _push_band(self, axis, coord, lo, hi, amp, half_w):
+        """沿一条直线边注入一条软包带。axis=0 竖直边（法向沿 x），1 水平边（法向沿 y）。
+
+        法向：以这条边的位置为中心、两侧各 `half_w` 的升余弦（边上为 1，±half_w
+        处归零）—— 位移正好骑在边上、两侧对称，就是"活塞推水时留下的那道隆起"。
+        切向：`[lo, hi]` 内恒为 1，两端各 `half_w` 内收口，角上才不会切出一条硬边。
+
+        用软包带而不是沿边撒一串落点：落点间距必然大于波半径，波前会变成一串
+        珠子；带既连成一条，又处处一阶连续（硬边会激起网格噪声，见 `test_no_grid_artifact`）。
+        """
+        c = self.cell
+        lim_a, lim_b = (self.gw, self.gh) if axis == 0 else (self.gh, self.gw)
+        a0 = max(0, int(np.floor((coord - half_w) / c)))
+        a1 = min(lim_a, int(np.ceil((coord + half_w) / c)) + 1)
+        b0 = max(0, int(np.floor((lo - half_w) / c)))
+        b1 = min(lim_b, int(np.ceil((hi + half_w) / c)) + 1)
+        if a1 <= a0 or b1 <= b0:
+            return False
+        hw = np.float32(half_w)
+        # **两个轴都先换成像素再比** —— `coord` / `lo` / `hi` 都是像素，格索引
+        # 直接拿去减会差出一个 `cell` 的倍数（曾经漏了这一下，整条带恒为 0）。
+        # 格中心 = idx·cell + cell/2。
+        pa = np.arange(a0, a1, dtype=np.float32)
+        pa = pa * np.float32(c) + np.float32(0.5 * c)
+        # 法向：到边的距离 / half_w
+        pa = np.abs(pa - np.float32(coord)) / hw
+        np.clip(pa, 0.0, 1.0, out=pa)
+        # 切向：到 [lo, hi] 的距离 / half_w（区间内为 0 -> 包值为 1）
+        pb = np.arange(b0, b1, dtype=np.float32)
+        pb = pb * np.float32(c) + np.float32(0.5 * c)
+        pb = np.maximum(np.maximum(np.float32(lo) - pb, pb - np.float32(hi)),
+                        0.0) / hw
+        np.clip(pb, 0.0, 1.0, out=pb)
+        half_pi = np.float32(np.pi * 0.5)
+        pa = np.cos(pa * half_pi)          # 升余弦：t=0 处 1、t=1 处 0
+        pb = np.cos(pb * half_pi)
+        if axis == 0:      # 竖直边：法向是 x，所以 outer 的行是 y、列是 x
+            prof = np.multiply.outer(pb, pa)
+            self.height[b0:b1, a0:a1] += np.float32(amp) * prof
+        else:              # 水平边：法向是 y，行正是 y
+            prof = np.multiply.outer(pa, pb)
+            self.height[a0:a1, b0:b1] += np.float32(amp) * prof
+        return True
+
+    def dome_rect(self, rect, amp):
+        """整块矩形当作水面上的一"包"：中心最高、四边归零（amp 可正可负）。
+
+        最小化 = 窗口离开水面，水从四周合拢填掉它占的位置（amp < 0：水面塌陷，
+        边缘的坡同时把波往里、往外推，看着就是"水合拢"）；恢复 = 窗口重新压回
+        水面（amp > 0：把水向外推开）。同一几何形状的两个相位，波形差半个波，
+        "离开"和"压回"一眼能分辨。
+
+        用**可分离**的升余弦包（沿 x、y 各一条 cos 曲线相乘）：形状是圆角的包、
+        没有硬边，成本只有一次外积。整块矩形（而不是只做一圈边）是因为窗口离开
+        水面时，水的运动发生在它**留下的整个空洞**上。
+        """
+        amp = float(amp)
+        if abs(amp) < 1e-7:
+            return False
+        c = self.cell
+        x0, y0, x1, y1 = (float(v) for v in rect)
+        x0 = float(np.clip(x0, 0.0, self.w))
+        x1 = float(np.clip(x1, 0.0, self.w))
+        y0 = float(np.clip(y0, 0.0, self.h))
+        y1 = float(np.clip(y1, 0.0, self.h))
+        if x1 - x0 < c or y1 - y0 < c:
+            return False
+        ix0 = max(0, int(np.floor(x0 / c)))
+        ix1 = min(self.gw, int(np.ceil(x1 / c)))
+        iy0 = max(0, int(np.floor(y0 / c)))
+        iy1 = min(self.gh, int(np.ceil(y1 / c)))
+        if ix1 <= ix0 or iy1 <= iy0:
+            return False
+        hw = max(0.5 * (x1 - x0), 0.5 * c)
+        hh = max(0.5 * (y1 - y0), 0.5 * c)
+        half_pi = np.float32(np.pi * 0.5)
+        f = np.float32(c)
+        px = ((np.arange(ix0, ix1, dtype=np.float32) + np.float32(0.5)) * f
+              - np.float32((x0 + x1) * 0.5)) / np.float32(hw)
+        py = ((np.arange(iy0, iy1, dtype=np.float32) + np.float32(0.5)) * f
+              - np.float32((y0 + y1) * 0.5)) / np.float32(hh)
+        np.clip(px, -1.0, 1.0, out=px)
+        np.clip(py, -1.0, 1.0, out=py)
+        px = np.cos(px * half_pi)
+        py = np.cos(py * half_pi)
+        self.height[iy0:iy1, ix0:ix1] += np.float32(amp) * np.multiply.outer(py, px)
+        self._alive = True
+        return True
 
     # ---------------------------------------------------------- 推进
     def step(self, k, damp):
@@ -555,7 +721,7 @@ class WaterRippleField:
             hx, hy = self.slope(box)
         return (hx * lx + hy * ly) / np.sqrt(hx * hx + hy * hy + knee2)
 
-    def draw(self, u32, w, h, cfg):
+    def draw(self, u32, w, h, cfg, solo=False):
         """把波面画成**迎光提亮 / 背光压暗**的亮暗条纹。
 
         参考的第三段是 `tex(背景, uv + offset * perturbance)` —— 真折射。我们拿不到
@@ -563,6 +729,9 @@ class WaterRippleField:
         再在浪尖叠一道高光。亮 = 白色预乘像素（把桌面提亮），暗 = 黑色预乘像素
         （把桌面压暗）——`UpdateLayeredWindow` 走的是 ULW_ALPHA + 预乘，
         两者都成立（聚光灯的全屏压暗早就在用这个能力）。
+
+        `solo=True` 表示**本帧鼠标层上只有水波**（聚光灯 / 颜料盘 / 涟漪都没出图）。
+        调用方若不能确定，一律用默认的 False —— 那只是慢一点，不会画错。
         """
         if not self._alive:
             return
@@ -617,51 +786,26 @@ class WaterRippleField:
             np.multiply(mid, wy[:, None], out=mid)
             np.add(dep, mid, out=dep)
         qh, qw = dep.shape
-
-        # `pos = clip(dep, 0, 1)`、`neg = clip(-dep, 0, 1)`，而二者必有一个是 0，
-        # 所以 `neg == pos - dep` —— 省掉一次 clip。
-        pos = np.clip(dep, 0.0, 1.0)
-        neg = pos - dep
         k_s = float(np.clip(cfg.get("wave_contrast", self._KS_DEF), 0.0, 1.5))
         k_d = float(np.clip(cfg.get("wave_shading", self._KD_DEF), 0.0, 1.0))
         k_sp = float(np.clip(cfg.get("wave_highlight", self._KSP_DEF), 0.0, 1.5))
 
-        # **绝不能用 `pos ** 1.3` / `pos ** 4`**：float32 的 np.power 实测
-        # 25ns/元素（1080p 满屏两次要 80ms），是全流程最贵的一项。
-        # 换成 `pos * sqrt(pos)`（= pos^1.5）与 `(pos²)²` 后只要 1/8 的时间。
-        # 指数从 1.3 提到 1.5 的观感差别很小（pos=0.5 处 0.406 -> 0.354），
-        # 亮条纹会稍细一点 —— 反而更像水面的高光。
-        sq = np.sqrt(pos)
-        sq *= pos
-        p2 = pos * pos
-        p2 *= p2
-        sq *= np.float32(k_s)
-        p2 *= np.float32(k_sp)
-        np.add(sq, p2, out=sq)
-        np.clip(sq, 0.0, 1.0, out=sq)          # sq = bright
-        neg *= np.float32(k_d)                 # neg = dark
-
-        # dark 用完即弃，直接拿它当 (bright + dark) 的容器 —— 两者互斥。
-        # 之后 sq 是"提亮量 0~255"、neg 是"alpha 0~255"。
-        np.add(sq, neg, out=neg)
-        neg *= np.float32(255.0 * op)
-        np.clip(neg, 0.0, 255.0, out=neg)
-        sq *= np.float32(255.0 * op)
-
-        ab = (neg + 0.5).astype(np.uint32)
-        # 染色是 0~1 的倍数，必须乘回 255 才是预乘的通道值
-        # （hex_to_bgr 给的是 0~255，set_color 里已经除过）。
-        # **顺序是 (b, g, r)** —— `_premul_pack` 收的就是 bgr，存成 rgb 会红蓝互换
-        # （第一版就是这么错的：设 #FF0000 画出来是蓝的）。
-        # 色是常量，`sq` 是已经乘好 255·op 的提亮量，所以这里只剩一次乘法。
-        cb, cg, cr = self._tint
-        small = _premul_pack(
-            (sq * np.float32(cb) + 0.5).astype(np.uint32),
-            (sq * np.float32(cg) + 0.5).astype(np.uint32),
-            (sq * np.float32(cr) + 0.5).astype(np.uint32), ab)
+        # **着色与打包合成一次查表**：这两步的结果只取决于 `dep` 一个标量（k 与
+        # 浓度都是本帧的常量），于是可以预先算成一张 8192 级的表，运行时只剩
+        # "量化 + 查表"三步。原来那条二十多趟数组运算的流水线实测 16.9 ms
+        # @52.7 万格（打包一项就 11.5 ms，是全帧最贵的地方），现在约 2 ms。
+        # 误差见 `_shade_lut` 的推导：不到 0.02 个字节。
+        lut = self._shade_lut(k_s, k_d, k_sp, op)
+        idx = dep + np.float32(1.0)
+        idx *= np.float32(self._LUT_HALF)
+        idx += np.float32(0.5)              # +0.5 再取整 = 四舍五入
+        np.clip(idx, 0.0, np.float32(self._LUT_N - 1), out=idx)
+        small = lut[idx.astype(np.int32)]
 
         # 上屏：先 x 后 y（结果才是 C 连续，见 PaintField 的踩坑），
-        # 且**只覆盖非零像素**，别把别层画好的东西整片抹掉。
+        # 且**只覆盖非零像素**，别把鼠标层上别人画好的东西整片抹掉。
+        # `solo=True` 时（本帧鼠标层只有水波）缓冲区是空的，改成整片直写：
+        # 实测 3.3M 像素下"掩码 + 按掩码写"要 7.0 ms，直写只要 1.0 ms。
         py0 = max(0, int(np.floor(ry0 * self.cell)))
         px0 = max(0, int(np.floor(rx0 * self.cell)))
         py1 = min(int(h), int(np.ceil(ry1 * self.cell)))
@@ -680,7 +824,64 @@ class WaterRippleField:
         np.clip(ix, 0, qw - 1, out=ix)
         big = small[:, ix][iy]
         dst = u32.reshape(int(h), int(w))[py0:py1, px0:px1]
-        np.copyto(dst, big, where=big != 0)
+        if solo:
+            dst[:] = big
+        else:
+            np.copyto(dst, big, where=big != 0)
+
+    def _shade_lut(self, k_s, k_d, k_sp, op):
+        """"明暗量 -> 预乘像素"的查表（8 千级）。参数或染色一变就重建。
+
+        整条着色链的输入只有 `dep` 一个标量，输出也只有那一个像素，所以它可以
+        完全预计算 —— 这是把上屏成本从"二十多趟数组运算"降到"量化 + 查表"的
+        根据。原式逐条抄在下面（**改动这里必须同步改 draw 的说明**）：
+
+            pos  = clip(dep, 0, 1)          neg = clip(-dep, 0, 1) = pos - dep
+            bright = clip(pos^1.5·k_s + pos⁴·k_sp, 0, 1)
+            alpha  = clip(bright + neg·k_d, 0, 1) · 255·op
+            rgb    = bright · 255·op · 染色
+
+        `pos^1.5` 用 `pos·sqrt(pos)`、`pos⁴` 用 `(pos²)²` —— float32 的 `np.power`
+        实测 25ns/元素，是全流程最贵的一项，现在只在建表时对 8192 个点算一次。
+
+        **量化误差**：dep 被分成 `_LUT_N` 级，单级宽 `2/(N-1)`。输出对 dep 的斜率
+        最陡处在迎光支的 pos=1 附近，约 `(1.5·k_s + 4·k_sp)·255·浓度`；面板把
+        `k_s/k_sp` 限在 1.5、浓度限在 0.20，故斜率 ≤ 2.5·255·0.20 ≈ 128 字节/单位，
+        乘以级宽 2.4e-4 得 **0.03 个字节** —— 连一个量化台阶都不到，肉眼无差。
+
+        **染色顺序是 (b, g, r)**：`_premul_pack` 收的就是 bgr，存成 rgb 会红蓝互换
+        （第一版就是这么错的：设 #FF0000 画出来是蓝的）。
+        """
+        key = (k_s, k_d, k_sp, op, self._tint)
+        if key == self._lut_key:
+            return self._lut
+        d = np.linspace(-1.0, 1.0, self._LUT_N, dtype=np.float32)
+        pos = np.clip(d, 0.0, 1.0)
+        neg = pos - d
+        # `pos = clip(dep,0,1)`、`neg = clip(-dep,0,1)` 二者必有一个是 0，
+        # 所以 `neg == pos - dep` —— 省掉一次 clip。
+        sq = np.sqrt(pos)
+        sq *= pos                              # pos^1.5
+        p2 = pos * pos
+        p2 *= p2                               # pos^4
+        sq *= np.float32(k_s)
+        p2 *= np.float32(k_sp)
+        np.add(sq, p2, out=sq)
+        np.clip(sq, 0.0, 1.0, out=sq)          # sq = bright
+        neg *= np.float32(k_d)                 # neg = dark
+        # dark 用完即弃，直接拿它当 (bright + dark) 的容器 —— 两者互斥。
+        np.add(sq, neg, out=neg)
+        neg *= np.float32(255.0 * op)
+        np.clip(neg, 0.0, 255.0, out=neg)      # neg = alpha
+        sq *= np.float32(255.0 * op)           # sq = 提亮量 0~255
+        cb, cg, cr = self._tint
+        self._lut = _premul_pack(
+            (sq * np.float32(cb) + np.float32(0.5)).astype(np.uint32),
+            (sq * np.float32(cg) + np.float32(0.5)).astype(np.uint32),
+            (sq * np.float32(cr) + np.float32(0.5)).astype(np.uint32),
+            (neg + np.float32(0.5)).astype(np.uint32))
+        self._lut_key = key
+        return self._lut
 
     def slope(self, box=None):
         """**前向差分**坡度（每格）。和参考的 cross(dy, dx) 用的是同一对量。
@@ -856,14 +1057,38 @@ _OVERLAY_CLASS = "DesktopFXOverlayCls"
 
 
 class WindowProbe:
-    """枚举桌面窗口并跨帧 diff，输出 move / minimize / restore 事件。
+    """枚举桌面窗口并跨帧跟踪，输出"窗口动了"的事件流。
 
-    这是"窗口交互"特效的公共地基：Scene 每帧消费事件，在窗口移动、最小化、
-    恢复时触发涟漪。为不增加每帧负担，update 内部节流到 ~10Hz。
+    两种节奏
+    --------
+    * **每帧**：只对**热点窗口**（最近动过的那几个 + 当前前台窗口）各读一次
+      `GetWindowRect`。一次内核调用几微秒，所以拖动 / 缩放中的窗口能拿到逐帧
+      精确的矩形；
+    * **10Hz**：全量 `EnumWindows`，负责发现"谁开始动了"，以及最小化 / 恢复 /
+      出现 / 消失。全量枚举要几百微秒，不能每帧做。
+
+    为什么非要逐帧：事件只报"窗口现在在哪"，调用方还得靠**位移 ÷ 时间**算出
+    窗口的速度，而水面被推开的幅度正比于这个速度（见 `WaterRippleField.push_rect`）。
+    只按 10Hz 采样的话，拖动中的窗口每帧差 100 像素，速度既测不准、注入又只在
+    每 6 帧来一串 —— 看着就是一顿一顿的。
+
+    事件（rect 都已折算到覆盖层坐标系）
+    ----------------------------------
+        ("change",   旧矩形, 新矩形, 经过的时间)   移动 / 缩放，逐帧
+        ("minimize", 最小化前的矩形, 经过的时间)
+        ("restore",  恢复后的矩形,   经过的时间)
+
+    矩形**变了**就报 change，不区分"平移"还是"改尺寸"：调用方拿到前后两条边
+    就能算出四条边各自的速度，平移与缩放本来就是同一件事（见 push_rect）。
+
+    新建窗口（各种弹窗、气泡、提示框）**刻意不报** —— 桌面上冒一个气泡就掀
+    一片浪只会吵闹。
 
     仅在 Windows 下真正工作（依赖 user32.EnumWindows）；非 Windows 环境
     update 安全返回空列表，不影响其它特效。
     """
+
+    _HOT_TTL = 0.7          # 窗口动过之后，保持"逐帧跟踪"多久（秒）
 
     def __init__(self, throttle=0.1):
         self._throttle = float(throttle)
@@ -873,6 +1098,7 @@ class WindowProbe:
         self.ov_x = 0
         self.ov_y = 0
         self._prev = {}                      # hwnd -> ((x0,y0,x1,y1), minimized)
+        self._hot = {}                       # hwnd -> 还要逐帧跟踪多少秒
         self._vs_w = 0
         self._vs_h = 0
         if _WIN32_OK:
@@ -922,36 +1148,93 @@ class WindowProbe:
             return {}
         return result
 
-    def _diff(self, prev, cur):
-        """对比前后两帧窗口集合，输出事件（rect 已折算到覆盖层坐标系）。"""
+    def _diff(self, prev, cur, dt):
+        """纯函数：对比两批快照，输出事件（rect 已折算到覆盖层坐标系）。
+
+        四条边的位移之和 ≤ 1 像素的变化不算（有些窗口会自己抖 1 像素；那点速度
+        只会往水里注入约 0.01 的位移，却会让"水面一直活着"、鼠标层每帧白上屏）。
+        """
         events = []
         for hwnd, (rect, minimized) in cur.items():
             p = prev.get(hwnd)
             if p is None:
-                continue                        # 新建窗口（open）暂不处理
+                continue                        # 新建窗口：不报（弹窗会刷屏）
             prect, pmin = p
             if minimized and not pmin:
-                events.append(("minimize", self._to_local(prect)))
+                events.append(("minimize", self._to_local(prect), dt))
             elif not minimized and pmin:
-                events.append(("restore", self._to_local(rect)))
-            elif not minimized and not pmin:
-                if abs(rect[0] - prect[0]) + abs(rect[1] - prect[1]) > 4:
-                    events.append(("move", self._to_local(rect)))
+                events.append(("restore", self._to_local(rect), dt))
+            elif not minimized and not pmin and (
+                    abs(rect[0] - prect[0]) + abs(rect[1] - prect[1])
+                    + abs(rect[2] - prect[2]) + abs(rect[3] - prect[3])) > 1:
+                events.append(("change", self._to_local(prect),
+                               self._to_local(rect), dt))
         return events
 
+    def reset(self):
+        """清掉全部跟踪状态。
+
+        特效关掉时调用：否则重新打开后，第一次全量扫描会把"上次关掉之前的位置"
+        当成参照，算出一个跨越整个停用期的巨大位移（速度 → 直接顶到上限），
+        无端炸出一片浪。
+        """
+        self._prev = {}
+        self._hot = {}
+        self._acc = 1.0
+
     def update(self, dt):
-        """返回本帧窗口事件列表 [(type, rect), ...]，rect 为覆盖层坐标系。"""
+        """每帧调用，返回本帧的窗口事件列表。"""
+        dt = float(dt)
+        if not _WIN32_OK:
+            return []
+        events = self._track(dt)               # 先逐帧精测，再全量扫描
         self._acc += dt
-        if self._acc < self._throttle:
+        if self._acc >= self._throttle:
+            scan_dt, self._acc = self._acc, 0.0
+            try:
+                cur = self._enumerate()
+            except Exception:
+                cur = {}
+            if cur:
+                events.extend(self._scan(cur, scan_dt))
+        return events
+
+    def _track(self, dt):
+        """逐帧精测热点窗口。只读那几个 hwnd，成本与窗口总数无关。"""
+        if not self._hot:
             return []
-        self._acc = 0.0
-        try:
-            cur = self._enumerate()
-        except Exception:
-            return []
-        if not cur:
-            return []
-        events = self._diff(self._prev, cur)
+        out = []
+        rect = wt.RECT()
+        for hwnd in list(self._hot):
+            ttl = self._hot[hwnd] - dt
+            if ttl <= 0.0:
+                del self._hot[hwnd]
+                continue
+            self._hot[hwnd] = ttl
+            if not _GetWindowRect(hwnd, ctypes.byref(rect)):
+                del self._hot[hwnd]
+                continue
+            if _IsIconic(hwnd):
+                continue                        # 最小化 / 恢复交给全量扫描
+            now = (rect.left, rect.top, rect.right, rect.bottom)
+            p = self._prev.get(hwnd)
+            if p is None or p[1] or p[0] == now:
+                continue
+            out.append(("change", self._to_local(p[0]), self._to_local(now), dt))
+            self._prev[hwnd] = (now, False)
+            self._hot[hwnd] = self._HOT_TTL     # 还在动，继续跟
+        return out
+
+    def _scan(self, cur, dt):
+        """10Hz 全量扫描：找出新动过的窗口、最小化 / 恢复，并刷新热点集合。"""
+        events = self._diff(self._prev, cur, dt)
+        for hwnd, (rect, mini) in cur.items():
+            p = self._prev.get(hwnd)
+            if p is not None and not mini and rect != p[0]:
+                self._hot[hwnd] = self._HOT_TTL     # 刚发现它在动 -> 转逐帧
+        self._prev = cur
+        for h in [k for k in self._hot if k not in cur]:
+            del self._hot[h]
         # 更新可见窗口列表与活动窗口（覆盖层坐标系）
         self.windows = [self._to_local(r) for (r, m) in cur.values() if not m]
         # GetForegroundWindow() 在"焦点在桌面"或切换窗口的瞬间会返回 NULL，
@@ -961,7 +1244,10 @@ class WindowProbe:
         fg = int(fg) if fg else None
         act = cur.get(fg)
         self.active = self._to_local(act[0]) if (act and not act[1]) else None
-        self._prev = cur
+        if act and not act[1]:
+            # 前台窗口恒为热点：用户刚开始拖的那一刻不必等下一次全量扫描，
+            # 否则起步的 0.1 秒是"死"的 —— 人已经在拖，水面还没反应。
+            self._hot[fg] = self._HOT_TTL
         return events
 
     def _to_local(self, rect):

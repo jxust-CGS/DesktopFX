@@ -36,8 +36,9 @@ EFFECTS = {
     "涟漪":     dict(cat="鼠标特效", layer="mouse", enable="ripple_enabled"),
     "真实水波": dict(cat="鼠标特效", layer="mouse", enable="wave_enabled"),
     # ---- 其他特效：既不由鼠标驱动，也不是整屏氛围 ----
-    # 窗口水波画进**鼠标层**：它复用的是涟漪池（RippleField），而涟漪池整体
-    # 画在鼠标层上 —— 拆成两层会让窗口水波和鼠标涟漪打架（同一池子只能画一处）。
+    # 窗口水波画进**鼠标层**：它和真实水波共用同一片水面（窗口只是往水里注入
+    # 位移，不自己画），而那片水面整体画在鼠标层上。分成两层会让同一片水被两个
+    # 覆盖窗各画一半。
     "窗口水波": dict(cat="其他特效", layer="mouse", enable="win_ripple_enabled"),
 }
 
