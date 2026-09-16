@@ -297,6 +297,10 @@ def main():
           f"自适应高度不改宽度：{saved.get('win_w')} == {p.W}")
     check(p.H == p._clamp_h(max(p.H_MIN, p._content_h + p._chrome)),
           f"自适应高度 {p.H} = 内容 {p._content_h} + chrome {p._chrome}")
+    sr = p._size_rows["win_h"]
+    check(int(sr["var"].get()) == p.H and sr["label"].cget("text") == f"{p.H} 像素",
+          f"自适应后「窗口高度」显示 {sr['label'].cget('text')!r}"
+          f"（实际 {p.H}）—— 构造期它是按默认 742 建的，必须跟着改")
     p._show_page("下雨")
     p.root.update_idletasks()
     check(not p._need_scroll(), "自适应后「下雨」页无需滚动")
@@ -330,6 +334,9 @@ def main():
           f"宽度滑块同步为 {p2._size_rows['win_w']['var'].get():.0f}")
     check(int(p2._size_rows["win_h"]["var"].get()) == 666,
           f"高度滑块同步为 {p2._size_rows['win_h']['var'].get():.0f}")
+    for k, want in (("win_w", 777), ("win_h", 666)):
+        lb = p2._size_rows[k]["label"].cget("text")
+        check(lb == f"{want} 像素", f"{k} 数值标签显示 {lb!r}（期望 {want}）")
     check(p2._content_h > 0, f"内容高度已测出：{p2._content_h}")
     _close(p2)
 
@@ -343,6 +350,11 @@ def main():
     check(p3.W == p3.W_DEF, f"默认宽度 {p3.W}（期望 {p3.W_DEF}）")
     check(p3.H == expect_h,
           f"默认高度按内容自适应 {p3.H}（期望 {expect_h}）")
+    sr = p3._size_rows["win_h"]
+    check(int(sr["var"].get()) == p3.H,
+          f"自适应后高度滑块 {sr['var'].get():.0f} == 实际 {p3.H}")
+    check(sr["label"].cget("text") == f"{p3.H} 像素",
+          f"自适应后高度标签 {sr['label'].cget('text')!r} == {p3.H} 像素")
     check(p3.root.winfo_height() >= p3._content_h,
           f"窗口装得下最长页：{p3.root.winfo_height()} >= {p3._content_h}")
     try:

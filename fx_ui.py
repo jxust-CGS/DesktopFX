@@ -723,8 +723,7 @@ class ControlPanel:
         self._user_w = int(self.W)
         self._ui["win_w"] = self._user_w
         self._save_ui_state()
-        self._fit_height()
-        self._sync_size_rows()
+        self._fit_height()      # 内部会同步「窗口尺寸」的数值标签
 
     def _size_reset(self):
         """两个方向都回到默认：宽度用默认值，高度按内容自适应。"""
@@ -733,8 +732,7 @@ class ControlPanel:
         self._ui.pop("win_h", None)
         self.W, self.H = self.W_DEF, self.H_DEF
         self._save_ui_state()
-        self._fit_height()
-        self._sync_size_rows()
+        self._fit_height()      # 内部会同步「窗口尺寸」的数值标签
 
     def _hwnd(self):
         """面板真正的顶层 hwnd。
@@ -1089,6 +1087,10 @@ class ControlPanel:
         # 恢复当前页（pack fill + 复位滚动）；滚动区交给 <Configure> 绑定自愈，
         # 此处不再 flush。
         self._show_page(self._active)
+        # 「窗口尺寸」卡片里的数值必须反映**真实**尺寸。构造期它是按 H_DEF
+        # (742) 建的，自适应之后 H 变成按内容算出的值（例如 916）—— 不在这里
+        # 同步，标签就永远停在 742，和窗口实际高度对不上。
+        self._sync_size_rows()
 
     def _show_page(self, name):
         for n, f in self._pages.items():

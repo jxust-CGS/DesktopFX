@@ -9,8 +9,10 @@
     python _shot_panel.py            # 生成 panel-rain / panel-other / panel-paint
 """
 import ctypes
+import os
 import queue
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -22,6 +24,11 @@ import fx_ui                    # noqa: E402
 import _shot                    # noqa: E402
 
 OUT_DIR = ROOT / "docs" / "images"
+
+# 隔离 UI 状态：_show_page 会把"上次停留的页面"写回 ui_state.json，那是用户
+# 真实在用的文件（里面还记着他调好的窗口尺寸）。截图工具不该改用户的设置。
+fx_ui._UI_STATE_PATH = os.path.join(tempfile.mkdtemp(prefix="fx_shot_"),
+                                    "ui_state.json")
 
 
 class _StubApp:
@@ -107,8 +114,18 @@ def _shoot(panel, page, out):
     panel.root.update()
     time.sleep(0.7)          # 等 DWM 圆角/亚克力画完，否则抓到方角
     panel.root.update()
-    grab(panel.root.winfo_x(), panel.root.winfo_y(),
-         panel.root.winfo_width(), panel.root.winfo_height(), out)
+    # 抓图期间把整体不透明度顶到 1.0：面板平时是 0.97（Tk 用分层窗实现），
+    # 那 3% 会把**背后的窗口**透进截图 —— 背后恰好开着文件管理器时，README
+    # 图里就会浮出别人的文件夹列表。截图要的是面板本身，不是当时的桌面。
+    panel.root.attributes("-alpha", 1.0)
+    panel.root.update()
+    time.sleep(0.15)
+    try:
+        grab(panel.root.winfo_x(), panel.root.winfo_y(),
+             panel.root.winfo_width(), panel.root.winfo_height(), out)
+    finally:
+        panel.root.attributes("-alpha", 0.97)
+        panel.root.update()
 
 
 def main():
