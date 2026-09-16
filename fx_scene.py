@@ -86,10 +86,20 @@ class Scene:
         fs = bool(cfg.get("rain_enabled", True) or cfg.get("snow_enabled", False)
                   or cfg.get("petal_enabled", False)
                   or cfg.get("meteor_enabled", False))
+        # 2026-09-15 修：早先这里是"开着就算有内容"（`wave_enabled` /
+        # `paint_enabled` / `win_ripple_enabled` 一律当 True）。后果是**真实水波
+        # 一开，鼠标层就永远上屏** —— 哪怕场上一个波都没有，也每帧白付约 5.9ms。
+        # 实测用户配置（真实水波 + 雪）只有 49 帧/秒、12.5% 掉帧，其中鼠标层
+        # 那 5.7ms 全是空转。改成读特效**自身的状态**：
+        #   - 真实水波 `_alive`：draw() 开头就用它早退，精确；
+        #   - 颜料盘 `_dirty`：颜料散尽时 draw() 自己会清零，精确；
+        #   - 窗口水波不直接出图（它把涟漪扔进涟漪池），池子的 active 已覆盖；
+        #   - 聚光灯恒画满屏压暗，只有它继续按开关判（开 = 真有内容）。
+        # 这样收紧是**安全**的：调用方的像素复核只会把 False 翻成 True，
+        # 判空判错了也不会把上一帧冻在桌面上。
         ms = bool(cfg.get("spotlight_enabled", False)
-                  or cfg.get("paint_enabled", False)
-                  or cfg.get("wave_enabled", False)
-                  or cfg.get("win_ripple_enabled", False)
+                  or self.paint._dirty
+                  or (cfg.get("wave_enabled", False) and self.wave._alive)
                   or self.ripples.active.any())
         return fs, ms
 

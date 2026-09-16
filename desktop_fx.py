@@ -751,6 +751,7 @@ class App:
         scene.set_origin(ov_fs.x, ov_fs.y)
 
         last = time.perf_counter()
+        next_t = last       # 下一帧的目标**绝对**时刻（帧率控制用，见循环末尾）
         frame = 0
         fps_ema = 60.0
         _last_alive = 0.0   # 上次"桌面层存活自检"时刻
@@ -758,6 +759,12 @@ class App:
         # 上一帧该层是否**有内容**。用于空层跳过呈现（见第 5 步注释）：
         # 有 -> 空 的那一帧还要补提交一次，把上一帧的像素擦掉。
         fs_dirty = ms_dirty = True
+        # 上一帧两层是否**空**（即缓冲确实全零）。空层的"把缓冲清零"这一下也
+        # 可以跳过 —— 全零的缓冲再清一遍纯属白干，两层合计 2.8ms/帧
+        # @3840x1200。安全性：第 5 步的 `*_has` 是**像素复核之后**的结论
+        # （`max() != 0`），它为 False 就等价于"上帧缓冲全零"，所以跳过清零与
+        # 真的清零**逐像素等效**，不可能把旧像素留在缓冲里。见 _probe_layer_skip。
+        fs_empty = ms_empty = True
         # 系统任务栏矩形（缓存）。每次都得跨进程读窗口矩形，所以别每帧问；
         # 但也不能缓存太久：任务栏自动隐藏时会被系统挪到屏幕外（此时矩形与
         # 虚拟屏不相交、自然不擦），鼠标触到屏幕边缘它又滑回来 —— 缓存 0.25s
@@ -851,8 +858,13 @@ class App:
                 # 5) 合成并上屏：全屏层一张、鼠标层一张
                 u32_fs = ov_fs.u32
                 u32_ms = ov_ms.u32
-                u32_fs[:] = 0
-                u32_ms[:] = 0
+                # 上帧为空的层不必再清零：缓冲本来就全是零，清一遍等于没清。
+                # 重建 / 改尺寸后的 DIB 是新分配的、同样是零，但那种帧很少，
+                # 仍旧老实清一次，不去纠结"新 DIB 到底清没清过"。
+                if not fs_empty or rebuilt or resized:
+                    u32_fs[:] = 0
+                if not ms_empty or rebuilt or resized:
+                    u32_ms[:] = 0
                 scene.cfg = cfg
                 scene.step(dt, u32_fs, w, h, u32_ms)
 
@@ -883,18 +895,25 @@ class App:
                 # 溅起的水花，按开关推断会把它冻在屏幕上。
                 # 有 -> 空 的那一帧必须补提交一次（把上一帧的像素擦掉），之后才
                 # 跳过；窗口重建 / 改过尺寸 / 层级切换后也要补一次，否则新 DIB 不上屏。
+                # 空判定用 `.max() != 0` 而不是 `.any()`：uint32 上两者语义**完全
+                # 等价**（无符号整数存在非零 ⟺ 最大值非零），但 `.any()` 要先跑
+                # 一遍 bool 转换，实测 4.6M 像素要 3.34ms，`.max()` 只要 0.67ms ——
+                # 5 倍。这句每帧每层都要过，省下的纯是赚的。
                 force = rebuilt or resized or modes_changed
                 fs_has, ms_has = scene.layer_activity()
                 if not fs_has:
-                    fs_has = bool(u32_fs.any())
+                    fs_has = int(u32_fs.max()) != 0
                 if not ms_has:
-                    ms_has = bool(u32_ms.any())
+                    ms_has = int(u32_ms.max()) != 0
                 if fs_has or fs_dirty or force:
                     ov_fs.present()
                     fs_dirty = fs_has
                 if ms_has or ms_dirty or force:
                     ov_ms.present()
                     ms_dirty = ms_has
+                # 记下"这一帧结束时缓冲是不是空的"，供下一帧决定要不要清零
+                fs_empty = not fs_has
+                ms_empty = not ms_has
                 self.clear_error()
                 frame += 1
             except Exception as exc:      # 单帧异常不终止整个特效
@@ -920,9 +939,21 @@ class App:
             self.fps = fps_ema
 
             target = 1.0 / max(20.0, min(144.0, float(cfg["fps"])))
-            rest = target - cost
-            if rest > 0.001:
-                time.sleep(rest)
+            # **按绝对时刻排程**，而不是"每帧睡 target − cost"。后者会把
+            # `time.sleep` 的过冲（Windows 上实测约 0.4~0.5ms，高精度定时器的
+            # 粒度）**逐帧累积**，60Hz 目标只能跑到 57.7 帧/秒 —— 明明算力只用
+            # 了 10.6ms/16.7ms，却因为每帧都白丢半毫秒而欠帧。绝对排程下这一帧
+            # 睡多了下一帧就自动少睡，误差不累积，帧率才真的贴着目标。
+            next_t += target
+            now2 = time.perf_counter()
+            if next_t <= now2:
+                # 已经落后（偶发卡帧 / 刚改过帧率 / 刚从暂停恢复）：重锚到"现在"，
+                # 别攒出一串要连补的帧 —— 那会让画面突然快放一段。
+                next_t = now2
+            else:
+                rest = next_t - now2
+                if rest > 0.001:
+                    time.sleep(rest)
 
         for ov in (ov_fs, ov_ms):
             try:

@@ -668,10 +668,24 @@ class Overlay:
         表面，画面立刻回来（实测：0/6 → 6/6 采样点可见）。
 
         挂载 / 解挂之后都必须走一遍：两个方向都是 SetParent，同一条根因。
+
+        **装回样式后必须立刻重新上屏**（真机实测，2026-09-15）：重新加上
+        WS_EX_LAYERED 会把分层属性**重置**，窗口在下次 UpdateLayeredWindow 之前
+        不再显示任何内容。而本方法是在渲染循环第 3 步被调用的，下一次常规上屏
+        在第 5 步 —— 中间隔着 keep_on_top 与整个 scene.step（真实水波下可达
+        几十毫秒），窗口就白着那么久，用户看到"切换图层时特效闪一下"。
+        实测（子窗口态）：摘装后不补上屏 → 屏幕读回壁纸色 0x97401c（画面没了）；
+        补一次上屏 → 立刻恢复。
+        DIB 里仍是上一帧的画面，所以这里补上屏等于"多显示一帧旧内容"，
+        代价为零、观感连续；本帧的新内容随后在第 5 步照常覆盖。
         """
         ex = user32.GetWindowLongW(self.hwnd, GWL_EXSTYLE)
         user32.SetWindowLongW(self.hwnd, GWL_EXSTYLE, ex & ~WS_EX_LAYERED)
         user32.SetWindowLongW(self.hwnd, GWL_EXSTYLE, ex)
+        try:
+            self.present()
+        except Exception:
+            pass          # 上屏失败交给主循环的错误处理，别把层级切换也带崩
 
     def _attach_desktop(self):
         """挂到桌面壁纸层。任一前提不满足就返回 False（由调用方降级）：
@@ -707,6 +721,11 @@ class Overlay:
         if hwnd_int(user32.GetParent(self.hwnd)) != workerw:
             user32.SetParent(self.hwnd, None)
             user32.SetWindowLongW(self.hwnd, GWL_STYLE, style)
+            # 已经摘回顶层窗了，父子状态与坐标系必须同步复位：_rebuild_layered_surface
+            # 会补一次上屏，若 _origin 还留着上一次挂载时的父客户区原点，
+            # 那次上屏就会把窗口按错误的坐标系再挪一段。
+            self._parented = False
+            self._origin = (0, 0)
             self._rebuild_layered_surface()   # 这一步的 SetParent 也会废掉分层表面
             return False
         self._parented = True
