@@ -635,6 +635,23 @@ def _is_topmost(hwnd):
     return bool(_GWL(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST)
 
 
+def _settle_layer(ov, mode, want_topmost, timeout=6.0):
+    """等一次层级切换**真正落地**；返回是否在超时内达到目标状态。
+
+    只等 `z_mode` 会读到中间态：它先翻，窗口样式要等渲染循环下一帧才跟上。
+    实测（2026-09-20）切回「最上层」时 `z_mode` 0.1s 内就翻过来了，而
+    `WS_EX_TOPMOST` 要再等约 0.25s 才补上 —— 中间那 0.25s 里断言就会在一个
+    "正在切"的窗口上判失败。这就是项目里"等层级切换完成不能只等 z_mode"
+    那条老坑，只是这次犯在测试自己身上。
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if ov.z_mode == mode and _is_topmost(ov.hwnd) == bool(want_topmost):
+            return True
+        time.sleep(0.05)
+    return False
+
+
 def test_workerw_lookup_safe():
     """找不到壁纸层时必须老实返回 0（调用方靠它降级），不得抛异常。"""
     w = fw._find_wallpaper_workerw()
@@ -701,6 +718,9 @@ def test_real_two_overlay_render_loop():
     只起渲染线程（不碰托盘 / 面板），也**不落盘**（不走 quit()）。
     注意逐帧统计必须挂在 Scene.step 上：从外部读 ov.u32 会读到"已清零、
     还没画完"的瞬时状态（鼠标层的聚光灯要画 ~10ms，这期间全屏层就是空的）。
+
+    层级往返必须用 `_settle_layer` 等**样式**也落定，不能只等 `z_mode`：
+    这里换层是渲染循环异步做的，z_mode 先翻、`WS_EX_TOPMOST` 下一帧才补上。
     """
     import threading
     import time
@@ -748,19 +768,15 @@ def test_real_two_overlay_render_loop():
             return False, "鼠标层默认不该挂在别的窗口下"
 
         app.snapshot = dict(app.snapshot, layer_mouse="desktop")
-        deadline = time.time() + 6
-        while time.time() < deadline and ov_ms.z_mode != fw.LAYER_DESKTOP:
-            time.sleep(0.1)
-        if ov_ms.z_mode != fw.LAYER_DESKTOP or not user32.IsWindow(ov_ms.hwnd):
+        if not _settle_layer(ov_ms, fw.LAYER_DESKTOP, False):
             return False, "运行时切到「仅桌面图层」没生效"
+        if not user32.IsWindow(ov_ms.hwnd):
+            return False, "切到桌面层后窗口没了"
         if _is_topmost(ov_ms.hwnd):
             return False, "桌面层的鼠标层仍带 WS_EX_TOPMOST"
 
         app.snapshot = dict(app.snapshot, layer_mouse="topmost")
-        deadline = time.time() + 6
-        while time.time() < deadline and ov_ms.z_mode != fw.LAYER_TOPMOST:
-            time.sleep(0.1)
-        if ov_ms.z_mode != fw.LAYER_TOPMOST or not _is_topmost(ov_ms.hwnd):
+        if not _settle_layer(ov_ms, fw.LAYER_TOPMOST, True):
             return False, "运行时切回「最上层」失败"
         if user32.GetParent(ov_ms.hwnd):
             return False, "切回最上层后仍挂在壁纸层下"

@@ -102,6 +102,27 @@ def _wait_desktop_settled(ov, timeout=8.0):
     return _wait(ok, timeout=timeout)
 
 
+def _wait_topmost_settled(ov, timeout=8.0):
+    """`_wait_desktop_settled` 的对称版：等"切回最上层"彻底做完。
+
+    同样不能只等 `z_mode`：换层是渲染循环异步做的，`z_mode` 先翻，
+    `WS_EX_TOPMOST` 要等下一帧才补上。实测（2026-09-20）中间那段窗口约 0.25s，
+    期间窗口看起来"不是置顶的" —— 在这里断言 `_is_topmost` 就是一次纯属测试
+    自身竞态的假失败（`_verify_layer_switch` 偶发、`_verify_zorder` 稳定复现）。
+    一并等几何，理由同 `_wait_desktop_settled`：present 在等待期间持续跑，
+    顺带也验掉"切回置顶后不会把窗口挪走"。
+    """
+    def ok():
+        if ov.z_mode != fx_kinds.LAYER_TOPMOST or not ov.hwnd:
+            return False
+        if not _is_topmost(ov.hwnd):
+            return False
+        if _parent_class(ov.hwnd)[1]:
+            return False
+        return _screen_rect(ov.hwnd) == fw.virtual_screen()
+    return _wait(ok, timeout=timeout)
+
+
 def _probe_fs_visible(ov_fs, seconds=0.45):
     """把全屏层缓冲刷成不透明品红，上屏后把**屏幕像素**读回来。
 
@@ -492,10 +513,11 @@ def test_real_mixed_modes(app):
     app.snapshot = dict(app.snapshot,
                         layer_fullscreen=fx_kinds.LAYER_TOPMOST,
                         layer_mouse=fx_kinds.LAYER_DESKTOP)
-    if not _wait(lambda: ov_fs.z_mode == fx_kinds.LAYER_TOPMOST
-                 and ov_ms.z_mode == fx_kinds.LAYER_DESKTOP):
-        return False, (f"混合档位没生效：全屏={ov_fs.z_mode} / "
-                       f"鼠标={ov_ms.z_mode}")
+    if not _wait_topmost_settled(ov_fs):
+        return False, (f"全屏层没稳定回到最上层：{ov_fs.z_mode}"
+                       f"(topmost={_is_topmost(ov_fs.hwnd)})")
+    if not _wait(lambda: ov_ms.z_mode == fx_kinds.LAYER_DESKTOP):
+        return False, f"鼠标层没切到桌面层：{ov_ms.z_mode}"
     if not _wait_desktop_settled(ov_ms):
         return False, (f"鼠标层没稳定落到桌面层：矩形={_screen_rect(ov_ms.hwnd)} "
                        f"虚拟屏={fw.virtual_screen()}")
@@ -532,10 +554,10 @@ def test_real_roundtrip_back_to_topmost(app):
     app.snapshot = dict(app.snapshot,
                         layer_fullscreen=fx_kinds.LAYER_TOPMOST,
                         layer_mouse=fx_kinds.LAYER_TOPMOST)
-    if not _wait(lambda: ov_fs.z_mode == fx_kinds.LAYER_TOPMOST
-                 and ov_ms.z_mode == fx_kinds.LAYER_TOPMOST):
-        return False, (f"切回最上层没生效：全屏={ov_fs.z_mode} / "
-                       f"鼠标={ov_ms.z_mode}")
+    if not (_wait_topmost_settled(ov_fs) and _wait_topmost_settled(ov_ms)):
+        return False, (f"切回最上层没生效：全屏={ov_fs.z_mode}"
+                       f"(topmost={_is_topmost(ov_fs.hwnd)}) / "
+                       f"鼠标={ov_ms.z_mode}(topmost={_is_topmost(ov_ms.hwnd)})")
     for ov, name in ((ov_fs, "全屏层"), (ov_ms, "鼠标层")):
         if not _is_topmost(ov.hwnd):
             return False, f"{name} 切回最上层后没有 WS_EX_TOPMOST"
@@ -568,7 +590,7 @@ def test_real_roundtrip_still_visible_on_screen(app):
     ov_fs = app.overlays[0]
     app.snapshot = dict(app.snapshot,
                         layer_fullscreen=fx_kinds.LAYER_TOPMOST)
-    if not _wait(lambda: ov_fs.z_mode == fx_kinds.LAYER_TOPMOST):
+    if not _wait_topmost_settled(ov_fs):
         return False, f"全屏层没回到最上层：{ov_fs.z_mode}"
     base_hits, total = _probe_fs_visible(ov_fs)
     if base_hits <= 0:
@@ -584,7 +606,7 @@ def test_real_roundtrip_still_visible_on_screen(app):
                        f" 虚拟屏 {fw.virtual_screen()}")
     app.snapshot = dict(app.snapshot,
                         layer_fullscreen=fx_kinds.LAYER_TOPMOST)
-    if not _wait(lambda: ov_fs.z_mode == fx_kinds.LAYER_TOPMOST):
+    if not _wait_topmost_settled(ov_fs):
         return False, f"全屏层没切回最上层：{ov_fs.z_mode}"
 
     hits, total = _probe_fs_visible(ov_fs)
