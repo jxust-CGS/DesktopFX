@@ -58,7 +58,7 @@ def _lit(buf):
     return buf[..., 3] > 0
 
 
-def _solo(W, H, cfg, frames=900, seed=11):
+def _solo(W, H, cfg, frames=900, seed=11, pick="lit"):
     """只放一颗流星，返回**点亮像素最多**的那一帧。
 
     两个坑：
@@ -68,10 +68,19 @@ def _solo(W, H, cfg, frames=900, seed=11):
         可能 70 帧都还没出生（早期版本就是在这里拿到空图）。
       * 只采 **n == 1** 的帧：生成速率恰好等于 1/平均寿命，偶尔会同时存在两颗，
         此时 bbox / 投影会把两颗的轨迹连成一片，"尾长"量出来是两者间距。
+
+    `pick="head"`：改挑**头部最亮、且尾巴已长到六成**的那一帧。量"头亮尾暗"
+    必须这样挑，否则会踩两个坑：
+      * "点亮最多"会挑到渐隐期的帧 —— 尾巴长满、但生灭包络只剩一半，
+        实测头部 alpha 只有 96（< 110），那是测量点选错，不是头部真的变暗；
+      * 光看"头部最亮"会挑到**刚出生两三帧**的流星 —— 头芯满亮（229），
+        可尾长只有 46px，投影"头端 15%"整段落在头部**辉光的前沿**上
+        （最亮芯 proj=563 反而小于 hi=574），量出来头 37 / 尾 42，比尾巴还暗。
     """
     m = MeteorField(W, H, seed=seed)
     m.set_amount(1, W, H)
     best, best_lit, best_dir = None, -1, (0.0, 1.0)
+    fb, fb_lit, fb_dir = None, -1, (0.0, 1.0)      # 兜底：不看尾巴长短
     seen = 0
     for _ in range(frames):
         m.update(1 / 60.0, cfg)
@@ -80,12 +89,26 @@ def _solo(W, H, cfg, frames=900, seed=11):
         if m.n == 1:
             seen += 1
             n = int((b[..., 3] > 0).sum())
-            if n > best_lit:
-                sp = float(np.hypot(m.vx[0], m.vy[0])) + 1e-6
-                best_lit, best = n, b
-                best_dir = (float(m.vx[0]) / sp, float(m.vy[0]) / sp)
+            sp = float(np.hypot(m.vx[0], m.vy[0])) + 1e-6
+            d = (float(m.vx[0]) / sp, float(m.vy[0]) / sp)
+            if pick == "head":
+                hx = int(round(float(m.x[0])))
+                hy = int(round(float(m.y[0])))
+                core = b[max(0, hy - 4):hy + 5, max(0, hx - 4):hx + 5, 3]
+                cm = int(core.max()) if core.size else -1
+                if cm > fb_lit:
+                    fb_lit, fb, fb_dir = cm, b, d
+                # 尾巴长到 60% 以上才算"成形"（cur = min(blen, spd·t)）
+                grown = float(m.spd[0]) * float(m.t[0]) >= 0.6 * float(m.blen[0])
+                score = cm if grown else -1
+            else:
+                score = n
+            if score > best_lit:
+                best_lit, best, best_dir = score, b, d
             if seen >= 130:
                 break
+    if best is None:
+        best, best_dir = fb, fb_dir
     return m, best, best_dir
 
 
@@ -164,6 +187,59 @@ def test_resize():
     if not _lit(buf).any():
         return False, "nothing drawn after resize"
     return True, "resize 800x600 -> 1920x1080 clean"
+
+
+def test_covers_whole_screen():
+    """流星必须"扫过整屏"，不能只在上面一半出现。
+
+    旧写法把燃尽距离定成 **尾长 × 1.3~2.3** —— 一个与屏幕尺寸无关的长度。
+    1920×1200 下平均只飞 580px（48% 高度），于是密度从顶部往下**断崖式**掉：
+    实测十段瞬时密度 41/42/35/26/17/11/9/7/7/7（像素/行），顶部 20% 是底部 20%
+    的 **5.7 倍**；本机 3840×1200 的双屏更极端，是 15 倍。用户看到的就是
+    "只有上半屏有流星"。
+
+    判据取**密度比**而不是"底部有没有像素"：旧实现在底部一直有零星像素
+    （左边缘低处出生的那几颗），只是稀到肉眼看不见 —— 早期那条"看单帧像不像
+    空的"的检查就是这么放过去的（单帧里恰好一颗都没有）。
+
+    阈值是拿 `_shot_meteor_coverage.py` 的新旧对照定出来的：
+        底部20%/顶部20%   旧 0.18（1920）/ 0.07（3840）  新 0.37 / 0.35
+        下半屏/上半屏     旧 0.26 / 0.30                 新 0.57 / 0.55
+    两条阈值（0.25 / 0.42）都落在新旧之间，且两种屏幕尺寸下都成立。
+    """
+    W, H = 1920, 1200        # 用 1200 高还原出问题的那种"高屏"
+    cfg = met_cfg(meteor_amount=14, meteor_stars=0.0)
+    m = MeteorField(W, H, seed=31)
+    m.set_amount(14, W, H)
+    dens = np.zeros(10, np.float64)
+    n = 0
+    for i in range(int(20 * 60)):
+        m.update(1 / 60.0, cfg)
+        if i % 6:
+            continue
+        buf = np.zeros((H, W, 4), np.uint8)
+        m.draw(buf.view(np.uint32).reshape(-1), W, H, cfg)
+        rows = (buf[:, :, 3] > 0).sum(axis=1)
+        dens += [rows[int(H * k / 10):int(H * (k + 1) / 10)].mean()
+                 for k in range(10)]
+        n += 1
+    dens /= max(1, n)
+    seg = "/".join("%.0f" % v for v in dens)
+    if dens.min() <= 0.0:
+        return False, f"有整段高度一个像素都没有：{seg}"
+    top20 = float(dens[:2].mean())
+    bot20 = float(dens[8:].mean())
+    top_h = float(dens[:5].mean())
+    bot_h = float(dens[5:].mean())
+    if bot20 < top20 * 0.25:
+        return False, (f"底部 20% 的密度只有顶部的 {bot20/top20:.1%}（应 >= 25%）"
+                       f" —— 流星够不着屏幕下半部：{seg}")
+    if bot_h < top_h * 0.42:
+        return False, (f"下半屏密度只有上半屏的 {bot_h/top_h:.1%}（应 >= 42%）"
+                       f" —— 分布断崖式集中在顶部：{seg}")
+    return True, (f"十段密度 {seg}（底部20%/顶部20% {bot20/top20:.0%}，"
+                  f"下半屏/上半屏 {bot_h/top_h:.0%}，最密/最疏 "
+                  f"{dens.max()/dens.min():.1f}×）")
 
 
 def test_amount_semantics():
@@ -294,10 +370,15 @@ def test_trail_smooth():
 
 
 def test_head_bright_tail_dim():
-    """rope trail 的本质：亮度沿轨迹从头部单调衰减。"""
+    """rope trail 的本质：亮度沿轨迹从头部单调衰减。
+
+    必须用 `pick="head"` 取头部最亮的一帧：寿命与屏幕挂钩之后，"点亮最多"会挑到
+    渐隐期的帧（尾巴长满、包络只剩一半），量出来头部 alpha 96 —— 那是测量点
+    选错，不是"头不亮"。
+    """
     W, H = 1280, 720
     cfg = met_cfg(meteor_amount=1, meteor_stars=0.0)
-    m, buf, (ux, uy) = _solo(W, H, cfg, seed=17)
+    m, buf, (ux, uy) = _solo(W, H, cfg, seed=17, pick="head")
     if buf is None or not _lit(buf).any():
         return False, "没画出来"
     ys, xs = np.nonzero(_lit(buf))
@@ -305,6 +386,8 @@ def test_head_bright_tail_dim():
     proj = xs * ux + ys * uy
     lo, hi = float(proj.min()), float(proj.max())
     span = hi - lo
+    if span < 40.0:
+        return False, f"轨迹只有 {span:.0f}px（太短，测不出梯度）"
     # 取分位数而不是均值：圆盘核的边缘很软，头端一圈像素 alpha 本来就近 0，
     # 用均值会把"亮头"平均成暗的。分位数量的才是"这一端最亮能到多少"。
     head = float(np.percentile(a[proj > hi - span * 0.15], 95))
@@ -618,6 +701,7 @@ def main():
         test_edge_amounts,
         test_resize,
         test_amount_semantics,
+        test_covers_whole_screen,
         test_angle_direction,
         test_tail_continuous,
         test_trail_smooth,

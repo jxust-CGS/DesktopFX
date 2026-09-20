@@ -1972,7 +1972,8 @@ class MeteorField:
     R_BASE = 2.8                 # 头部实心半径基准（像素，meteor_size=1.0）
     GLOW_SCALE = 3.8             # 光晕半径 / 实心半径
     _SPAN = 1.2                  # 采样间距 = 半径 × 该值（<2 才不断线）
-    TRAVEL = (1.3, 2.3)          # 入屏点 -> 燃尽点的行程 / 尾长
+    _BURN_MIN = 0.40             # 燃尽距离 / 「出生点到背风边」的距离，下限
+    _BURN_MAX = 1.35             # 同上的上限；>1 = 允许飞过屏幕边再燃尽（见 _spawn）
     _KMIN, _KMAX = 12, 512
     _KEEP = 0.006
     # 圆盘核内**平坦区**占比：权重在 rr <= (1-PLATEAU)·(r+0.5) 内恒为 1，
@@ -1990,6 +1991,7 @@ class MeteorField:
         self._t = 0.0
         self._acc = 0.0
         self._want = 0
+        self._life_ema = 0.0                  # 最近生成那批的平均寿命（自校正用）
         self._kt = {}
         self._hc = (255.0, 255.0, 255.0)      # 头：#FFFFFF (b, g, r)
         self._tc = (240.0, 184.0, 95.0)       # 尾：#5FB8F0 (b, g, r)
@@ -2009,6 +2011,7 @@ class MeteorField:
     def resize(self, w, h):
         self.w, self.h = w, h
         self._s_w = self._s_h = -1            # 星空按新尺寸重排
+        self._life_ema = 0.0                  # 燃尽距离随屏幕走，平均寿命要重估
 
     # ------------------------------------------------------------ 核
     def _ktab_round(self, r_px, glow=0.0):
@@ -2093,9 +2096,40 @@ class MeteorField:
                       (0.0 if dx >= 0.0 else float(w)))
         ey = np.where(top, 0.0, rng.uniform(0.0, h, k))
 
-        u = rng.uniform(self.TRAVEL[0], self.TRAVEL[1], k).astype(np.float32)
         blen = (np.float32(length) * rng.uniform(0.70, 1.35, k)).astype(np.float32)
-        travel = (blen * u).astype(np.float32)
+        # 燃尽距离 = 从出生点沿 d 一路飞到**背风边**（离开屏幕）的距离，再乘一个
+        # [_BURN_MIN, _BURN_MAX] 的系数。
+        #
+        # 曾经取「尾长 × 1.3~2.3」—— 那是**与屏幕尺寸无关**的长度，于是屏幕越高
+        # 流星越够不着底：1200 高的屏上平均只飞 580px（48% 高度），本机
+        # 3840×1200 十段瞬时密度是 3.1万/3.2万/3.1万/2.7万/2.3万/1.8万/1.3万/
+        # 7.9千/3.5千/7.9百（像素/行）—— 最密/最疏 41×，从 40% 高度起断崖式
+        # 掉下去，看着就是"只有上半屏有流星"。
+        #
+        # 上限取 **1.35 而不是 1.0** 是量出来的：`draw` 的生灭包络让流星在最后
+        # 30% 寿命里渐隐，行程若是"正好到屏边"，它在离屏边还有三成路程时就淡没了，
+        # 底部照样是空的（实测上限取 1.0 时最密/最疏仍是 41×、底部十段只有
+        # 789 像素/行）。让它多飞一截、在屏幕外才燃尽，淡出正好落在屏边，尾巴
+        # 继续把底部刷上：最密/最疏 41× -> 3.6×，底部十段 789 -> 7358，而
+        # **总像素数基本不变** —— 只是把原来堆在顶部的流星摊到了整屏。
+        dxf, dyf = float(dx), float(dy)
+        if dxf > 0.0:
+            bx = (np.float32(w) - ex) / np.float32(dxf)
+        elif dxf < 0.0:
+            bx = ex / np.float32(-dxf)
+        else:
+            bx = np.full(k, np.float32(np.inf), np.float32)
+        if dyf > 0.0:
+            by = (np.float32(h) - ey) / np.float32(dyf)
+        elif dyf < 0.0:
+            by = ey / np.float32(-dyf)
+        else:
+            by = np.full(k, np.float32(np.inf), np.float32)
+        exit_d = np.maximum(np.minimum(bx, by), np.float32(1.0))
+        travel = exit_d * rng.uniform(self._BURN_MIN, self._BURN_MAX, k).astype(np.float32)
+        # 出生点贴着背风边时（左边缘靠下那种）行程会短到"一闪就没"——给个下限，
+        # 宁可让它飞出屏幕也不要一次眨眼（尾部全靠 life 内长出来）。
+        travel = np.maximum(travel, np.float32(0.55) * blen).astype(np.float32)
 
         vary = rng.uniform(0.80, 1.25, k)
         sp = (np.float32(speed) * vary).astype(np.float32)
@@ -2107,12 +2141,30 @@ class MeteorField:
         self.vy[sl] = dy * sp
         self.t[sl] = 0.0
         self.spd[sl] = sp
-        # 尾长是**几何长度**；寿命 = 入屏点到燃尽点的行程 / 速度
+        # 尾长是**几何长度**（拖尾最多这么长，与寿命无关）；
+        # 寿命 = 燃尽行程 / 速度 —— 行程由屏幕几何定，见上面的 exit_d。
         self.blen[sl] = blen
         self.life[sl] = np.maximum(0.10, travel / np.maximum(sp, np.float32(1.0))
                                    ).astype(np.float32)
         self.bright[sl] = rng.uniform(0.55, 1.0, k).astype(np.float32)
         self.n = tot
+        # 记下这批的实际寿命，供生成速率自校正（见 `_mean_life`）。
+        m = float(np.mean(self.life[sl]))
+        if m > 0.0:
+            self._life_ema = (m if self._life_ema <= 0.0
+                              else 0.92 * self._life_ema + 0.08 * m)
+
+    def _mean_life(self, cfg):
+        """生成速率用的平均寿命：最近实际生成那批的指数平均。
+
+        还没生成过（刚构造 / 刚 resize）时给个量级初值 —— 一个屏高 / 速度，
+        也就是"从迎风边飞到背风边"的时长。它只影响最初几帧的生成速率，
+        之后 EMA 会把它拉到实测值。
+        """
+        if self._life_ema > 0.0:
+            return self._life_ema
+        sp = max(1.0, float(cfg.get("meteor_speed", 880.0)))
+        return max(0.15, float(self.h) / sp)
 
     def update(self, dt, cfg):
         """推进流星（返回空数组：流星不溅水）。"""
@@ -2134,14 +2186,12 @@ class MeteorField:
         want = int(max(0, min(400, self._want)))
         if want <= 0:
             return np.zeros(0, np.float32)
-        # 平均寿命 = 平均行程 / 平均速度。行程 = 尾长 × TRAVEL × 尾长抖动均值，
-        # 必须把这些系数都算进去，否则 meteor_amount 只是"名义数量"——
-        # 早先漏掉系数，滑条写 14 实际稳态 25 颗。
-        lead_k = 0.5 * (self.TRAVEL[0] + self.TRAVEL[1]) * 1.025
-        mean_life = max(0.08, lead_k
-                        * float(cfg.get("meteor_length", 380.0))
-                        / max(1.0, float(cfg.get("meteor_speed", 880.0))))
-        self._acc += (want / mean_life) * dt
+        # 生成速率 = 目标颗数 / 平均寿命。平均寿命取**最近实际生成那批**的指数
+        # 平均（见 `_mean_life`），而不是解析式：解析式要同时依赖屏幕长宽比、
+        # 飞行角度与 _BURN_MIN，改任何一个都会系统性偏多/偏少 —— 早先漏掉尾长
+        # 抖动系数，滑条写 14 实际稳态 25 颗。用实测值自校正，稳态颗数会自动
+        # 收敛到 want（速率 × 实际平均寿命 = want）。
+        self._acc += (want / self._mean_life(cfg)) * dt
         k = int(self._acc)
         if k > 0:
             self._acc -= k
