@@ -7,10 +7,10 @@
   1. 两种宠物在几个典型尺寸、左右两个朝向下的样子；
   2. **走路循环的 6 帧**（尾巴摆动 + 前后腿交替）与**静止循环的 4 帧**，
      用来确认动画幅度够不够看得见；
-  3. **眨眼**与 **4 个点击表情**。
+  3. **眨眼**对比与跟随链的排队排布。
 
 输出 `docs/images/pet-preview.png`。改完 `_draw_cat` / `_draw_dog` /
-`_build_frames` / `_expr_icon` 的坐标后重跑它。
+`_build_frames` 的坐标后重跑它。
 
 提示：在终端里想快速看单帧形状，用 `_ascii_pet.py` 更省事。
 """
@@ -70,10 +70,10 @@ def _blink_overlay(base, blink):
 
 
 def main():
-    W, H = 960, 620
+    W, H = 960, 560
     canvas = Image.new("RGBA", (W, H), BG_LIGHT)
     d = ImageDraw.Draw(canvas)
-    d.rectangle([0, 286, W, H], fill=BG_DARK)      # 下半段换深色底
+    d.rectangle([0, 300, W, H], fill=BG_DARK)      # 下半段换深色底
 
     def label(text, x, y, col=LABEL):
         d.text((x, y), text, fill=col)
@@ -91,8 +91,7 @@ def main():
 
     # ---------------- 中部：走路循环 / 静止循环 / 眨眼
     p = _pet("小猫", COLORS[0], 64)
-    walk, idle, blink, exprs = (p._frames_walk, p._frames_idle, p._blink,
-                                p._expr)
+    walk, idle, blink = p._frames_walk, p._frames_idle, p._blink
     label("走路循环（尾巴摆动 + 前后腿交替）", 40, 166)
     x = 58
     for k in range(walk.shape[0]):
@@ -107,18 +106,15 @@ def main():
     _paste(canvas, _blink_overlay(idle[0], blink), 764, 226)
     label("眨眼", 750, 262)
 
-    # ---------------- 下半：表情 + 跟随链
-    label("点击表情", 40, 322, LABEL_D)
-    x = 92
-    for k, name in enumerate(fx_effects.PetField.EXPR_KINDS):
-        _paste(canvas, exprs[k], x, 386)
-        label(name, x - 14, 424, LABEL_D)
-        x += 86
-    label("跟随链排布（间距 = 体型 × 0.82）", 470, 322, LABEL_D)
-    for i in range(7):
-        _paste(canvas, idle[i % idle.shape[0]], 520 + i * 60, 390)
-    label("虚线以上 = 浅色桌面，以下 = 深色桌面", 40, 452, LABEL_D)
-    d.line([(0, 286), (W, 286)], fill=DIVIDER, width=1)
+    # ---------------- 下半：跟随链排布
+    label("跟随链排布（间距 = 体型 × 0.82）", 40, 330, LABEL_D)
+    for i in range(8):
+        _paste(canvas, idle[i % idle.shape[0]], 96 + i * 60, 404)
+    label("小狗 / 朝左", 660, 470, LABEL_D)
+    _paste(canvas, _pet("小狗", COLORS[1], 72)._frames_idle[0], 740, 404,
+           flip=True)
+    label("虚线以上 = 浅色桌面，以下 = 深色桌面", 40, 466, LABEL_D)
+    d.line([(0, 300), (W, 300)], fill=DIVIDER, width=1)
 
     out = os.path.join(HERE, "docs", "images", "pet-preview.png")
     os.makedirs(os.path.dirname(out), exist_ok=True)
@@ -126,7 +122,7 @@ def main():
     print(f"已输出 {out}  ({W}x{H})")
     print(f"  上半：40/72/116 像素 + 小狗朝左（浅底）")
     print(f"  中部：走路 {walk.shape[0]} 帧 + 静止 {idle.shape[0]} 帧 + 眨眼")
-    print(f"  下半：4 个点击表情 + 跟随链排布（深底）")
+    print(f"  下半：跟随链排布（深底）")
 
 
 if __name__ == "__main__":

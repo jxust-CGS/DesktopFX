@@ -155,7 +155,6 @@ DEFAULTS = {
     "pet_opacity": 1.0,
     # 光标停住多少秒后渐隐（0 = 一直跟着不消失）
     "pet_idle_fade": 1.6,
-    "pet_expr": True,        # 点击时头顶弹出可爱表情
     # ---- 窗口水波（窗口移动 / 缩放 / 最小化 / 恢复时扰动水面）----
     # 它**不自己画**：窗口只是水面的一个扰动源 —— 和鼠标共用同一片水（见
     # WaterRippleField.push_rect / dome_rect），所以这里只剩"扰动多大、多宽"
@@ -406,22 +405,22 @@ PRESETS = {
               petal_enabled=False, meteor_enabled=False,
               pet_enabled=True, pet_kind="小猫", pet_count=2,
               pet_size=56, pet_follow=0.55, pet_color="#F2C27B",
-              pet_opacity=1.0, pet_idle_fade=1.6, pet_expr=True),
+              pet_opacity=1.0, pet_idle_fade=1.6),
     "小狗": dict(rain_enabled=False, snow_enabled=False,
               petal_enabled=False, meteor_enabled=False,
               pet_enabled=True, pet_kind="小狗", pet_count=2,
               pet_size=58, pet_follow=0.55, pet_color="#B9CBE8",
-              pet_opacity=1.0, pet_idle_fade=1.6, pet_expr=True),
+              pet_opacity=1.0, pet_idle_fade=1.6),
     "一队小猫": dict(rain_enabled=False, snow_enabled=False,
                 petal_enabled=False, meteor_enabled=False,
                 pet_enabled=True, pet_kind="小猫", pet_count=6,
                 pet_size=44, pet_follow=0.66, pet_color="#F2C27B",
-                pet_opacity=1.0, pet_idle_fade=1.6, pet_expr=True),
+                pet_opacity=1.0, pet_idle_fade=1.6),
     "一群小动物": dict(rain_enabled=False, snow_enabled=False,
                  petal_enabled=False, meteor_enabled=False,
                  pet_enabled=True, pet_kind="小猫", pet_count=10,
                  pet_size=36, pet_follow=0.72, pet_color="#9FD8C0",
-                 pet_opacity=1.0, pet_idle_fade=2.2, pet_expr=True),
+                 pet_opacity=1.0, pet_idle_fade=2.2),
 }
 
 # 预设方案下沉到各特效页内部：每个特效页显示自己的预设方案

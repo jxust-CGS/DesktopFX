@@ -43,7 +43,7 @@ def _cfg(**over):
     """
     cfg = dict(pet_enabled=True, pet_kind="小猫", pet_count=2.0,
                pet_size=56.0, pet_follow=0.55, pet_color="#F2C27B",
-               pet_opacity=1.0, pet_idle_fade=0.0, pet_expr=True)
+               pet_opacity=1.0, pet_idle_fade=0.0)
     cfg.update(over)
     return cfg
 
@@ -501,15 +501,19 @@ def test_idle_fade_hides_then_wakes():
     if not p._hidden:
         return False, "淡光后没有进入 hidden 状态"
 
-    # 一动就回来，而且要**落在光标处**而不是从老位置跑过来
-    p.set_pointer(700.0, 420.0)
+    # 一动就回来，而且要**落在光标处**而不是从老位置跑过来。
+    # 目标点留在画面内：跳出屏幕的宠物会被 docstring 里说的裁剪逻辑整只丢掉，
+    # 那时"看不见"与唤醒成不成功就分不清了。
+    far = (W - 60.0, H - 60.0)
+    p.set_pointer(*far)
     p.update(1.0 / 60.0, cfg)
     if p._hidden or p._fade <= 0.0:
         return False, "移动后没有立刻淡入"
-    d0 = ((float(p.px[0]) - 700.0) ** 2 + (float(p.py[0]) - 420.0) ** 2) ** 0.5
+    d0 = ((float(p.px[0]) - far[0]) ** 2
+          + (float(p.py[0]) - far[1]) ** 2) ** 0.5
     if d0 > 8.0:
         return False, f"唤醒后第一只离光标 {d0:.0f} 像素（应从光标处出现）"
-    _run(p, cfg, 60, 0.6, (700.0, 420.0))
+    _run(p, cfg, 60, 0.6, far)
     if p._fade < 0.99:
         return False, f"唤醒 0.6 秒后仍未完全淡入（fade={p._fade:.2f}）"
     return True, "静止 1.4 秒后淡光且停止上屏；一动立刻在光标处淡入复原"
@@ -526,74 +530,57 @@ def test_idle_fade_zero_never_hides():
 
 
 def test_click_wakes_hidden_pets():
-    """光标不动时点一下，宠物该回来 —— 点击也算交互。"""
+    """光标不动时点一下，宠物该回来 —— 点击也算交互。
+
+    这条是"静止渐隐"的配套：没有它，用户必须晃一下鼠标才能把宠物叫回来，
+    而原地点击（比如在空白桌面点一下）恰恰是最自然的"我想看它们"的动作。
+    """
     p = PetField(W, H)
     cfg = _cfg(pet_idle_fade=0.8)
-    _run(p, cfg, 60, 2.0, (400.0, 400.0))
+    c = (W * 0.5, H * 0.5)
+    _run(p, cfg, 60, 2.0, c)
     if not p._hidden:
         return False, "前提不成立：静止 2 秒后没有隐去"
-    p.set_pointer(400.0, 400.0, 1)          # 原地点击（位置没变）
+    p.set_pointer(c[0], c[1], 1)            # 原地点击（位置没变）
     p.update(1.0 / 60.0, cfg)
     if p._hidden:
         return False, "原地点击没有把宠物叫回来"
-    if p._expr_t <= 0.0:
-        return False, "点击没有触发表情"
-    return True, "隐去状态下原地点击能唤醒，并同时触发表情"
-
-
-# ---------------------------------------------------------- 7. 点击表情
-def test_click_expression_lifecycle():
-    """点击 → 弹表情（出现在头顶上方）→ 到时自动消失。"""
-    p = PetField(W, H)
-    cfg = _cfg(pet_count=1.0)
-    _run(p, cfg, 60, 0.5, (W * 0.5, H * 0.5))
-    p.set_pointer(W * 0.5, H * 0.5, 1)
-    p.update(1.0 / 60.0, cfg)
-    if p._expr_t <= 0.0:
-        return False, "点击后没有进入表情状态"
-    if not (0 <= p._expr_idx < len(PetField.EXPR_KINDS)):
-        return False, f"表情序号越界：{p._expr_idx}"
-
-    buf = np.full(W * H, BG_BRIGHT, np.uint32)
+    if p._fade <= 0.0:
+        return False, "点击后没有开始淡入"
+    # 别只看状态位：淡入要真的把像素画回来。
+    # 注意坐标必须留在画面内 —— 宠物中心超出屏幕就会被整只裁掉，
+    # 那时"画不出像素"跟唤醒成不成功毫无关系。
+    _run(p, cfg, 60, 0.6, c)
+    buf = np.zeros(W * H, np.uint32)
     p.draw(buf, W, H, cfg)
-    with_expr = int((buf != BG_BRIGHT).sum())
-    p._expr_t = 0.0
-    buf2 = np.full(W * H, BG_BRIGHT, np.uint32)
-    p.draw(buf2, W, H, cfg)
-    without = int((buf2 != BG_BRIGHT).sum())
-    if with_expr <= without:
-        return False, f"表情帧没有多画任何像素（{with_expr} vs {without}）"
-
-    # 表情必须画在**宠物上方**：取两者的差异像素，平均 y 要更靠上。
-    # 缓冲区是扁平的，行号 = 扁平下标 // 宽度，也就是 y。
-    diff = (buf != buf2)
-    ys = np.nonzero(diff)[0] // W
-    if ys.size == 0:
-        return False, "找不到表情新增的像素"
-    body_ys = np.nonzero(buf2 != BG_BRIGHT)[0] // W
-    if ys.mean() >= body_ys.mean():
-        return False, (f"表情平均 y={ys.mean():.0f} 不低于宠物本体 "
-                       f"{body_ys.mean():.0f} —— 没有弹在头顶")
-
-    # 到时消失
-    for _ in range(int((PetField._EXPR_LIFE + 0.2) * 60)):
-        p.update(1.0 / 60.0, cfg)
-    if p._expr_t > 0.0:
-        return False, "表情过了寿命仍没消失"
-    return True, (f"点击弹表情（' {PetField.EXPR_KINDS[p._expr_idx]} '），"
-                  f"头顶新增 {with_expr - without} 像素，"
-                  f"{PetField._EXPR_LIFE} 秒后自动消失")
+    if not (buf > 0).any():
+        return False, "点击唤醒后画不出任何像素"
+    return True, "隐去状态下原地点击能唤醒并淡入，且真的重新画了出来"
 
 
-def test_expression_can_be_disabled():
+# ---------------------------------------------------------- 7. 跟随链规模
+def test_ten_pets_chain_visible():
+    """10 只时队列要真的散开成一列，而不是全挤在光标那一点上。
+
+    上限从 3 提到 10 之后，"后面几只还看得见吗"就成了新问题：间距是
+    体型 × 0.82，体型调小的时候这一串会缩得比较短。这里钉住"首尾要有
+    足够的跨度"，免得哪天改参数把队伍缩成一坨。
+    """
     p = PetField(W, H)
-    cfg = _cfg(pet_expr=False)
-    _run(p, cfg, 60, 0.4, (W * 0.5, H * 0.5))
-    p.set_pointer(W * 0.5, H * 0.5, 1)
-    p.update(1.0 / 60.0, cfg)
-    if p._expr_t > 0.0:
-        return False, "关掉开关后点击仍然弹了表情"
-    return True, "开关关闭时点击不弹表情"
+    cfg = _cfg(pet_count=float(PetField.MAX_PETS), pet_size=36.0,
+               pet_follow=0.72)
+    _run(p, cfg, 60, 2.5, (W * 0.5, H * 0.5))
+    spread = float(np.ptp(p.px[:PetField.MAX_PETS]))
+    if spread < 36.0 * 0.82 * (PetField.MAX_PETS - 1) * 0.55:
+        return False, (f"10 只首尾跨度只有 {spread:.0f} 像素，队伍挤成一坨了")
+    # 每只都该在自己那一格附近（间距 = 体型 × 0.82 ± 容差）
+    want = 36.0 * 0.82
+    for i in range(1, PetField.MAX_PETS):
+        got = abs(float(p.px[i] - p.px[i - 1]))
+        if got < want * 0.45:
+            return False, (f"第 {i} 只与前一只只差 {got:.0f} 像素"
+                           f"（期望约 {want:.0f}）—— 叠在一起了")
+    return True, f"10 只首尾跨度 {spread:.0f} 像素，相邻间距约 {want:.0f}"
 
 
 # ---------------------------------------------------------- 8. 十只同屏
@@ -657,10 +644,10 @@ def test_registry():
             return False, f"预设 {n} 含未登记的键：{bad}"
     for k in ("pet_enabled", "pet_kind", "pet_count", "pet_size",
               "pet_follow", "pet_color", "pet_opacity",
-              "pet_idle_fade", "pet_expr"):
+              "pet_idle_fade"):
         if k not in d.DEFAULTS:
             return False, f"DEFAULTS 缺 {k}"
-    return True, "分类/分层/启停键/导航/预设 六处登记齐全（9 个 pet_ 键）"
+    return True, "分类/分层/启停键/导航/预设 六处登记齐全（8 个 pet_ 键）"
 
 
 def test_kind_and_values_sane():
@@ -679,13 +666,17 @@ def test_kind_and_values_sane():
                           pet_size=48.0))
     if p._frames_walk is None:
         return False, "未知种类没有兜底，精灵构建失败"
-    for k in ("pet_idle_fade", "pet_expr"):
+    for k in ("pet_idle_fade",):
         if k not in d.DEFAULTS:
             return False, f"DEFAULTS 缺 {k}"
+    # 已去掉的功能不该在配置里留下"无效开关"（面板上会多一个拨了没用的项）
+    for k in ("pet_expr",):
+        if k in d.DEFAULTS:
+            return False, f"DEFAULTS 里残留了已移除的配置键 {k}"
     if PetField.MAX_PETS != 10:
         return False, f"数量上限是 {PetField.MAX_PETS}，期望 10"
     return True, ("默认值与钳制区间自洽；未知种类兜到默认形象；"
-                  f"数量上限 {PetField.MAX_PETS} 只")
+                  f"数量上限 {PetField.MAX_PETS} 只；无残留键")
 
 
 # ------------------------------------------------- 7. 负向对照（判据灵敏性）
@@ -767,8 +758,7 @@ def main():
         test_idle_fade_hides_then_wakes,
         test_idle_fade_zero_never_hides,
         test_click_wakes_hidden_pets,
-        test_click_expression_lifecycle,
-        test_expression_can_be_disabled,
+        test_ten_pets_chain_visible,
         test_ten_pets_ok,
         test_blend_depends_on_destination,
         test_blend_covers_sprite_area,

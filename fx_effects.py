@@ -3082,11 +3082,6 @@ class PetField:
     # 走路动画的判定速度：低于它就走"静止帧"（腿站定、只摆尾）
     _WALK_SPEED = 26.0
 
-    # 点击表情
-    EXPR_KINDS = ("爱心", "星星", "音符", "闪光")
-    _EXPR_LIFE = 1.25           # 一次表情从弹出到消失的总时长
-    _EXPR_POP = 0.20            # 弹出（回弹）阶段时长
-    _EXPR_FADE = 0.32           # 收尾淡出时长
     _BLINK_TIME = 0.11          # 单次眨眼时长
     _BLINK_GAP = (2.2, 6.0)     # 两次眨眼的间隔范围（随机）
 
@@ -3119,15 +3114,10 @@ class PetField:
         # 输入：由 set_pointer 每帧置位，update 消费后清掉
         self._moved = False
         self._clicked = 0
-        # 点击表情
-        self._expr_idx = 0
-        self._expr_t = 0.0
-        self._expr_pet = 0
         # 预渲染资源
         self._frames_walk = None
         self._frames_idle = None
         self._blink = None          # (img, dx, dy) 裁剪后的闭眼覆盖层
-        self._expr = None           # (E, Es, Es, 4) 表情图标
         self._sprite_key = None
         self._failed = False        # 精灵构建失败过就不要再每帧重试
 
@@ -3138,6 +3128,9 @@ class PetField:
         `clicked`：1=左键 2=右键 0=无。位移与点击都在这里记成"待消费"标志，
         由 `update()` 统一处理 —— 一帧里指针可能被喂多次（Scene 里聚光灯 /
         颜料盘 / 宠物各要一次），不能在喂的时候直接改状态。
+
+        点击的作用是**把渐隐中的宠物叫回来**（见 `update()` 的静止渐隐）：
+        鼠标停在原地不动时点一下也算一次交互。
         """
         x = float(x)
         y = float(y)
@@ -3162,7 +3155,7 @@ class PetField:
         self._fade = 1.0
         self._hidden = False
         self._idle = 0.0
-        self._expr_t = 0.0
+        self._clicked = 0
 
     def active(self):
         """这一帧有没有宠物要画（给"空层跳过"用的保守信号）。
@@ -3226,14 +3219,6 @@ class PetField:
             self._seat(n, spacing)
             self._n = n
             self._placed = True
-
-        # ---------------- 点出表情
-        if clicked and cfg.get("pet_expr", True) and n > 0:
-            self._expr_idx = int(self.rng.integers(0, len(self.EXPR_KINDS)))
-            self._expr_t = self._EXPR_LIFE
-            self._expr_pet = 0          # 领头那只来表现，最显眼
-        if self._expr_t > 0.0:
-            self._expr_t = max(0.0, self._expr_t - dt)
 
         # ---------------- 渐隐 / 淡入
         want = 0.0 if (idle_fade > 0.0 and self._idle >= idle_fade) else 1.0
@@ -3368,36 +3353,7 @@ class PetField:
                            cy - S * 0.5 + bdy + bimg.shape[0] * 0.5,
                            op, center=True)
 
-            # 点击表情：领头那只头顶弹出图标
-            if self._expr_t > 0.0 and i == self._expr_pet:
-                self._draw_expr(u32, w, h, cx, cy, S, op, flip)
-
-    def _draw_expr(self, u32, w, h, cx, cy, S, op, flip):
-        """把当前表情画在宠物头顶：回弹弹出 → 轻轻上飘 → 淡出。"""
-        if self._expr is None or len(self._expr) == 0:
-            return
-        t = self._EXPR_LIFE - self._expr_t          # 已经过去多久
-        # 弹出阶段：从 0.3 冲到约 1.0，中段用 sin 给一个回弹过冲。
-        # 过冲而不是线性放大到 1，是"啵"地弹出来那种手感的关键。
-        if t < self._EXPR_POP:
-            u = t / self._EXPR_POP
-            sc = 0.30 + 0.70 * (u ** 0.5) + 0.22 * math.sin(math.pi * u)
-        else:
-            sc = 1.0
-        # 收尾淡出
-        left = self._EXPR_LIFE - t
-        a = 1.0 if left >= self._EXPR_FADE else max(0.0, left / self._EXPR_FADE)
-        if a <= 0.01:
-            return
-        # 整体缓缓上飘，像漫画里的气泡
-        rise = -min(1.0, t / self._EXPR_LIFE) * S * 0.20
-        eimg = self._expr[self._expr_idx]
-        if flip:
-            eimg = eimg[:, ::-1]
-        self._blit(u32, w, h, eimg, cx, cy - S * 0.92 + rise,
-                   op * a, scale=sc)
-
-    def _blit(self, u32, w, h, img, cx, cy, op, scale=1.0, center=True):
+    def _blit(self, u32, w, h, img, cx, cy, op, center=True):
         """把预乘 RGBA 精灵**叠加**到缓冲上（默认以 (cx, cy) 为中心）。
 
         这里做真正的 over 混合，而不是本文件其它特效惯用的"非零覆盖"：
@@ -3406,15 +3362,9 @@ class PetField:
         缓冲是预乘格式，所以 over 就是 `dst = src + dst·(1 − src_a)`，不必
         再除 alpha。混合只作用在精灵包围盒上（几十像素见方），开销可忽略。
 
-        `scale` 走最近邻缩放：只给点击表情的"弹出"用（每帧至多一张小图），
-        不值得为它开一条双线性路径。`center=False` 时 (cx, cy) 是左上角 ——
-        闭眼覆盖层已经裁剪过，用左上角定位比换算中心更直接。
+        `center=False` 时 (cx, cy) 是左上角 —— 闭眼覆盖层已经裁剪过，用左上角
+        定位比换算中心更直接。
         """
-        if scale != 1.0:
-            s0 = img.shape[0]
-            ns = max(1, int(round(s0 * scale)))
-            idx = np.minimum((np.arange(ns) * s0) // ns, s0 - 1)
-            img = img[np.ix_(idx, idx)]
         S = img.shape[0]
         x0 = int(round(cx - S * 0.5)) if center else int(round(cx))
         y0 = int(round(cy - S * 0.5)) if center else int(round(cy))
@@ -3474,7 +3424,6 @@ class PetField:
         self._frames_walk = self._build_frames(kind, color, size, walk=True)
         self._frames_idle = self._build_frames(kind, color, size, walk=False)
         self._blink = self._build_blink(kind, color, size)
-        self._expr = self._build_expr(size)
         self._sprite_key = key
 
     def _build_frames(self, kind, color_hex, size, walk):
@@ -3534,69 +3483,6 @@ class PetField:
         crop *= (1.0 / 255.0)
         crop[..., :3] *= crop[..., 3:4]         # 直通 alpha -> 预乘
         return np.ascontiguousarray(crop), dx0, dy0
-
-    def _build_expr(self, size):
-        """生成 4 个点击表情图标，尺寸随宠物体型走。"""
-        es = max(28, int(size * 0.82))
-        return np.stack([self._expr_icon(i, es)
-                         for i in range(len(self.EXPR_KINDS))], axis=0)
-
-    def _expr_icon(self, idx, size):
-        """画一个表情图标。形状与配色都是代码写的，不依赖字体或图片。"""
-        W = size * self._SS
-        img = _PImage.new("RGBA", (W, W), (0, 0, 0, 0))
-        dr = _PDraw.Draw(img)
-
-        def poly(pts, fill):
-            dr.polygon([(x * W, y * W) for x, y in pts], fill=fill)
-
-        def ell(cx, cy, rx, ry, fill):
-            dr.ellipse([(cx - rx) * W, (cy - ry) * W,
-                        (cx + rx) * W, (cy + ry) * W], fill=fill)
-
-        def line(pts, fill, wd):
-            dr.line([(x * W, y * W) for x, y in pts], fill=fill,
-                    width=max(1, int(wd)), joint="curve")
-
-        kind = self.EXPR_KINDS[idx]
-        if kind == "爱心":
-            # 两个圆瓣 + 一个倒三角，拼出心形
-            c = (255, 96, 138, 255)
-            ell(0.355, 0.365, 0.205, 0.205, c)
-            ell(0.645, 0.365, 0.205, 0.205, c)
-            poly([(0.155, 0.435), (0.845, 0.435), (0.500, 0.880)], c)
-            # 左上角一点高光，不然整块颜色太平
-            ell(0.305, 0.310, 0.062, 0.048, (255, 255, 255, 200))
-        elif kind == "星星":
-            c = (255, 209, 102, 255)
-            pts = []
-            for j in range(10):
-                rr = 0.44 if j % 2 == 0 else 0.185
-                aa = -math.pi / 2 + j * math.pi / 5
-                pts.append((0.5 + rr * math.cos(aa), 0.5 + rr * math.sin(aa)))
-            poly(pts, c)
-            ell(0.5, 0.47, 0.075, 0.075, (255, 250, 225, 220))
-        elif kind == "音符":
-            c = (127, 231, 255, 255)
-            ell(0.335, 0.735, 0.185, 0.135, c)      # 符头
-            line([(0.505, 0.720), (0.505, 0.215)], c, max(2, W * 0.045))
-            # 符尾：向右下甩出的一小段弧
-            line([(0.505, 0.215), (0.700, 0.290), (0.760, 0.430)],
-                 c, max(2, W * 0.042))
-        else:   # 闪光
-            c = (255, 250, 235, 255)
-            pts = []
-            for j in range(8):
-                rr = 0.46 if j % 2 == 0 else 0.115
-                aa = -math.pi / 2 + j * math.pi / 4
-                pts.append((0.5 + rr * math.cos(aa), 0.5 + rr * math.sin(aa)))
-            poly(pts, c)
-            ell(0.5, 0.5, 0.075, 0.075, (255, 232, 150, 255))
-
-        img = img.resize((int(size), int(size)), _LANCZOS)
-        arr = np.asarray(img).astype(np.float32) * (1.0 / 255.0)
-        arr[..., :3] *= arr[..., 3:4]
-        return np.ascontiguousarray(arr)
 
     def _build_sprite(self, kind, color_hex, size, anim=None):
         """把卡通形象画进 (size, size, 4) 的**预乘** RGBA 数组。

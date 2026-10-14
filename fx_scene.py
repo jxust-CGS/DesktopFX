@@ -313,8 +313,8 @@ class Scene:
         # 宠物是这一层的主体，压在涟漪与水波之上才看得清；水波那次 solo 整片
         # 直写发生在本段**之前**，所以不会把宠物抹掉。
         # 指针与点击每帧都喂（特效关着也喂）：重新启用时 _seat() 要按当前光标
-        # 把队伍摆出来，喂不到就会先出现在很久以前的位置。点击给它喂的是
-        # `mouse.clicked`（1=左键 2=右键 0=无），宠物用它决定要不要弹表情。
+        # 把队伍摆出来，喂不到就会先出现在很久以前的位置。点击的作用是把渐隐
+        # 中的宠物叫回来 —— 光标停在原地不动时点一下也算一次交互。
         self.pets.set_pointer(float(self.mouse.mx), float(self.mouse.my),
                               int(self.mouse.clicked))
         if cfg.get("pet_enabled", False):
