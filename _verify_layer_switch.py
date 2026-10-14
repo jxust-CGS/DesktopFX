@@ -216,7 +216,7 @@ def test_layer_taxonomy():
           if e.get("layer") == "fullscreen"}
     ms = {n for n, e in fx_kinds.EFFECTS.items() if e.get("layer") == "mouse"}
     want_fs = {"下雨", "下雪", "落樱", "流星雨"}
-    want_ms = {"聚光灯", "颜料盘", "涟漪", "真实水波", "窗口水波"}
+    want_ms = {"聚光灯", "颜料盘", "宠物跟随", "涟漪", "真实水波", "窗口水波"}
     if fs != want_fs:
         return False, f"全屏层归类变了：{sorted(fs)}（期望 {sorted(want_fs)}）"
     if ms != want_ms:
@@ -234,7 +234,7 @@ def test_layer_taxonomy():
     if fx_kinds.layer_of("不存在的特效") is not None:
         return False, "未知特效的 layer_of 应当返回 None"
     return True, ("全屏特效开关 → 下雨/下雪/落樱/流星雨；"
-                  "鼠标特效开关 → 聚光灯/颜料盘/涟漪/真实水波/窗口水波")
+                  "鼠标特效开关 → 聚光灯/颜料盘/宠物跟随/涟漪/真实水波/窗口水波")
 
 
 # ------------------------------------------------------------------ 2. 非法值归一

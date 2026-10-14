@@ -14,7 +14,7 @@ import numpy as np
 
 from fx_effects import (RainField, RippleField, MeteorField, MouseProbe,
                         PaintField, PetalField, SnowField, SpotlightField,
-                        WaterRippleField, WindowProbe, hex_to_bgr)
+                        PetField, WaterRippleField, WindowProbe, hex_to_bgr)
 
 
 class Scene:
@@ -31,6 +31,7 @@ class Scene:
         self.wave = WaterRippleField(w, h, seed=41)
         self.mouse = MouseProbe()
         self.spot = SpotlightField(w, h, seed=17)       # 聚光灯
+        self.pets = PetField(w, h, seed=53)             # 宠物跟随
         self.win = WindowProbe()                        # 窗口枚举（窗口交互地基）
 
         # 覆盖层在虚拟屏幕里的左上角偏移（鼠标坐标要折算进来）
@@ -77,7 +78,8 @@ class Scene:
         保守体现在"开着就算有内容"：聚光灯恒画满屏、颜料盘/真实水波开着就可能
         随时出图，都懒得去猜。真正能省下来的是**涟漪池空着**的时候，所以要按池子
         的真实活跃状态判，而不是按 ripple_enabled —— 后者开着但用户没动鼠标时
-        池子是空的。
+        池子是空的。宠物同理按"队伍是否真的摆在场上了"判（`pets.active()`），
+        而不是按 pet_enabled：开关开着但队伍还没落位时不该让它一直上屏。
         """
         cfg = self.cfg
         fs = bool(cfg.get("rain_enabled", True) or cfg.get("snow_enabled", False)
@@ -99,7 +101,8 @@ class Scene:
                   or self.paint._dirty
                   or ((cfg.get("wave_enabled", False)
                        or cfg.get("win_ripple_enabled", False)) and self.wave._alive)
-                  or self.ripples.active.any())
+                  or self.ripples.active.any()
+                  or self.pets.active())
         return fs, ms
 
     def resize(self, w, h):
@@ -111,6 +114,7 @@ class Scene:
         self.paint.resize(w, h)
         self.wave.resize(w, h)
         self.spot.resize(w, h)
+        self.pets.resize(w, h)
 
     def _ripple_color(self):
         c = self.cfg.get("ripple_color", "#7FE7FF")
@@ -304,6 +308,18 @@ class Scene:
             self.wave.reset()
             self._wave_acc = 0.0
             self._wave_amb = 0.0
+
+        # ---------------- 宠物跟随（画在最后 = 鼠标层最上）
+        # 宠物是这一层的主体，压在涟漪与水波之上才看得清；水波那次 solo 整片
+        # 直写发生在本段**之前**，所以不会把宠物抹掉。
+        # 指针每帧都喂（特效关着也喂）：重新启用时 _seat() 要按当前光标把队伍
+        # 摆出来，喂不到就会先出现在很久以前的位置。
+        self.pets.set_pointer(float(self.mouse.mx), float(self.mouse.my))
+        if cfg.get("pet_enabled", False):
+            self.pets.update(dt, cfg)
+            self.pets.draw(buf_ms, w, h, cfg)
+        else:
+            self.pets.reset()
 
     # ------------------------------------------------------------ 真实水波
     def _wave_trigger(self, cfg, dist, w, h, dt):

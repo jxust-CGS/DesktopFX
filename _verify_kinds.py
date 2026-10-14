@@ -27,7 +27,8 @@ def _base_cfg(**over):
     cfg = dict(d.DEFAULTS)
     cfg.update(dict(rain_enabled=False, snow_enabled=False, petal_enabled=False,
                     meteor_enabled=False, spotlight_enabled=False,
-                    paint_enabled=False, ripple_enabled=False,
+                    paint_enabled=False, pet_enabled=False,
+                    ripple_enabled=False,
                     wave_enabled=False, win_ripple_enabled=False))
     cfg.update(over)
     return cfg

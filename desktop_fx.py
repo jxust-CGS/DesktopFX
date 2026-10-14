@@ -142,6 +142,17 @@ DEFAULTS = {
     "spotlight_radius": 220.0,
     "spotlight_dim": 0.6,
     "spotlight_color": "#05070A",
+    # ---- 宠物跟随（小猫 / 小狗跟着鼠标跑）----
+    # 形象由 fx_effects.PetField **用代码画**出来（PIL 超采样 + LANCZOS），
+    # 不引入任何图片资源 —— 也就不牵扯第三方形象授权，还能整体换色。
+    # pet_color 是主色，耳朵内侧 / 描边 / 眼睛这些深浅都由它派生。
+    "pet_enabled": False,
+    "pet_kind": "小猫",
+    "pet_count": 2.0,        # 1~3 只，排成一列跟在后面
+    "pet_size": 56.0,        # 精灵边长（像素）
+    "pet_follow": 0.55,      # 跟随紧密度：越大跟得越紧、越贴
+    "pet_color": "#F2C27B",
+    "pet_opacity": 1.0,
     # ---- 窗口水波（窗口移动 / 缩放 / 最小化 / 恢复时扰动水面）----
     # 它**不自己画**：窗口只是水面的一个扰动源 —— 和鼠标共用同一片水（见
     # WaterRippleField.push_rect / dome_rect），所以这里只剩"扰动多大、多宽"
@@ -385,6 +396,24 @@ PRESETS = {
               wave_speed=170, wave_persist=0.45, wave_size=24, wave_strength=0.07,
               wave_light=225, wave_contrast=0.40, wave_shading=0.30,
               wave_highlight=0.40, wave_color="#FFFFFF", wave_opacity=0.11),
+    # ---- 宠物跟随 ----
+    # 像「水面」一样把全屏特效显式关掉：预设是"整套方案"，只写自己那几个键
+    # 会让用户上一次开着的雨继续下，看起来像没生效。
+    "小猫": dict(rain_enabled=False, snow_enabled=False,
+              petal_enabled=False, meteor_enabled=False,
+              pet_enabled=True, pet_kind="小猫", pet_count=2,
+              pet_size=56, pet_follow=0.55, pet_color="#F2C27B",
+              pet_opacity=1.0),
+    "小狗": dict(rain_enabled=False, snow_enabled=False,
+              petal_enabled=False, meteor_enabled=False,
+              pet_enabled=True, pet_kind="小狗", pet_count=2,
+              pet_size=58, pet_follow=0.55, pet_color="#B9CBE8",
+              pet_opacity=1.0),
+    "三只小猫": dict(rain_enabled=False, snow_enabled=False,
+                petal_enabled=False, meteor_enabled=False,
+                pet_enabled=True, pet_kind="小猫", pet_count=3,
+                pet_size=46, pet_follow=0.62, pet_color="#F2C27B",
+                pet_opacity=1.0),
 }
 
 # 预设方案下沉到各特效页内部：每个特效页显示自己的预设方案
@@ -400,6 +429,7 @@ PRESET_GROUPS = {
     # 这样预设块里从上往下就是"越来越明显"，对比时不用来回切。
     "真实水波": ["微风拂面", "月下湖面", "真实水波", "暴雨打点", "惊涛"],
     "窗口水波": ["水面"],
+    "宠物跟随": ["小猫", "小狗", "三只小猫"],
 }
 
 

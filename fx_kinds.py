@@ -31,6 +31,9 @@ EFFECTS = {
     # 选了「仅桌面图层」后会被窗口遮住 —— 那是该档位的语义，不是故障。
     "聚光灯":   dict(cat="鼠标特效", layer="mouse", enable="spotlight_enabled"),
     "颜料盘":   dict(cat="鼠标特效", layer="mouse", enable="paint_enabled"),
+    # 宠物跟随：同样只由光标驱动，但它是这一层里唯一的**不透明实体**
+    # （其余都是半透明的光/水/颜料），所以画在最后、压在涟漪与水波之上。
+    "宠物跟随": dict(cat="鼠标特效", layer="mouse", enable="pet_enabled"),
     # 涟漪有主开关 ripple_enabled（"跟随移动 / 点击扩散"只是它的两种触发方式），
     # 否则它在配置里恒为"开着"，同类互斥会一直把它当占用者、把别的特效顶掉。
     "涟漪":     dict(cat="鼠标特效", layer="mouse", enable="ripple_enabled"),
@@ -64,7 +67,7 @@ ENABLE_TO_EFFECT = {v["enable"]: k for k, v in EFFECTS.items() if v.get("enable"
 # 侧栏导航顺序：(分组标题, [页键...])
 NAV_GROUPS = [
     ("全屏特效", ["下雨", "下雪", "落樱", "流星雨"]),
-    ("鼠标特效", ["聚光灯", "颜料盘", "涟漪", "真实水波"]),
+    ("鼠标特效", ["聚光灯", "颜料盘", "宠物跟随", "涟漪", "真实水波"]),
     ("其他特效", ["窗口水波"]),
 ]
 

@@ -14,6 +14,18 @@ import numpy as np
 
 from _win32 import user32, HANDLE, INT, SHORT
 
+# 宠物跟随的卡通形象用 PIL 画（超采样 + LANCZOS，与 fx_ui._render_aa 同一套
+# 先例）：三角耳朵 / 多段尾巴 / 细胡须这类形状用绘图原语表达要干净得多。
+# 形状全部来自代码，不引入任何图片资源 —— 也就不牵扯第三方形象授权。
+try:
+    from PIL import Image as _PImage
+    from PIL import ImageDraw as _PDraw
+    _LANCZOS = _PImage.Resampling.LANCZOS
+except Exception:                       # pragma: no cover - 打包环境必有 PIL
+    _PImage = None
+    _PDraw = None
+    _LANCZOS = None
+
 # ---- Win32 窗口枚举（仅 Windows 下可用；非 Windows 仅跳过，不报错）----
 try:
     _WinU32 = user32
@@ -2993,6 +3005,342 @@ class CursorTrailField:
     def set_color(self, hex_str):
         bgr = hex_to_bgr(hex_str)
         self._rgb = (float(bgr[2]), float(bgr[1]), float(bgr[0]))
+
+
+# ------------------------------------------------------------------ 宠物跟随
+class PetField:
+    """宠物跟随：小猫 / 小狗沿着鼠标轨迹跟在后面跑。
+
+    三处值得说的设计：
+
+    * **精灵预渲染**：卡通形象用 PIL 在 3× 画布上画一次、LANCZOS 缩到目标
+      尺寸，存成**预乘** RGBA 数组；之后每帧只做贴图，成本与形象复杂度无关。
+      画布取 `max(64, 显示尺寸)` 再缩下来 —— 小体型时降采样比直接画 24px 干净。
+      形状一律由代码绘制，不引入图片资源，也就不牵扯第三方形象授权。
+
+    * **跟随链**：第一只追鼠标，第二只追第一只……位移走**临界阻尼弹簧**
+      （阻尼 c = 2√k）。不用"每帧向目标靠固定比例"的 lerp —— 那种写法的手感
+      随帧率变（同一个 follow 值，120 帧的机器跟得明显更紧），而弹簧的解析解
+      只依赖 dt，换帧率手感一致。
+
+    * **朝向迟滞**：按水平速度左右翻转，带速度阈值 + 需连续保持一小段时间。
+      没有迟滞的话，鼠标原地画小圈会让宠物每帧左右横跳。
+
+    与其它特效共用 resize/update/draw 的接口约定，另加 `set_pointer()` ——
+    目标点来自外部鼠标，由 Scene 每帧喂进来。
+    """
+
+    KINDS = ("小猫", "小狗")
+    MAX_PETS = 3
+
+    # 触发转向的最小水平速度与需保持的时间。阈值给得偏高：宠物慢慢挪动时
+    # 应该保持原朝向"侧着身子走"，而不是跟着微小抖动转身。
+    _FLIP_SPEED = 55.0          # 像素/秒
+    _FLIP_HOLD = 0.07           # 秒
+    _SPRITE_MIN = 64            # 精灵分辨率下限
+    _SS = 3                     # 精灵超采样倍数
+
+    def __init__(self, w, h, seed=53):
+        self.rng = np.random.default_rng(seed)
+        self.w, self.h = w, h
+        self._mx = w * 0.5
+        self._my = h * 0.5
+        # 跟随链状态：位置 / 速度 / 朝向 / 转向候选已保持的时长
+        self.px = np.zeros(self.MAX_PETS, np.float32)
+        self.py = np.zeros(self.MAX_PETS, np.float32)
+        self.vx = np.zeros(self.MAX_PETS, np.float32)
+        self.vy = np.zeros(self.MAX_PETS, np.float32)
+        self._face = np.ones(self.MAX_PETS, np.float32)     # +1 朝右 / -1 朝左
+        self._hold = np.zeros(self.MAX_PETS, np.float32)
+        self._n = 0                 # 当前宠物数
+        self._placed = False
+        self._phase = 0.0           # 步行相位（驱动力上下浮动）
+        self._speed = 0.0
+        self._sprite = None
+        self._sprite_key = None
+        self._failed = False        # 精灵构建失败过就不要再每帧重试
+
+    # ------------------------------------------------------------ 外部接口
+    def set_pointer(self, x, y):
+        """Scene 每帧喂当前光标位置（覆盖层坐标系）。"""
+        self._mx = float(x)
+        self._my = float(y)
+
+    def resize(self, w, h):
+        self.w, self.h = w, h
+
+    def reset(self):
+        """关掉特效时清场：下次打开重新从光标处出现，而不是从上次的位置跑来。"""
+        self._placed = False
+        self._n = 0
+        self.vx[:] = 0.0
+        self.vy[:] = 0.0
+        self._hold[:] = 0.0
+
+    def active(self):
+        """这一帧有没有宠物要画（给"空层跳过"用的保守信号）。"""
+        return bool(self._placed and self._n > 0 and self._sprite is not None)
+
+    # ------------------------------------------------------------ 每帧
+    def update(self, dt, cfg):
+        if self._failed:
+            return
+        # 显式欧拉推进弹簧：dt 过大时数值会发散。Scene 传进来的已经夹过一次，
+        # 这里再夹一次，保证本类被单独调用时也稳。
+        dt = min(max(float(dt), 0.0), 0.05)
+        n = int(np.clip(round(float(cfg.get("pet_count", 2.0))), 1,
+                        self.MAX_PETS))
+        size = float(np.clip(float(cfg.get("pet_size", 56.0)), 16.0, 160.0))
+        follow = float(np.clip(float(cfg.get("pet_follow", 0.55)), 0.0, 1.0))
+        spacing = size * 0.82       # 队列间距跟着体型走
+
+        try:
+            self._ensure_sprite(cfg)
+        except Exception:
+            # 只试一次：失败原因会由渲染线程的保护层记进 error.log，但反复抛
+            # 会耗光"连续失败"配额把整个渲染线程熔断掉 —— 一个特效画不出来
+            # 不该让雨也停。
+            self._failed = True
+            raise
+
+        # 首次出现 / 改数量：把队伍直接铺在光标身后。否则它们会从 (0,0)
+        # 排队跑过来，像被甩出去一样。
+        if not self._placed or n != self._n:
+            self._seat(n, spacing)
+            self._n = n
+            self._placed = True
+
+        # 刚度：follow=0 时松垮（慢悠悠），follow=1 时紧咬不放。
+        # 阻尼取临界值 c = 2√k 并略微过阻尼（×1.03）—— 欠阻尼的宠物会在
+        # 光标处来回荡，而过阻尼只是"跟得钝一点"，观感上更像活物。
+        k = 14.0 + 190.0 * follow
+        c = 2.0 * np.sqrt(k) * 1.03
+
+        for i in range(n):
+            if i == 0:
+                gx, gy = self._mx, self._my
+            else:
+                # 目标 = 前一只身后 spacing 处（沿两者连线后退）。
+                # 用"身后一点"而不是"直接追前一只的位置"：后者会让整队挤成
+                # 一坨，因为每只都想贴到同一个点上。
+                ax, ay = float(self.px[i - 1]), float(self.py[i - 1])
+                dx = ax - float(self.px[i])
+                dy = ay - float(self.py[i])
+                d = (dx * dx + dy * dy) ** 0.5
+                if d > 1e-3:
+                    gx = ax - dx / d * spacing
+                    gy = ay - dy / d * spacing
+                else:
+                    gx, gy = ax, ay
+            fx = k * (gx - float(self.px[i]))
+            fy = k * (gy - float(self.py[i]))
+            self.vx[i] += (fx - c * float(self.vx[i])) * dt
+            self.vy[i] += (fy - c * float(self.vy[i])) * dt
+            self.px[i] += self.vx[i] * dt
+            self.py[i] += self.vy[i] * dt
+
+        # 朝向：过阈值且连续保持一小段时间才真的翻
+        for i in range(n):
+            want = float(self._face[i])
+            vx = float(self.vx[i])
+            if vx > self._FLIP_SPEED:
+                want = 1.0
+            elif vx < -self._FLIP_SPEED:
+                want = -1.0
+            if want != float(self._face[i]):
+                self._hold[i] += dt
+                if self._hold[i] >= self._FLIP_HOLD:
+                    self._face[i] = want
+                    self._hold[i] = 0.0
+            else:
+                self._hold[i] = 0.0
+
+        # 步行相位：走得快摆得快，同时留一个"慢悠悠踱步"的下限
+        spd = (float(self.vx[0]) ** 2 + float(self.vy[0]) ** 2) ** 0.5
+        self._speed = spd
+        self._phase += dt * (2.4 + spd / 70.0)
+
+    def _seat(self, n, spacing):
+        """把 n 只宠物沿当前朝向铺在光标身后（首次出现 / 改数量时调用）。"""
+        for i in range(n):
+            self.px[i] = self._mx - spacing * i
+            self.py[i] = self._my
+            self.vx[i] = 0.0
+            self.vy[i] = 0.0
+            self._face[i] = 1.0
+            self._hold[i] = 0.0
+
+    def draw(self, u32, w, h, cfg):
+        if not self.active():
+            return
+        op = float(np.clip(float(cfg.get("pet_opacity", 1.0)), 0.0, 1.0))
+        if op <= 0.004:
+            return
+        base = self._sprite
+        S = base.shape[0]
+        # 完全平移的宠物看着像贴纸；加一点上下浮动，幅度随速度增长
+        amp = S * 0.030
+        gait = 0.30 + 0.70 * min(1.0, self._speed / 260.0)
+        for i in range(self._n):
+            yb = float(np.sin(self._phase + i * 1.1)) * amp * gait
+            img = base[:, ::-1] if self._face[i] < 0.0 else base
+            self._blit(u32, w, h, img, float(self.px[i]),
+                       float(self.py[i]) + yb, op)
+
+    def _blit(self, u32, w, h, img, cx, cy, op):
+        """把预乘 RGBA 精灵以 (cx, cy) 为中心**叠加**到缓冲上。
+
+        这里做真正的 over 混合，而不是本文件其它特效惯用的"非零覆盖"：
+        宠物有羽化边缘，覆盖写法会把半透明边缘像素写成"实心但偏暗"，叠在
+        涟漪 / 水面上就是一圈脏边。
+        缓冲是预乘格式，所以 over 就是 `dst = src + dst·(1 − src_a)`，不必
+        再除 alpha。混合只作用在精灵包围盒上（几十像素见方），开销可忽略。
+        """
+        S = img.shape[0]
+        x0 = int(round(cx - S * 0.5))
+        y0 = int(round(cy - S * 0.5))
+        # 与屏幕求交（宠物可以走出屏幕边缘，裁掉即可）
+        gx0, gy0 = max(0, x0), max(0, y0)
+        gx1, gy1 = min(int(w), x0 + S), min(int(h), y0 + S)
+        if gx1 <= gx0 or gy1 <= gy0:
+            return
+        sub = img[gy0 - y0:gy1 - y0, gx0 - x0:gx1 - x0]
+        a = sub[:, :, 3] * op
+        if not (a > 0.004).any():
+            return
+        inv = 1.0 - a
+
+        dst = u32.reshape(int(h), int(w))[gy0:gy1, gx0:gx1]
+        d = dst.astype(np.uint32)
+        dr = ((d >> np.uint32(16)) & np.uint32(0xFF)).astype(np.float32)
+        dg = ((d >> np.uint32(8)) & np.uint32(0xFF)).astype(np.float32)
+        db = (d & np.uint32(0xFF)).astype(np.float32)
+        da = ((d >> np.uint32(24)) & np.uint32(0xFF)).astype(np.float32)
+
+        # 精灵已是预乘色（rgb 内含 alpha），乘 op 就是"整体调不透明度"
+        sc = 255.0 * op
+        nr = sub[:, :, 0] * sc + dr * inv
+        ng = sub[:, :, 1] * sc + dg * inv
+        nb = sub[:, :, 2] * sc + db * inv
+        na = a * 255.0 + da * inv      # a 已含 op
+
+        out = (np.clip(nb, 0.0, 255.0).astype(np.uint32)
+               | (np.clip(ng, 0.0, 255.0).astype(np.uint32) << np.uint32(8))
+               | (np.clip(nr, 0.0, 255.0).astype(np.uint32) << np.uint32(16))
+               | (np.clip(na, 0.0, 255.0).astype(np.uint32) << np.uint32(24)))
+        dst[...] = out
+
+    # ------------------------------------------------------------ 精灵
+    def _ensure_sprite(self, cfg):
+        """按 (种类, 颜色, 尺寸) 重建精灵；三者任一变化才重建。"""
+        if _PImage is None:
+            raise RuntimeError("宠物跟随需要 Pillow 来绘制卡通形象，"
+                               "当前环境没有可用的 PIL")
+        kind = str(cfg.get("pet_kind", self.KINDS[0]))
+        if kind not in self.KINDS:
+            kind = self.KINDS[0]
+        color = str(cfg.get("pet_color", "#F2C27B"))
+        size = int(np.clip(round(float(cfg.get("pet_size", 56.0))), 16, 160))
+        key = (kind, color, size)
+        if key == self._sprite_key:
+            return
+        self._sprite = self._build_sprite(kind, color, size)
+        self._sprite_key = key
+
+    def _build_sprite(self, kind, color_hex, size):
+        """把卡通形象画进 (size, size, 4) 的**预乘** RGBA 数组。"""
+        S = max(self._SPRITE_MIN, int(size))
+        W = S * self._SS
+        img = _PImage.new("RGBA", (W, W), (0, 0, 0, 0))
+        dr = _PDraw.Draw(img)
+
+        bgr = hex_to_bgr(color_hex)
+        base = (int(bgr[2]), int(bgr[1]), int(bgr[0]))
+        body = base + (255,)
+        dark = tuple(max(0, int(v * 0.34)) for v in base) + (255,)
+        mid = tuple(int(v * 0.68) for v in base) + (255,)
+        light = tuple(int(v + (255 - v) * 0.62) for v in base) + (255,)
+        white = (255, 255, 255, 255)
+        lw = max(1, int(round(W * 0.013)))
+
+        def ell(cx, cy, rx, ry, fill, outline=None, wd=0):
+            dr.ellipse([(cx - rx) * W, (cy - ry) * W,
+                        (cx + rx) * W, (cy + ry) * W],
+                       fill=fill, outline=outline, width=wd)
+
+        def cir(cx, cy, r, fill, outline=None, wd=0):
+            ell(cx, cy, r, r, fill, outline, wd)
+
+        def poly(pts, fill):
+            dr.polygon([(x * W, y * W) for x, y in pts], fill=fill)
+
+        def line(pts, fill, wd):
+            dr.line([(x * W, y * W) for x, y in pts], fill=fill,
+                    width=max(1, int(wd)), joint="curve")
+
+        args = (ell, cir, poly, line, body, dark, mid, light, white, lw)
+        if kind == "小狗":
+            self._draw_dog(*args)
+        else:
+            self._draw_cat(*args)
+
+        img = img.resize((int(size), int(size)), _LANCZOS)
+        arr = np.asarray(img).astype(np.float32) * (1.0 / 255.0)
+        arr[..., :3] *= arr[..., 3:4]           # 直通 alpha -> 预乘
+        return np.ascontiguousarray(arr)
+
+    @staticmethod
+    def _draw_cat(ell, cir, poly, line, body, dark, mid, light, white, lw):
+        """小猫（侧面朝右，Q 版大头小身）。
+
+        画序 = 从后往前（尾巴 -> 后腿 -> 身体 -> 前腿 -> 耳 -> 头 -> 五官），
+        后画的自然压住先画的，正好就是遮挡关系。坐标归一化到 0~1。
+        耳朵的**底边落在头圆内部**，靠这一点保证耳根与头连成一体而不是飘着。
+
+        不画胡须：96px 的精灵上它只有 1px 宽，LANCZOS 缩完糊成一片灰，
+        反倒显脏；猫的特征交给耳形与三角鼻去表达。
+        """
+        # 尾巴：从身后向上翘
+        line([(0.13, 0.72), (0.05, 0.60), (0.04, 0.45), (0.13, 0.36)],
+             mid, lw * 3.0)
+        line([(0.26, 0.82), (0.23, 0.92)], mid, lw * 3.4)          # 后腿
+        ell(0.40, 0.68, 0.30, 0.19, body, dark, lw)                # 身体
+        line([(0.58, 0.82), (0.60, 0.92)], body, lw * 3.4)         # 前腿
+        ell(0.52, 0.74, 0.115, 0.075, light)                       # 胸口
+        # 耳朵（底边在头内，头会压住耳根）
+        poly([(0.50, 0.30), (0.52, 0.05), (0.68, 0.20)], body)
+        poly([(0.72, 0.20), (0.88, 0.05), (0.90, 0.30)], body)
+        poly([(0.545, 0.265), (0.557, 0.115), (0.655, 0.205)], light)
+        poly([(0.752, 0.207), (0.845, 0.115), (0.858, 0.272)], light)
+        cir(0.68, 0.40, 0.24, body, dark, lw)                      # 头
+        ell(0.582, 0.376, 0.047, 0.058, dark)                      # 眼
+        ell(0.778, 0.370, 0.047, 0.058, dark)
+        cir(0.594, 0.359, 0.020, white)                            # 高光
+        cir(0.790, 0.353, 0.020, white)
+        poly([(0.652, 0.470), (0.708, 0.470), (0.680, 0.503)], dark)   # 鼻
+        line([(0.680, 0.501), (0.645, 0.533)], mid, lw)            # 嘴
+        line([(0.680, 0.501), (0.715, 0.533)], mid, lw)
+
+    @staticmethod
+    def _draw_dog(ell, cir, poly, line, body, dark, mid, light, white, lw):
+        """小狗（侧面朝右，垂耳 + 突出的口鼻）。"""
+        line([(0.14, 0.72), (0.06, 0.62), (0.07, 0.50)], mid, lw * 3.0)  # 尾
+        line([(0.26, 0.83), (0.23, 0.93)], mid, lw * 3.4)                 # 后腿
+        ell(0.40, 0.69, 0.30, 0.185, body, dark, lw)                      # 身体
+        line([(0.58, 0.83), (0.60, 0.93)], body, lw * 3.4)                # 前腿
+        ell(0.52, 0.75, 0.115, 0.075, light)                              # 胸口
+        # 垂耳同样先画：头压住耳根，只让两侧垂下来
+        ell(0.520, 0.500, 0.085, 0.190, mid, dark, lw)
+        ell(0.860, 0.480, 0.085, 0.190, mid, dark, lw)
+        cir(0.68, 0.40, 0.235, body, dark, lw)                            # 头
+        ell(0.760, 0.505, 0.116, 0.090, light)                            # 口鼻
+        ell(0.808, 0.472, 0.050, 0.038, dark)                             # 鼻头
+        ell(0.596, 0.380, 0.049, 0.059, dark)                             # 眼
+        ell(0.762, 0.373, 0.049, 0.059, dark)
+        cir(0.608, 0.362, 0.021, white)
+        cir(0.774, 0.355, 0.021, white)
+        line([(0.808, 0.510), (0.768, 0.548)], mid, lw)                   # 嘴
+        line([(0.808, 0.510), (0.848, 0.548)], mid, lw)
 
 
 # ------------------------------------------------------------------ 聚光灯

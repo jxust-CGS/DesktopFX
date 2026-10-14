@@ -7,7 +7,7 @@
 桌面特效脚本大多要建真窗口、动真 z 序，同样经不起并行。
 
 用法（按改动范围选，别一律跑全量）：
-    python _run_all_verify.py --fast     # 核心回归，13 个脚本约 75 秒 —— 日常收尾默认用这个
+    python _run_all_verify.py --fast     # 核心回归，14 个脚本约 70 秒 —— 日常收尾默认用这个
     python _run_all_verify.py --skip-slow  # 全部但要略过已知慢的，约 3 分钟
     python _run_all_verify.py            # 全部，约 11 分钟（含性能/长跑基准）
 
@@ -21,7 +21,7 @@ import subprocess
 import sys
 import time
 
-# 核心回归：覆盖"改了容易坏、坏了用户立刻能看出来"的那几块，13 个脚本约 75 秒。
+# 核心回归：覆盖"改了容易坏、坏了用户立刻能看出来"的那几块，14 个脚本约 70 秒。
 FAST = [
     "_verify_kinds.py",          # 特效分类表自洽（2s）
     "_verify_zorder.py",         # 置顶保活 / 插入锚点（9s）
@@ -32,6 +32,7 @@ FAST = [
     "_verify_layer_skip.py",      # 层判空的安全不变量，无窗口（22s）
     "_verify_render_guard.py",    # 渲染线程异常保护 + 三处 JSON 原子写（6s）
     "_verify_cfg_coerce.py",      # 配置值钳制：坏值不静默变行为，也不误伤好值（6s）
+    "_verify_pet.py",             # 宠物跟随：跟随链物理 / 朝向迟滞 / 精灵与混合（4s）
     "_verify_attach_rollback.py",  # 挂到壁纸层失败时的样式回滚（真机，4s）
     "_verify_window_ripple.py",   # 窗口 = 水面活塞（事件流 / 物理 / 接线，无窗口，1s）
     "_verify_wave_draw.py",       # 水面上屏：查表着色 + 直写（1s）

@@ -57,6 +57,11 @@ METEOR_TAIL_COLORS = ["#5FB8F0", "#9FC8FF", "#7FD0FF", "#5FE0D0", "#C08FE8",
 # 所以这里给的是"基准色"而不是"唯一色"。
 PAINT_COLORS = ["#FF4D6D", "#7C4DFF", "#20C997", "#FFB020", "#38BDF8", "#F06292"]
 WAVE_COLORS = ["#FFFFFF", "#EAF6FF", "#CFE6FF", "#D8F2FF", "#FFF3E0", "#E8FFE8"]
+# 宠物跟随：种类只有两种，用文字按钮而不是色块（"小猫/小狗"没有天然的颜色表示）。
+PET_KINDS = ["小猫", "小狗"]
+# 毛色。刻意避开纯白与纯黑：白猫在浅色桌面上糊成一片、黑猫在深色桌面上同样，
+# 所以在两端各取"米白"与"深棕"作端点色。换色会连带耳朵内侧、描边、眼睛一起配色。
+PET_COLORS = ["#F2C27B", "#E9A0A8", "#B9CBE8", "#9FD8C0", "#F5F1E8", "#6B5A50"]
 
 FONT_LABEL = ("Microsoft YaHei UI", 9)
 FONT_TITLE = ("Microsoft YaHei UI", 10, "bold")   # 顶栏程序名
@@ -389,6 +394,12 @@ class _NavIcon(tk.Canvas):
             for yy in (5.4, 9.0, 12.6):
                 line([3, yy, 5.4, yy - 1.7, 7.8, yy, 10.2, yy + 1.7, 12.6, yy,
                       15, yy - 1.7], width=1.4)
+        elif n == "宠物跟随":
+            # 爪印：下方掌垫 + 上方三个脚趾
+            dot(9.0, 12.0, 2.9)
+            dot(4.6, 7.0, 1.7)
+            dot(9.0, 5.2, 1.7)
+            dot(13.4, 7.0, 1.7)
         else:  # 其它 / 设置：三条水平滑块
             for y, x1, x2 in ((5, 3, 9), (9, 6, 12), (13, 4, 10)):
                 line([x1, y, x2, y])
@@ -440,6 +451,11 @@ class _NavIcon(tk.Canvas):
             for yy in (5.4, 9.0, 12.6):
                 self._legacy_line([3, yy, 5.4, yy - 1.7, 7.8, yy, 10.2, yy + 1.7,
                                    12.6, yy, 15, yy - 1.7], w)
+        elif n == "宠物跟随":
+            for cx, cy, r in ((9.0, 12.0, 2.9), (4.6, 7.0, 1.7),
+                              (9.0, 5.2, 1.7), (13.4, 7.0, 1.7)):
+                self.create_oval(cx - r, cy - r, cx + r, cy + r,
+                                 fill=self.color, outline="")
         else:  # 其它 / 设置
             for y, x1, x2 in ((5, 3, 9), (9, 6, 12), (13, 4, 10)):
                 self._legacy_line([x1, y, x2, y], w)
@@ -926,6 +942,7 @@ class ControlPanel:
             "流星雨": self._page_meteor,
             "聚光灯": self._page_spot,
             "颜料盘": self._page_paint,
+            "宠物跟随": self._page_pet,
             "涟漪": self._page_ripple,
             "真实水波": self._page_wave,
             "窗口水波": self._page_win,
@@ -1471,6 +1488,29 @@ class ControlPanel:
         self._preset_block(p, "聚光灯")
         return p
 
+    def _page_pet(self, parent):
+        p = tk.Frame(parent, bg=BG)
+        self._page_head(p, "宠物跟随")
+        c = tk.Frame(p, bg=CARD)
+        c.pack(fill="x", padx=16, pady=(0, 8))
+        self._toggle(c, "启用宠物跟随", "pet_enabled")
+        self._choices(c, "种类", "pet_kind", PET_KINDS)
+        self._slider(c, "数量", "pet_count", 1, 3, 1, "{:.0f} 只")
+        self._slider(c, "大小", "pet_size", 24, 120, 2, "{:.0f} 像素")
+        self._slider(c, "跟随紧密度", "pet_follow", 0.05, 1.0, 0.01, "{:.0%}")
+        self._swatch(c, "毛色", "pet_color", PET_COLORS)
+        self._slider(c, "不透明度", "pet_opacity", 0.2, 1.0, 0.01, "{:.0%}")
+        self._hint(c, "小猫小狗沿着鼠标划过的路线跟上来：第一只追光标，"
+                      "其余排成一列跟在它身后（间距跟着体型走）。停下时它们会"
+                      "自己收拢站定，走得越快晃动越明显。")
+        self._hint(c, "转身带一点迟滞，所以鼠标原地画圈时它们不会左右乱跳；"
+                      "「跟随紧密度」调低会更像慢悠悠地追，调高就紧咬着不放。")
+        self._hint(c, "形象是用代码画出来的，不依赖任何图片文件。"
+                      "换「毛色」会把描边、耳内与眼睛一起配色。")
+        self._save_bar(c, "宠物跟随")
+        self._preset_block(p, "宠物跟随")
+        return p
+
     def _page_win(self, parent):
         p = tk.Frame(parent, bg=BG)
         self._page_head(p, "窗口水波")
@@ -1785,6 +1825,40 @@ class ControlPanel:
         refresh()
         self._swatches[key] = refresh
 
+    def _choices(self, parent, label, key, options):
+        """分段选择行：名称 …… 一排文字按钮（选中项用强调色描边 2px）。
+
+        视觉语言与 `_swatch` 保持一致，只是把色块换成文字 —— "小猫 / 小狗"
+        没有天然的颜色表示，硬造两个色块反而更难认。
+        """
+        app = self.app
+        f = tk.Frame(parent, bg=CARD)
+        f.pack(fill="x", padx=16, pady=8)
+        tk.Label(f, text=label, bg=CARD, fg=TEXT,
+                 font=FONT_LABEL).pack(side="left")
+        btns = []
+
+        def refresh():
+            cur = app.cfg[key]
+            for b, opt in zip(btns, options):
+                sel = (opt == cur)
+                b.config(relief="solid" if sel else "flat",
+                         bd=2 if sel else 0,
+                         fg=ACCENT if sel else TEXT)
+
+        # 倒着 pack 到右侧，视觉顺序才与 options 一致（btns[i] 对应 options[i]）
+        for opt in reversed(options):
+            b = tk.Button(f, text=opt, bd=0, relief="flat", bg=BTN, fg=TEXT,
+                          font=FONT_LABEL, padx=10, cursor="hand2",
+                          activebackground=BTN_H, activeforeground=TEXT,
+                          command=lambda o=opt: (app.set(key, o), refresh()))
+            b.pack(side="right", padx=3)
+            b.bind("<Enter>", lambda e, w=b: w.config(bg=BTN_H))
+            b.bind("<Leave>", lambda e, w=b: w.config(bg=BTN))
+            btns.insert(0, b)
+        refresh()
+        self._ctrls[key] = {"kind": "choices", "refresh": refresh}
+
     def _choose_color(self, key):
         """系统调色板：任意 RGB 都能选（预设色块只有 6 个，覆盖不到）。"""
         from tkinter import colorchooser
@@ -1850,6 +1924,8 @@ class ControlPanel:
             elif c["kind"] == "layer":   # 层级是字符串键，开关只反映"是否桌面层"
                 c["var"].set(str(v) == "desktop")
                 c["repaint"]()
+            elif c["kind"] == "choices":  # 分段选择（如宠物种类），重画描边
+                c["refresh"]()
         for refresh in self._swatches.values():
             refresh()
 
