@@ -12,6 +12,7 @@ import ctypes.wintypes as wt
 import math
 import os
 import random
+import re
 import threading
 import time
 
@@ -4235,8 +4236,77 @@ CLICK_IMAGE_POOL = ClickImagePool()
 
 # ---------------------------------------------------------------- 点击语音
 _VOICE_ALIAS = "fxclickvoice"
-_AUDIO_COUNT_TTL = 2.0          # 面板状态显示的扫描缓存（秒）
-_AUDIO_COUNT_CACHE = {}
+_AUDIO_TTL = 2.0                # 目录列表的缓存时长（秒）
+_AUDIO_CACHE = {}               # folder -> (monotonic, [路径...])
+
+
+def list_audio(folder):
+    """文件夹里可播放的音频路径，**已排序**（2 秒内复用结果）。
+
+    缓存是必须的：面板每 200ms 要一次（显示"找到 N 个音频"、语音包模式下还要
+    把名字填进文字栏），点击时也要一次。音频文件夹动辄几百首，每 200ms 扫一趟
+    盘纯属白烧。
+    """
+    folder = str(folder or "")
+    if not folder:
+        return []
+    now = time.monotonic()
+    hit = _AUDIO_CACHE.get(folder)
+    if hit is not None and now - hit[0] < _AUDIO_TTL:
+        return hit[1]
+    paths = _scan_files(folder, _AUDIO_EXTS)
+    if len(_AUDIO_CACHE) > 32:
+        _AUDIO_CACHE.clear()
+    _AUDIO_CACHE[folder] = (now, paths)
+    return paths
+
+
+def count_audio(folder):
+    """文件夹里有多少个可播放的音频。"""
+    return len(list_audio(folder))
+
+
+# 文件名开头的音轨号：「01 你好」「12_再见」「3. 走起」-> 去掉序号。
+# **只在数字后面真的还有内容时才剥**（"1.mp3" 这种名字本身就是数字，
+# 剥掉就等于没有文字可显示）。
+_TRACK_NO = re.compile(r"^\s*\d+\s*[\s._\-—、,，]+(.*)$")
+
+
+def audio_label(path):
+    """音频文件名 -> 显示文字（去扩展名、去开头的音轨号）。
+
+    语音包的"文字与音频统一"模式直接拿它当弹出文字，所以文件名就是文案 ——
+    这也是把清洗做在这一层的原因：用户不需要为了好看再改一遍文件名。
+    """
+    base = os.path.basename(str(path or ""))
+    stem = os.path.splitext(base)[0].strip()
+    m = _TRACK_NO.match(stem)
+    if m and m.group(1).strip():
+        stem = m.group(1).strip()
+    return stem or base
+
+
+def audio_labels(folder):
+    """文件夹里每条音频的显示文字（去重、保持排序）。"""
+    out, seen = [], set()
+    for p in list_audio(folder):
+        t = audio_label(p)
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+def pick_audio(folder, rng=None):
+    """随机挑一条音频路径（**只挑不播**）。
+
+    独立于 `VoicePlayer` 而存在，是因为「点击文字」的语音包要先定下"这一次是
+    哪一条"，才能把它的名字当成弹出文字 —— 先挑后播，文字和声音才可能对上。
+    """
+    items = list_audio(folder)
+    if not items:
+        return None
+    return (rng or random).choice(items)
 
 try:
     _winmm = ctypes.WinDLL("winmm")
@@ -4260,25 +4330,6 @@ def _mci_send(cmd):
     return int(r), buf.value
 
 
-def count_audio(folder):
-    """文件夹里有多少个可播放的音频（面板状态显示用，2 秒内复用结果）。
-
-    不缓存的话面板每 200ms 扫一次盘 —— 音频文件夹动辄几百首，白扫。
-    """
-    folder = str(folder or "")
-    if not folder:
-        return 0
-    now = time.monotonic()
-    hit = _AUDIO_COUNT_CACHE.get(folder)
-    if hit is not None and now - hit[0] < _AUDIO_COUNT_TTL:
-        return hit[1]
-    n = len(_scan_files(folder, _AUDIO_EXTS))
-    if len(_AUDIO_COUNT_CACHE) > 32:
-        _AUDIO_COUNT_CACHE.clear()
-    _AUDIO_COUNT_CACHE[folder] = (now, n)
-    return n
-
-
 class VoicePlayer:
     """点击语音：随机播一段音频，**同一时刻只响一个**。
 
@@ -4298,9 +4349,6 @@ class VoicePlayer:
     def __init__(self):
         self._lock = threading.Lock()
         self._busy = False
-        self._folder = ""
-        self._cache = []
-        self._stamp = 0.0
         self._rng = random.Random(0x51CE07)
         self._played = 0
         self._failed = 0
@@ -4311,35 +4359,34 @@ class VoicePlayer:
 
     def play_random(self, folder):
         """随机播一个；正在播 -> 放弃这次（返回 False）。"""
-        if self._busy:
+        return self.play_path(pick_audio(folder, self._rng))
+
+    def pick(self, folder):
+        """随机挑一条（不播）。给"文字与音频统一"用。"""
+        return pick_audio(folder, self._rng)
+
+    def play_path(self, path):
+        """播**指定**的这一条；正在播 -> 放弃这次（返回 False，不排队）。
+
+        与 `play_random` 拆开，是因为语音包的"统一"模式必须是**先挑后播**：
+        文字已经按这条音频定下来了，播的就必须是同一条。
+        """
+        if not path:
             return False
-        path = self._pick(folder)
-        if path is None:
+        if self._busy:
             return False
         with self._lock:
             if self._busy:              # 同帧两次点击抢跑，让先到的那个播
                 return False
             self._busy = True
             self._played += 1
-        threading.Thread(target=self._worker, args=(path,),
+        threading.Thread(target=self._worker, args=(str(path),),
                          name="VoicePlayer", daemon=True).start()
         return True
 
     def stats(self):
         with self._lock:
             return self._played, self._failed
-
-    def _pick(self, folder):
-        folder = str(folder or "")
-        now = time.monotonic()
-        if folder != self._folder or now - self._stamp > _AUDIO_COUNT_TTL:
-            # 2 秒缓存：点击本来就稀疏，但连点时没必要每次都重扫目录。
-            self._folder = folder
-            self._stamp = now
-            self._cache = _scan_files(folder, _AUDIO_EXTS)
-        if not self._cache:
-            return None
-        return self._rng.choice(self._cache)
 
     # ---------------------------------------------------------- 播放线程
     def _worker(self, path):
@@ -4728,6 +4775,10 @@ class ClickTextField:
     * **可读性**：文字带半透明描边，否则白字落在浅色桌面上会糊掉。
     * **装饰**：彩带 / 星光复用 `_BurstEngine`，`up_bias` 让它们整体偏上，
       朝着文字飘而不是均匀四散。
+    * **语音包（文字与音频统一）**：开 `click_text_voice_match` 时，文字不再
+      来自配置，而是**先随机挑一条音频、再拿它的文件名当文字** —— 看到的
+      那行字与听到的那段声音永远是同一条。挑中的路径通过 `take_voice()`
+      交给场景去播（播放归 `VoicePlayer`，这里只负责"是哪一条"）。
     """
 
     def __init__(self, w, h, seed=79):
@@ -4736,10 +4787,17 @@ class ClickTextField:
         self._mx = w * 0.5
         self._my = h * 0.5
         self._clicked = 0
-        self.pops = []              # [{x, y, t, life, idx}]
+        self.pops = []              # [{x, y, t, life, idx, text}]
         self._next_idx = 0          # 多条文字轮换用的游标
+        self._voice_q = None        # 这次点击要播的音频（统一模式）
         self.deco = _BurstEngine(seed=seed + 1)
         self._failed = False
+
+    def take_voice(self):
+        """取走并清空"这次点击要播的音频"（没有则 None）。"""
+        p = self._voice_q
+        self._voice_q = None
+        return p
 
     def set_pointer(self, x, y, clicked=0):
         self._mx = float(x)
@@ -4755,6 +4813,7 @@ class ClickTextField:
         self.deco.reset()
         self._clicked = 0
         self._next_idx = 0
+        self._voice_q = None
 
     def active(self):
         return bool(self.pops) or self.deco.active()
@@ -4766,6 +4825,26 @@ class ClickTextField:
         return [s.strip() for s in raw.replace("\r", "\n").split("\n")
                 if s.strip()]
 
+    def _resolve(self, cfg):
+        """定下这次点击显示的文字，以及（统一模式下）要同步播的音频。
+
+        返回 `(文字 或 None, 音频路径 或 None, 轮换下标)`。
+
+        统一模式下**没选语音包 / 文件夹里没有音频时不报错、也不吞掉这次点击**，
+        而是退回自定义文字 —— 换文件夹的间隙、空目录都算常见状态，让点击
+        变成"什么都不发生"比显示一句自己写的字难懂得多。
+        """
+        if bool(cfg.get("click_text_voice_match", False)):
+            path = pick_audio(str(cfg.get("click_text_voice_dir", "") or ""))
+            if path is not None:
+                return audio_label(path), path, 0
+        texts = self.texts_of(cfg)
+        if not texts:
+            return None, None, 0
+        idx = self._next_idx % len(texts)
+        self._next_idx = (self._next_idx + 1) % len(texts)
+        return texts[idx], None, idx
+
     def update(self, dt, cfg):
         if self._failed:
             return
@@ -4775,20 +4854,23 @@ class ClickTextField:
         life = max(0.2, float(cfg.get("click_text_life", 1.4)))
 
         if clicked:
-            texts = self.texts_of(cfg)
-            if texts:
+            text, voice, idx = self._resolve(cfg)
+            if text:
                 # 倾斜与横向漂移在**点击这一下**定下来，之后不再变 ——
                 # 每帧重随机会让文字疯狂抖动。
                 spin = float(np.clip(float(cfg.get("click_text_spin", 0.75)),
                                      0.0, 1.0))
                 tilt = int(self.rng.choice(_tilt_choices(spin)))
                 drift = float(self.rng.uniform(-1.0, 1.0)) * 0.45
+                # 文字在这一刻**定死进弹幕条目**（而不是到 draw 时再按下标
+                # 去查）：统一模式下这一次是哪条音频是随机的，到 draw 时重查
+                # 就会查到另一条 —— 那正是"字与声音对不上"的来源。
                 self.pops.append({
                     "x": float(self._mx), "y": float(self._my), "t": 0.0,
-                    "life": life, "idx": self._next_idx % len(texts),
+                    "life": life, "text": text, "idx": idx,
                     "tilt": tilt, "drift": drift,
                 })
-                self._next_idx = (self._next_idx + 1) % len(texts)
+                self._voice_q = voice
             # 装饰：与文字同一个爆发点，整体偏上
             deco = str(cfg.get("click_text_deco", "彩带"))
             if deco != "无":
@@ -4825,9 +4907,14 @@ class ClickTextField:
                 color = str(cfg.get("click_text_color", "#FFFFFF"))
                 rise = float(cfg.get("click_text_rise", 90))
                 for pp in self.pops:
-                    if pp["idx"] >= len(texts):
-                        continue
-                    steps = _text_sprites(texts[pp["idx"]], font_name,
+                    # 文字优先取**点击那一刻定下的**那份（统一模式下是随机挑中
+                    # 的那条音频的名字）；老数据没有该字段时才回退按下标查。
+                    txt = pp.get("text")
+                    if txt is None:
+                        if pp["idx"] >= len(texts):
+                            continue
+                        txt = texts[pp["idx"]]
+                    steps = _text_sprites(txt, font_name,
                                           size, color, pp.get("tilt",
                                                               _TEXT_TILT_ZERO))
                     u = pp["t"] / max(pp["life"], 1e-4)

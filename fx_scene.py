@@ -357,10 +357,16 @@ class Scene:
             self.click_text.reset()
 
         # ---------------- 点击语音（点一下随机播一段）
-        # 挂在**点击事件本身**，与两个点击特效的开关无关：只想要声音、不想
-        # 要图案和文字是完全合理的用法。播放全程在后台线程里，这里只是登记
-        # —— 上一段没播完时 `play_random` 立刻返回，不会排队也不会卡帧。
-        if self.mouse.clicked and cfg.get("click_voice_enabled", False):
+        # 两个来源，**一次点击只响一个**（同一个播放器、同一个 MCI 别名）：
+        #   1. 「点击文字」语音包在"文字与音频统一"模式下挑中的那条 —— 它同时
+        #      决定了弹出的文字，所以优先级最高，播的必须就是那一条；
+        #   2. 「点击表情」页的随机语音（与图案/文字开关无关，只想要声音也行）。
+        # 取路径要**无条件**调用 `take_voice()`：文字特效关掉时也得把队列清掉，
+        # 否则下次开起来会播一条上一轮遗留的音频。
+        path = self.click_text.take_voice()
+        if path:
+            self.voice.play_path(path)
+        elif self.mouse.clicked and cfg.get("click_voice_enabled", False):
             self.voice.play_random(str(cfg.get("click_voice_dir", "")))
 
     # ------------------------------------------------------------ 真实水波

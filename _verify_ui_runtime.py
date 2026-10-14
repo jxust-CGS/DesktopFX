@@ -150,6 +150,47 @@ def main():
     assert _deep[-10:] in _lb2, (_lb2, _deep[-10:])
     app.cfg["click_voice_dir"] = ""
 
+    # 2d4) 「点击文字」页的语音包 + 只读文字栏。
+    #      开着「语音与文字统一」时，文字框必须**自动填入语音包里的音频名并
+    #      禁止编辑**，且**不能顺手把用户自己写的文字从 cfg 里抹掉**（关掉
+    #      统一之后得原样回来）—— 这条最容易实现成"直接覆盖配置"。
+    for k in ("click_text_voice_dir", "click_text_voice_match"):
+        assert k in p._ctrls, f"点击文字页缺少控件 {k}"
+    assert p._ctrls["click_text_voice_match"]["kind"] == "toggle"
+    assert p._ctrls["click_text_voice_dir"]["kind"] == "path"
+    _pack = _tf.mkdtemp(prefix="fx_ui_pack_")
+    for _nm in ("01-你好.wav", "02_再见.mp3", "note.txt"):
+        with open(_os2.path.join(_pack, _nm), "wb") as _fh:
+            _fh.write(b"\x00")
+    _box = p._ctrls["click_text_list"]["widget"]
+    _custom = str(app.cfg["click_text_list"])
+    assert str(_box.cget("state")) == "normal", "默认应当可编辑"
+    app.cfg["click_text_voice_dir"] = _pack
+    p._ctrls["click_text_voice_match"]["on"](True)
+    p.root.update_idletasks()
+    _shown = _box.get("1.0", "end-1c")
+    assert str(_box.cget("state")) == "disabled", \
+        f"统一开启后文字框仍可编辑（state={_box.cget('state')}）"
+    assert _shown == "你好\n再见", f"文字框没自动填入音频名：{_shown!r}"
+    assert app.cfg["click_text_list"] == _custom, \
+        f"统一模式改写了用户的文字配置：{app.cfg['click_text_list']!r}"
+    assert "找到 2 个音频" in p._ctrls["click_text_voice_dir"]["label"].cget("text"), \
+        p._ctrls["click_text_voice_dir"]["label"].cget("text")
+    # 关掉统一：恢复可编辑、内容回到用户自己写的那份
+    p._ctrls["click_text_voice_match"]["on"](False)
+    p.root.update_idletasks()
+    assert str(_box.cget("state")) == "normal", "关掉统一后文字框仍被锁着"
+    assert _box.get("1.0", "end-1c") == _custom, \
+        f"关掉统一后没回到用户文字：{_box.get('1.0', 'end-1c')!r}"
+    # 空目录时不锁成空框：仍禁止编辑（统一模式就是这样），但内容应是空
+    app.cfg["click_text_voice_dir"] = _tf.mkdtemp(prefix="fx_ui_pack0_")
+    p._ctrls["click_text_voice_match"]["on"](True)
+    p.root.update_idletasks()
+    assert _box.get("1.0", "end-1c") == "", "空语音包目录下文字框应为空"
+    assert "没找到音频" in p._ctrls["click_text_voice_dir"]["label"].cget("text")
+    p._ctrls["click_text_voice_match"]["on"](False)
+    app.cfg["click_text_voice_dir"] = ""
+
     # 2e) 「其他设置」页：层级 / 多开开关已注册，且写的是字符串档位
     for k in ("layer_fullscreen", "layer_mouse", "multi_fullscreen", "multi_mouse"):
         assert k in p._ctrls, f"其他设置页缺少控件 {k}"

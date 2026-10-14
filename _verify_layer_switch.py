@@ -701,11 +701,15 @@ def main():
             r = (False, f"exception: {type(e).__name__}: {e}")
         if r is None:
             results.append((name, None, "SKIP"))
-            print(f"  [SKIP] {name}：跳过")
+            print(f"  [SKIP] {name}：整项跳过（返回 None）")
             return
         ok, msg = r
         results.append((name, ok, msg))
-        print(f"  [{'PASS' if ok else 'FAIL'}] {name}: {msg}")
+        # `(None, msg)` 是"环境不具备、无法判定"（如真机上另有置顶窗遮住采样点），
+        # 它**不算失败**。以前这里按 `'PASS' if ok else 'FAIL'` 打，于是全绿的
+        # 一轮里会混进一行 `[FAIL]`（再看摘要却是 VERIFIED），非常误导。
+        tag = "SKIP" if ok is None else ("PASS" if ok else "FAIL")
+        print(f"  [{tag}] {name}: {msg}")
 
     # 之后的 App 一律读临时配置，绝不碰用户的 config.json
     d.CONFIG_PATH = cfg_path

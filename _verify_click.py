@@ -520,7 +520,8 @@ def test_registry_and_defaults():
               "click_emoji_rotate", "click_emoji_opacity",
               "click_text_enabled", "click_text_list", "click_text_color",
               "click_text_size", "click_text_font", "click_text_deco",
-              "click_text_rise", "click_text_life", "click_text_opacity"):
+              "click_text_rise", "click_text_life", "click_text_opacity",
+              "click_text_voice_dir", "click_text_voice_match"):
         if k not in d.DEFAULTS:
             return False, f"DEFAULTS 缺 {k}"
     if d.DEFAULTS["click_emoji_shape"] not in F._SHAPE_NAMES:
@@ -1125,7 +1126,9 @@ def test_voice_no_overlap():
         playing[0] = False
         released = _wait_busy(vp, False)
         fourth = vp.play_random(folder)
-        scanned = list(vp._cache)
+        # 目录扫描已经收进模块级 `list_audio`（面板与点击两处共用它的缓存），
+        # 所以这里查的是它，而不是播放器自身的字段。
+        scanned = F.list_audio(folder)
     finally:
         F._mci_send = orig
         shutil.rmtree(folder, ignore_errors=True)
@@ -1246,6 +1249,277 @@ def test_scene_voice_wiring():
     return True, "只在点击那一帧触发一次、传对文件夹，与点击特效开关无关"
 
 
+# ------------------------------------------------- 8. 点击文字的语音包
+def _mk_pack(folder=None, names=("01-你好.wav", "02_再见.mp3", "3. 走起.wma")):
+    """造一个语音包文件夹（真音频文件，名字带序号）。"""
+    folder = folder or tempfile.mkdtemp(prefix="fx_textpack_")
+    for i, nm in enumerate(names):
+        p = os.path.join(folder, nm)
+        if nm.lower().endswith(".wav"):
+            with wave.open(p, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(8000)
+                w.writeframes(b"\x00\x00" * 80)
+        else:
+            with open(p, "wb") as fh:      # 内容不重要，只要后缀与存在
+                fh.write(b"\x00" * 64)
+    with open(os.path.join(folder, "说明.txt"), "w", encoding="utf-8") as fh:
+        fh.write("不是音频")
+    return folder
+
+
+def test_audio_label_cleaning():
+    """文件名 -> 显示文字：去扩展名、去音轨号，且不把纯数字名剥成空。"""
+    cases = [("01-你好.wav", "你好"), ("12_再见.mp3", "再见"),
+             ("3. 走起.wma", "走起"), ("07、来吧.mp3", "来吧"),
+             ("  太棒了  .m4a", "太棒了"), ("a/b/纯文件名.wav", "纯文件名"),
+             ("1.mp3", "1"),          # 本身就是数字 -> 保留，不能剥成空
+             ("2024.wav", "2024"),
+             ("无后缀", "无后缀")]
+    for src, want in cases:
+        got = F.audio_label(src)
+        if got != want:
+            return False, f"{src!r} -> {got!r}，期望 {want!r}"
+    if F.audio_label("") != "":
+        return False, "空路径不该返回内容"
+    return True, f"{len(cases)} 个文件名（含纯数字名 / 无后缀 / 带路径）转换正确"
+
+
+def test_audio_labels_dedup_sorted():
+    """文字栏里要显示的名字：去重、保持排序（重名不重复占一行）。"""
+    folder = tempfile.mkdtemp(prefix="fx_labels_")
+    for nm in ("01-你好.wav", "02-你好.mp3", "05-再见.wav", "note.txt"):
+        with open(os.path.join(folder, nm), "wb") as fh:
+            fh.write(b"\x00")
+    got = F.audio_labels(folder)
+    shutil.rmtree(folder, ignore_errors=True)
+    if got != ["你好", "再见"]:
+        return False, f"得到 {got}，期望 ['你好', '再见']（重名只留一行、非音频排除）"
+    return True, "两个文件同叫「你好」只占一行，非音频文件被排除"
+
+
+def test_text_voice_match_pairs_text_and_audio():
+    """**核心不变量**：统一模式下弹出的文字必须就是所播那条音频的名字。
+
+    判据取"文字 == audio_label(要播的路径)"，而不是"文字落在候选集合里" ——
+    后者随机挑也能通过，测不出"两边各自随机"这个真正的失败模式。
+    """
+    folder = _mk_pack()
+    cfg = _tcfg(click_text_voice_dir=folder, click_text_voice_match=True,
+                click_text_list="自定义甲\n自定义乙", click_text_deco="无")
+    t = ClickTextField(W, H)
+    pairs, used = [], []
+    for _ in range(12):
+        t.set_pointer(W * 0.5, H * 0.5, 1)
+        t.update(1.0 / 60.0, cfg)
+        t.pops = [p for p in t.pops if p["t"] < 0.05]
+        path = t.take_voice()
+        pairs.append((t.pops[-1]["text"], path))
+        used.append(t.pops[-1]["text"])
+    shutil.rmtree(folder, ignore_errors=True)
+
+    bad = [(txt, p) for txt, p in pairs if not p or F.audio_label(p) != txt]
+    if bad:
+        return False, f"{len(bad)}/{len(pairs)} 次的文字与音频对不上：{bad[:2]}"
+    if set(used) & {"自定义甲", "自定义乙"}:
+        return False, "统一模式下仍弹了配置里的自定义文字"
+    if len(set(used)) < 2:
+        return False, f"12 次点击只出现 {set(used)} —— 语音包的随机没生效"
+    if t.take_voice() is not None:
+        return False, "take_voice 取走后没清空（会重复播上一条）"
+    return True, (f"12 次点击全部对上（出现 {len(set(used))} 种："
+                  f"{sorted(set(used))}），且不用配置里的自定义文字")
+
+
+def test_text_voice_match_falls_back():
+    """没选语音包 / 空目录 / 目录不存在 -> 退回自定义文字，点击不落空。"""
+    empty = tempfile.mkdtemp(prefix="fx_pack_empty_")
+    cases = [("", "没选语音包"), (empty, "空目录"),
+             (os.path.join(empty, "不存在"), "目录不存在")]
+    for folder, name in cases:
+        cfg = _tcfg(click_text_voice_dir=folder, click_text_voice_match=True,
+                    click_text_list="甲\n乙", click_text_deco="无")
+        t = ClickTextField(W, H)
+        t.set_pointer(W * 0.5, H * 0.5, 1)
+        t.update(1.0 / 60.0, cfg)
+        t.pops = [p for p in t.pops if p["t"] < 0.05]
+        if not t.pops:
+            shutil.rmtree(empty, ignore_errors=True)
+            return False, f"{name}：统一模式下点击什么都没弹"
+        if t.pops[-1]["text"] not in ("甲", "乙"):
+            shutil.rmtree(empty, ignore_errors=True)
+            return False, f"{name}：退回了 {t.pops[-1]['text']!r}，不是自定义文字"
+        if t.take_voice() is not None:
+            shutil.rmtree(empty, ignore_errors=True)
+            return False, f"{name}：没有音频却排了一条待播路径"
+    shutil.rmtree(empty, ignore_errors=True)
+    return True, "三种「没有音频」的情形都退回自定义文字且不排音频"
+
+
+def test_text_voice_off_is_independent():
+    """关闭统一：文字可自定义（轮换），这一次点击不指定音频。"""
+    folder = _mk_pack()
+    cfg = _tcfg(click_text_voice_dir=folder, click_text_voice_match=False,
+                click_text_list="甲\n乙\n丙", click_text_deco="无")
+    t = ClickTextField(W, H)
+    seq = []
+    for _ in range(4):
+        t.set_pointer(W * 0.5, H * 0.5, 1)
+        t.update(1.0 / 60.0, cfg)
+        t.pops = [p for p in t.pops if p["t"] < 0.05]
+        seq.append((t.pops[-1]["text"], t.take_voice()))
+    shutil.rmtree(folder, ignore_errors=True)
+    if [s[0] for s in seq] != ["甲", "乙", "丙", "甲"]:
+        return False, f"关闭统一后文字不是按自定义轮换：{seq}"
+    if any(s[1] is not None for s in seq):
+        return False, "关闭统一后仍在指定音频（会与随机语音打架）"
+    return True, "关闭统一时文字按 甲→乙→丙→甲 轮换，且不指定音频"
+
+
+def test_no_shadowed_module_defs():
+    """产品模块里不能有**同名重复的顶层定义**。
+
+    后定义的那个会**静默**顶掉前面的（Python 不报错），症状全落在别处：本轮
+    就中过一次 —— 改 `count_audio` 时只替换了它上面的常量块，旧那份（引用了
+    已被删掉的缓存变量）留在文件末尾继续生效，调用抛 NameError，而调用方
+    （面板刷文件夹状态的 try/except）把它吞了，表现只是"状态那一截不显示了"。
+    读代码看不出来，手动点界面也未必踩得到（要先选中那个文件夹）。
+    """
+    import ast
+    mods = ("fx_effects.py", "fx_scene.py", "fx_ui.py", "desktop_fx.py",
+            "fx_kinds.py", "fx_winlayer.py", "fx_tray.py", "_paths.py")
+    bad, checked = [], 0
+    for fn in mods:
+        path = os.path.join(HERE, fn)
+        if not os.path.exists(path):
+            continue
+        checked += 1
+        with open(path, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read(), fn)
+        seen = {}
+        for node in tree.body:          # 只看顶层（嵌套同名是合法的）
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                     ast.ClassDef)):
+                continue
+            if node.name in seen:
+                bad.append("%s 的 %s：第 %d 行顶掉第 %d 行"
+                           % (fn, node.name, node.lineno, seen[node.name]))
+            else:
+                seen[node.name] = node.lineno
+    if bad:
+        return False, "存在被静默顶掉的重复定义 —— " + "；".join(bad[:3])
+    return True, f"{checked} 个产品模块的顶层 def/class 无重名"
+
+
+def test_text_pack_defaults():
+    """两个新配置键：类型正确、坏值被钳制、默认关闭。"""
+    for k, t in (("click_text_voice_dir", str),
+                 ("click_text_voice_match", bool)):
+        if k not in d.DEFAULTS:
+            return False, f"DEFAULTS 缺 {k}"
+        if not isinstance(d.DEFAULTS[k], t):
+            return False, f"{k} 默认值类型是 {type(d.DEFAULTS[k])}，期望 {t}"
+    if d.DEFAULTS["click_text_voice_match"] is not False:
+        return False, "「语音与文字统一」默认应当是关闭的"
+    if d.DEFAULTS["click_text_voice_dir"] != "":
+        return False, "语音包目录默认应当是空"
+    bad = []
+    for k, v in (("click_text_voice_dir", 7), ("click_text_voice_dir", ["a"]),
+                 ("click_text_voice_match", "也许")):
+        ok, _ = d._coerce_cfg_value(k, v)
+        if ok:
+            bad.append((k, v))
+    if bad:
+        return False, f"坏值被收下了：{bad}"
+    for v, exp in (("是", True), ("关", False)):
+        ok, got = d._coerce_cfg_value("click_text_voice_match", v)
+        if not ok or got is not exp:
+            return False, f"统一开关 {v!r} 应转成 {exp}，实得 {got!r}"
+    return True, "两键类型正确、默认关闭、坏值被拒、中文开关能按意图转换"
+
+
+def test_scene_plays_the_matched_audio():
+    """场景接线：统一模式播**指定的那一条**；没有指定时退回随机语音源。
+
+    这条守的是"字与声音对不上"最容易复发的位置 —— 特效内部算对了，场景那
+    一层却仍去 `play_random` 另挑一条，两边就又各自随机了。
+    """
+    from _verify_kinds import _base_cfg
+    from fx_scene import Scene
+
+    folder = _mk_pack()
+    calls = []
+
+    class _Spy:
+        def play_path(self, p):
+            calls.append(("path", p))
+            return True
+
+        def play_random(self, f):
+            calls.append(("random", f))
+            return True
+
+    def _drive(sc, frames=4, first_click=True):
+        box = {"fired": not first_click}
+
+        def fake_update(dt, ox, oy):
+            sc.mouse.mx, sc.mouse.my = W * 0.5, H * 0.5
+            sc.mouse.clicked = 0 if box["fired"] else 1
+            return 0.0
+
+        sc.mouse.update = fake_update
+        buf = np.zeros(W * H, np.uint32)
+        for k in range(frames):
+            # 只在**第一帧**给一次点击（第二帧起置位）—— 写在循环体最前面
+            # 会把第一帧也置成"已点过"，于是整个驱动一次点击都没有。
+            box["fired"] = (k >= 1)
+            sc.step(1.0 / 60.0, buf, W, H, buf)
+
+    # 1) 统一模式：必须走 play_path，且参数就是那行字对应的那条音频
+    sc = Scene(W, H)
+    sc.voice = _Spy()
+    sc.cfg = _base_cfg(click_text_enabled=True, click_text_voice_match=True,
+                       click_text_voice_dir=folder, click_text_deco="无",
+                       click_text_list="自定义甲")
+    _drive(sc)
+    if len(calls) != 1 or calls[0][0] != "path":
+        shutil.rmtree(folder, ignore_errors=True)
+        return False, f"统一模式没走 play_path，而是 {calls}"
+    path = calls[0][1]
+    pop = sc.click_text.pops[-1] if sc.click_text.pops else None
+    if not pop or pop["text"] != F.audio_label(path):
+        shutil.rmtree(folder, ignore_errors=True)
+        return False, (f"场景播的 {F.audio_label(path)!r} 与弹出的 "
+                       f"{pop and pop['text']!r} 不一致")
+
+    # 2) 关闭统一、开着「点击表情」页的随机语音 -> 退回随机源
+    calls.clear()
+    sc2 = Scene(W, H)
+    sc2.voice = _Spy()
+    sc2.cfg = _base_cfg(click_text_enabled=True, click_text_voice_match=False,
+                        click_text_voice_dir=folder, click_text_list="自定义甲",
+                        click_text_deco="无", click_voice_enabled=True,
+                        click_voice_dir=folder)
+    _drive(sc2)
+    if calls != [("random", folder)]:
+        shutil.rmtree(folder, ignore_errors=True)
+        return False, f"未指定音频时没退回随机语音源：{calls}"
+
+    # 3) 文字特效关着时队列必须是空的（否则下次开起来会播旧音频）
+    calls.clear()
+    sc3 = Scene(W, H)
+    sc3.voice = _Spy()
+    sc3.cfg = _base_cfg(click_text_enabled=False, click_text_voice_match=True,
+                        click_text_voice_dir=folder, click_voice_enabled=False)
+    _drive(sc3)
+    shutil.rmtree(folder, ignore_errors=True)
+    if calls:
+        return False, f"文字特效关着却播了音频：{calls}"
+    return True, ("统一模式播的正是那行字对应的音频；未指定时退回随机源；"
+                  "特效关着时不播")
+
+
 # ------------------------------------------------------------------ 驱动
 def main():
     tests = [
@@ -1287,6 +1561,14 @@ def main():
         test_voice_releases_on_failure,
         test_click_asset_defaults,
         test_scene_voice_wiring,
+        test_audio_label_cleaning,
+        test_audio_labels_dedup_sorted,
+        test_text_voice_match_pairs_text_and_audio,
+        test_text_voice_match_falls_back,
+        test_text_voice_off_is_independent,
+        test_text_pack_defaults,
+        test_scene_plays_the_matched_audio,
+        test_no_shadowed_module_defs,
     ]
     print("== 点击特效 + 分组 ==")
     bad = 0

@@ -1677,8 +1677,12 @@ class ControlPanel:
         c = tk.Frame(p, bg=CARD)
         c.pack(fill="x", padx=16, pady=(0, 8))
         self._toggle(c, "启用点击文字", "click_text_enabled")
+        # 这块文字框会被「语音与文字统一」接管：闸门一开就变成只读、内容由
+        # 语音包的文件名派生（见 _sync_text）。
         self._textbox(c, "文字（一行一个，点击时轮换取下一个）",
-                      "click_text_list", height=2)
+                      "click_text_list", height=2,
+                      gate="click_text_voice_match",
+                      fill=self._voice_text_preview)
         # 9 款字体排 5 列 = 2 行（3 列要 3 行，多 34px）。名字最长 4 个字，
         # 5 列在最小窗口宽度下也放得下（内容区 400px / 5 ≈ 80px）。
         self._choices(c, "字体", "click_text_font", CLICK_FONTS, columns=5)
@@ -1691,15 +1695,39 @@ class ControlPanel:
         self._slider(c, "不透明度", "click_text_opacity", 0.2, 1.0, 0.01,
                      "{:.0%}")
         self._hint(c, "点一下鼠标，在光标处弹出一行字并向上飘走。文字框可以写"
-                      "多行，点一次换下一个。字带半透明描边，浅色桌面上也读"
-                      "得清；「装饰」会在旁边撒彩带或星光。")
-        self._hint(c, "「倾斜幅度」是每次点击随机歪斜的角度，连点时文字朝不同"
-                      "方向散开；字体取系统已装的花样款，没装的自动回退雅黑。")
-        self._hint(c, "它与「点击表情」默认互斥，想同时用就去「其它设置 → "
-                      "特效多开」。")
+                      "多行，点一次换下一个；「倾斜幅度」是每次点击的随机歪斜"
+                      "角度，字体取系统已装的花样款（没装的自动回退雅黑）。")
         self._save_bar(c, "点击文字")
+
+        # 语音包单独一张卡：它不只是"加个声音"，开着「统一」时**上面那个文字
+        # 框会被接管**（只读、内容来自音频文件名），所以必须和文字框分开说。
+        # 两条说明**合并成一条**：页面自然高已经贴着上限（1062），提示是按
+        # 行数占高的，多条短文比一条长文贵。
+        c2 = tk.Frame(p, bg=CARD)
+        c2.pack(fill="x", padx=16, pady=(0, 8))
+        self._folder(c2, "语音包文件夹", "click_text_voice_dir",
+                     status=self._voice_pack_status)
+        self._toggle(c2, "语音与文字统一", "click_text_voice_match")
+        self._hint(c2, "统一开启后文字栏自动填入语音包里每条音频的名字并变为"
+                       "只读，点击时随机挑一条 —— 弹出的字与声音永远是同一条；"
+                       "关闭则文字自己写。文件名的序号（如「01 你好」）会自动"
+                       "去掉。")
+
         self._preset_block(p, "点击文字")
         return p
+
+    def _voice_pack_status(self):
+        """语音包文件夹的附加状态。"""
+        folder = str(self.app.cfg.get("click_text_voice_dir", "") or "")
+        if not folder:
+            return ""
+        n = fx_effects.count_audio(folder)
+        return "找到 %d 个音频" % n if n else "没找到音频"
+
+    def _voice_text_preview(self):
+        """统一模式下文字栏要显示的内容：语音包里每条音频的名字。"""
+        folder = str(self.app.cfg.get("click_text_voice_dir", "") or "")
+        return "\n".join(fx_effects.audio_labels(folder))
 
     def _page_win(self, parent):
         p = tk.Frame(parent, bg=BG)
@@ -2095,11 +2123,16 @@ class ControlPanel:
         refresh()
         self._ctrls[key] = {"kind": "choices", "refresh": refresh}
 
-    def _textbox(self, parent, label, key, height=3):
+    def _textbox(self, parent, label, key, height=3, gate=None, fill=None):
         """多行文本输入行：名称在上、输入框在下（横排会太窄）。
 
         `tk.Text` 而不是 `Entry`：要配多个文字就得能换行。写入走 `<KeyRelease>`
         —— 自动保存是 1 秒轮询的脏标记，逐键写 cfg 不会真的每次落盘。
+
+        `gate` 给定时，这个框会在 `cfg[gate]` 为真的期间**变成只读**，内容改由
+        `fill()` 提供（每 200ms 重算）——"语音与文字统一"要用它：文字由语音包
+        的文件名决定，用户能看不能改。**框里显示的不是 cfg 那条键的值**，所以
+        同步逻辑要单独走一条分支，否则 `_sync_from_cfg` 会把派生内容覆盖回去。
         """
         app = self.app
         f = tk.Frame(parent, bg=CARD)
@@ -2124,7 +2157,10 @@ class ControlPanel:
         txt.bind("<<Paste>>", lambda e: txt.after(0, on_key))
         txt.bind("<<Cut>>", lambda e: txt.after(0, on_key))
         txt.bind("<FocusOut>", on_key)
-        self._ctrls[key] = {"kind": "text", "widget": txt}
+        self._ctrls[key] = {"kind": "text", "widget": txt,
+                            "gate": gate, "fill": fill, "editable": (CARD2, TEXT)}
+        if gate is not None:
+            self._sync_text(self._ctrls[key], app.cfg.get(key, ""))
 
     def _folder(self, parent, label, key, status=None, on_change=None):
         """文件夹选择行：名称 | 路径（从尾部截断） | 选择 / 清除。
@@ -2204,6 +2240,37 @@ class ControlPanel:
         self._folders.append(refresh)
         refresh()
 
+    def _sync_text(self, c, v):
+        """把一个多行文本框刷成它当前该显示的内容。
+
+        两种形态：
+        * **只读闸门开着**（`cfg[gate]` 为真）—— 内容由 `fill()` 派生（语音包里
+          每条音频的名字），框置为 disabled 并用次级字色，让"这不能改"一眼可见；
+        * 平常 —— 显示 cfg 的值、可编辑。
+
+        切换 state 时必须**先把框改回 normal 再增删内容**：disabled 的 `tk.Text`
+        接受 `delete/insert` 却不显示（内容改了屏幕不变，很难查）。
+        """
+        w = c["widget"]
+        gate = c.get("gate")
+        locked = bool(gate is not None and self.app.cfg.get(gate))
+        if locked:
+            try:
+                want = (c.get("fill")() if c.get("fill") else "") or ""
+            except Exception:
+                want = ""
+        else:
+            want = str(v if v is not None else "")
+        cur = w.get("1.0", "end-1c")
+        # 值没变、形态也没变就别动：写回会把光标顶到开头，正在打字时尤其难受
+        if cur != want or str(w.cget("state")) != ("disabled" if locked else "normal"):
+            bg, fg = (CARD2, SUB) if locked else c["editable"]
+            w.config(state="normal", bg=bg, fg=fg)
+            if cur != want:
+                w.delete("1.0", "end")
+                w.insert("1.0", want)
+            w.config(state="disabled" if locked else "normal")
+
     def _choose_color(self, key):
         """系统调色板：任意 RGB 都能选（预设色块只有 6 个，覆盖不到）。"""
         from tkinter import colorchooser
@@ -2274,12 +2341,7 @@ class ControlPanel:
             elif c["kind"] == "path":     # 文件夹选择行：只有文字要重画
                 c["refresh"]()
             elif c["kind"] == "text":     # 多行文本（如点击文字列表）
-                w = c["widget"]
-                cur = str(v)
-                # 值没变就别动：写回会把光标顶到开头，正在打字时尤其难受
-                if w.get("1.0", "end-1c") != cur:
-                    w.delete("1.0", "end")
-                    w.insert("1.0", cur)
+                self._sync_text(c, v)
         for refresh in self._swatches.values():
             refresh()
 
@@ -2362,6 +2424,14 @@ class ControlPanel:
                 rf()
             except Exception:
                 pass
+        # 只读文本框（语音包统一模式）的内容也依赖目录扫描，跟着一起刷；
+        # 用户中途往文件夹里丢了几首歌，两秒内文字栏就能反映出来。
+        for key, c in self._ctrls.items():
+            if c["kind"] == "text" and c.get("gate") is not None:
+                try:
+                    self._sync_text(c, app.cfg.get(key))
+                except Exception:
+                    pass
 
         err = getattr(app, "last_error", None)
         if err != self._err_shown:
