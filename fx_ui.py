@@ -63,6 +63,21 @@ PET_KINDS = ["小猫", "小狗"]
 # 所以在两端各取"米白"与"深棕"作端点色。换色会连带耳朵内侧、描边、眼睛一起配色。
 PET_COLORS = ["#F2C27B", "#E9A0A8", "#B9CBE8", "#9FD8C0", "#F5F1E8", "#6B5A50"]
 
+# ---- 点击特效 ----
+# 这三张表必须与 fx_effects 里的实现一一对应：
+#   CLICK_SHAPES <-> fx_effects._SHAPE_NAMES（少了会画出空白，多了会静默退回爱心）
+#   CLICK_FONTS  <-> fx_effects._FONT_FILES
+#   CLICK_DECOS  <-> ClickTextField.update() 里的 deco 分支
+# 跨文件的一致性由 `_verify_click.py` 断言，不靠人记。
+CLICK_SHAPES = ["爱心", "星星", "彩带", "雪花", "气泡", "火焰", "花瓣", "音符"]
+CLICK_FONTS = ["微软雅黑", "雅黑粗体", "黑体", "宋体", "楷体", "等线"]
+CLICK_DECOS = ["无", "彩带", "星光"]
+# 点击表情的主色（彩带图案会忽略主色，另外用一整套调色板）
+CLICK_EMOJI_COLORS = ["#FF6B8E", "#FFD166", "#5EEAD4", "#7FD1FF", "#C4A7FF",
+                      "#FFFFFF"]
+CLICK_TEXT_COLORS = ["#FFFFFF", "#FFE066", "#7FE7FF", "#FF9DB6", "#A8E6A0",
+                     "#FFB38A"]
+
 FONT_LABEL = ("Microsoft YaHei UI", 9)
 FONT_TITLE = ("Microsoft YaHei UI", 10, "bold")   # 顶栏程序名
 FONT_H2 = ("Microsoft YaHei UI", 12, "bold")      # 页头大标题
@@ -400,6 +415,21 @@ class _NavIcon(tk.Canvas):
             dot(4.6, 7.0, 1.7)
             dot(9.0, 5.2, 1.7)
             dot(13.4, 7.0, 1.7)
+        elif n == "点击表情":
+            # 一颗小爱心 + 两侧溅开的两个点 = "点一下就炸开"
+            # （不能画成"圆心+射线"，那与「聚光灯」的图标撞脸）
+            dot(6.4, 6.6, 2.5)
+            dot(11.6, 6.6, 2.5)
+            line([(4.2, 8.0), (9.0, 14.4)])
+            line([(13.8, 8.0), (9.0, 14.4)])
+            dot(2.6, 3.2, 1.1)
+            dot(15.4, 3.2, 1.1)
+        elif n == "点击文字":
+            # 对话气泡：圆角方框 + 左下小尾巴 + 里面两行字
+            line([(3.5, 4.0), (14.5, 4.0), (14.5, 11.5), (8.0, 11.5),
+                  (5.0, 14.5), (5.0, 11.5), (3.5, 11.5), (3.5, 4.0)])
+            line([(6.0, 6.6), (12.0, 6.6)], width=1.2)
+            line([(6.0, 9.0), (10.5, 9.0)], width=1.2)
         else:  # 其它 / 设置：三条水平滑块
             for y, x1, x2 in ((5, 3, 9), (9, 6, 12), (13, 4, 10)):
                 line([x1, y, x2, y])
@@ -456,6 +486,18 @@ class _NavIcon(tk.Canvas):
                               (9.0, 5.2, 1.7), (13.4, 7.0, 1.7)):
                 self.create_oval(cx - r, cy - r, cx + r, cy + r,
                                  fill=self.color, outline="")
+        elif n == "点击表情":
+            for cx, cy, r in ((6.4, 6.6, 2.5), (11.6, 6.6, 2.5),
+                              (2.6, 3.2, 1.1), (15.4, 3.2, 1.1)):
+                self.create_oval(cx - r, cy - r, cx + r, cy + r,
+                                 fill=self.color, outline="")
+            self._legacy_line([4.2, 8.0, 9.0, 14.4], w)
+            self._legacy_line([13.8, 8.0, 9.0, 14.4], w)
+        elif n == "点击文字":
+            self._legacy_line([3.5, 4.0, 14.5, 4.0, 14.5, 11.5, 8.0, 11.5,
+                               5.0, 14.5, 5.0, 11.5, 3.5, 11.5, 3.5, 4.0], w)
+            self._legacy_line([6.0, 6.6, 12.0, 6.6], 1.2)
+            self._legacy_line([6.0, 9.0, 10.5, 9.0], 1.2)
         else:  # 其它 / 设置
             for y, x1, x2 in ((5, 3, 9), (9, 6, 12), (13, 4, 10)):
                 self._legacy_line([x1, y, x2, y], w)
@@ -945,6 +987,8 @@ class ControlPanel:
             "宠物跟随": self._page_pet,
             "涟漪": self._page_ripple,
             "真实水波": self._page_wave,
+            "点击表情": self._page_click_emoji,
+            "点击文字": self._page_click_text,
             "窗口水波": self._page_win,
             "其它": self._page_other,
         }
@@ -1515,6 +1559,62 @@ class ControlPanel:
         self._preset_block(p, "宠物跟随")
         return p
 
+    def _page_click_emoji(self, parent):
+        p = tk.Frame(parent, bg=BG)
+        self._page_head(p, "点击表情")
+        c = tk.Frame(p, bg=CARD)
+        c.pack(fill="x", padx=16, pady=(0, 8))
+        self._toggle(c, "启用点击表情", "click_emoji_enabled")
+        # 8 个图案排单行会把页面撑破最小宽度（内容区只有 400px），折成 4 列
+        self._choices(c, "图案", "click_emoji_shape", CLICK_SHAPES, columns=4)
+        self._slider(c, "数量", "click_emoji_count", 2, 40, 1, "{:.0f} 个")
+        self._slider(c, "大小", "click_emoji_size", 8, 64, 1, "{:.0f} 像素")
+        self._slider(c, "扩散", "click_emoji_spread", 20, 300, 5, "{:.0f}")
+        self._slider(c, "重力", "click_emoji_gravity", -0.5, 1.5, 0.05, "{:.2f}")
+        self._slider(c, "持续时间", "click_emoji_life", 0.4, 3.0, 0.1, "{:.1f} 秒")
+        self._toggle(c, "粒子自旋", "click_emoji_rotate")
+        self._swatch(c, "主色", "click_emoji_color", CLICK_EMOJI_COLORS)
+        self._slider(c, "不透明度", "click_emoji_opacity", 0.2, 1.0, 0.01,
+                     "{:.0%}")
+        self._hint(c, "点一下鼠标，就在光标位置炸开一簇图案："
+                      "「扩散」是它们飞出去的速度，「重力」调大像彩纸往下飘、"
+                      "调成负数则向上浮（泡泡那类）。")
+        self._hint(c, "「数量」最多 40 个，连点几下会自然叠起来。"
+                      "「彩带」图案会忽略下面的主色，改用一整套彩色 —— "
+                      "单色彩带看着像一堆纸片，不像彩带。")
+        self._hint(c, "图案全部由代码绘制，不依赖图片文件或系统字体。")
+        self._save_bar(c, "点击表情")
+        self._preset_block(p, "点击表情")
+        return p
+
+    def _page_click_text(self, parent):
+        p = tk.Frame(parent, bg=BG)
+        self._page_head(p, "点击文字")
+        c = tk.Frame(p, bg=CARD)
+        c.pack(fill="x", padx=16, pady=(0, 8))
+        self._toggle(c, "启用点击文字", "click_text_enabled")
+        self._textbox(c, "文字（一行一个，点击时轮换取下一个）",
+                      "click_text_list")
+        self._choices(c, "字体", "click_text_font", CLICK_FONTS, columns=3)
+        self._slider(c, "字号", "click_text_size", 14, 90, 1, "{:.0f} 像素")
+        self._swatch(c, "颜色", "click_text_color", CLICK_TEXT_COLORS)
+        self._choices(c, "装饰", "click_text_deco", CLICK_DECOS)
+        self._slider(c, "上飘高度", "click_text_rise", 0, 260, 5, "{:.0f} 像素")
+        self._slider(c, "持续时间", "click_text_life", 0.4, 3.0, 0.1, "{:.1f} 秒")
+        self._slider(c, "不透明度", "click_text_opacity", 0.2, 1.0, 0.01,
+                     "{:.0%}")
+        self._hint(c, "点一下鼠标，在光标处弹出一行字并向上飘走。"
+                      "文字框里可以写多行，点一次换下一个（轮换而不是随机，"
+                      "这样能一眼确认每条都生效了）。")
+        self._hint(c, "字带一圈半透明描边，白字落在浅色桌面上也不会糊掉。"
+                      "「装饰」会在文字旁边一起撒彩带或星光。")
+        self._hint(c, "它和「点击表情」默认互斥 —— 同时炸图案又弹文字会糊成"
+                      "一团；想让两个一起用，去「其它设置 → 特效多开」打开"
+                      "「鼠标特效允许多开」。")
+        self._save_bar(c, "点击文字")
+        self._preset_block(p, "点击文字")
+        return p
+
     def _page_win(self, parent):
         p = tk.Frame(parent, bg=BG)
         self._page_head(p, "窗口水波")
@@ -1599,7 +1699,7 @@ class ControlPanel:
         self._hint(c2, "最上层＝始终浮在窗口之上（默认）；"
                        "仅桌面图层＝被窗口盖住、只在桌面可见。")
         self._layer_row(c2, "全屏特效", "layer_fullscreen")
-        self._layer_row(c2, "鼠标特效", "layer_mouse")
+        self._layer_row(c2, "鼠标特效（拖动 / 点击）", "layer_mouse")
 
         # ---- 特效多开 ----
         c3 = tk.Frame(p, bg=CARD)
@@ -1608,6 +1708,9 @@ class ControlPanel:
         self._hint(c3, "关闭时同一分类只能开一个特效，开启新的会自动关掉旧的。")
         self._toggle(c3, "全屏特效允许多开", "multi_fullscreen")
         self._toggle(c3, "鼠标特效允许多开", "multi_mouse")
+        self._hint(c3, "「鼠标特效」这一项同时管**拖动**与**点击**两组"
+                      "（它们本来就在同一条鼠标层上）：打开后聚光灯可以和"
+                      "水波同屏，点击表情也可以和点击文字一起弹。")
 
         # ---- 任务栏 ----
         # 覆盖窗是置顶窗、任务栏不是，所以特效默认会被画在任务栏上 ——
@@ -1829,17 +1932,20 @@ class ControlPanel:
         refresh()
         self._swatches[key] = refresh
 
-    def _choices(self, parent, label, key, options):
+    def _choices(self, parent, label, key, options, columns=None):
         """分段选择行：名称 …… 一排文字按钮（选中项用强调色描边 2px）。
 
         视觉语言与 `_swatch` 保持一致，只是把色块换成文字 —— "小猫 / 小狗"
         没有天然的颜色表示，硬造两个色块反而更难认。
+
+        `columns` 给定时改为**等宽网格**（名称独占一行，按钮按列数折行）。
+        选项多的时候必须折行：8 个图案排在单行会把页面撑到 538px，而窗口最小
+        宽度只给内容区留 400px —— 撑破之后 Tk 既不换行也不缩，只会把右边的
+        选项直接裁掉。
         """
         app = self.app
         f = tk.Frame(parent, bg=CARD)
         f.pack(fill="x", padx=16, pady=8)
-        tk.Label(f, text=label, bg=CARD, fg=TEXT,
-                 font=FONT_LABEL).pack(side="left")
         btns = []
 
         def refresh():
@@ -1850,18 +1956,68 @@ class ControlPanel:
                          bd=2 if sel else 0,
                          fg=ACCENT if sel else TEXT)
 
-        # 倒着 pack 到右侧，视觉顺序才与 options 一致（btns[i] 对应 options[i]）
-        for opt in reversed(options):
-            b = tk.Button(f, text=opt, bd=0, relief="flat", bg=BTN, fg=TEXT,
-                          font=FONT_LABEL, padx=10, cursor="hand2",
-                          activebackground=BTN_H, activeforeground=TEXT,
-                          command=lambda o=opt: (app.set(key, o), refresh()))
-            b.pack(side="right", padx=3)
-            b.bind("<Enter>", lambda e, w=b: w.config(bg=BTN_H))
-            b.bind("<Leave>", lambda e, w=b: w.config(bg=BTN))
-            btns.insert(0, b)
+        if columns:
+            tk.Label(f, text=label, bg=CARD, fg=TEXT, font=FONT_LABEL,
+                     anchor="w").grid(row=0, column=0, columnspan=columns,
+                                      sticky="w", pady=(0, 4))
+            for c in range(columns):
+                f.grid_columnconfigure(c, weight=1, uniform="choice")
+            for i, opt in enumerate(options):
+                r, c = divmod(i, columns)
+                b = tk.Button(f, text=opt, bd=0, relief="flat", bg=BTN, fg=TEXT,
+                              font=FONT_LABEL, cursor="hand2",
+                              activebackground=BTN_H, activeforeground=TEXT,
+                              command=lambda o=opt: (app.set(key, o), refresh()))
+                b.grid(row=1 + r, column=c, sticky="ew", padx=3, pady=3)
+                b.bind("<Enter>", lambda e, w=b: w.config(bg=BTN_H))
+                b.bind("<Leave>", lambda e, w=b: w.config(bg=BTN))
+                btns.append(b)
+        else:
+            tk.Label(f, text=label, bg=CARD, fg=TEXT,
+                     font=FONT_LABEL).pack(side="left")
+            # 倒着 pack 到右侧，视觉顺序才与 options 一致（btns[i] 对应 options[i]）
+            for opt in reversed(options):
+                b = tk.Button(f, text=opt, bd=0, relief="flat", bg=BTN, fg=TEXT,
+                              font=FONT_LABEL, padx=10, cursor="hand2",
+                              activebackground=BTN_H, activeforeground=TEXT,
+                              command=lambda o=opt: (app.set(key, o), refresh()))
+                b.pack(side="right", padx=3)
+                b.bind("<Enter>", lambda e, w=b: w.config(bg=BTN_H))
+                b.bind("<Leave>", lambda e, w=b: w.config(bg=BTN))
+                btns.insert(0, b)
         refresh()
         self._ctrls[key] = {"kind": "choices", "refresh": refresh}
+
+    def _textbox(self, parent, label, key, height=3):
+        """多行文本输入行：名称在上、输入框在下（横排会太窄）。
+
+        `tk.Text` 而不是 `Entry`：要配多个文字就得能换行。写入走 `<KeyRelease>`
+        —— 自动保存是 1 秒轮询的脏标记，逐键写 cfg 不会真的每次落盘。
+        """
+        app = self.app
+        f = tk.Frame(parent, bg=CARD)
+        f.pack(fill="x", padx=16, pady=8)
+        tk.Label(f, text=label, bg=CARD, fg=TEXT,
+                 font=FONT_LABEL).pack(anchor="w", pady=(0, 4))
+        box = tk.Frame(f, bg=LINE)                       # 1px 描边靠外框露边实现
+        box.pack(fill="x")
+        txt = tk.Text(box, height=height, width=1, bg=CARD2, fg=TEXT, bd=0,
+                      relief="flat",
+                      insertbackground=ACCENT, font=FONT_LABEL, wrap="word",
+                      padx=8, pady=6, highlightthickness=0,
+                      selectbackground=ACCENT_DARK, selectforeground=ON_ACCENT)
+        txt.pack(fill="x", padx=1, pady=1)
+        txt.insert("1.0", str(app.cfg.get(key, "")))
+
+        def on_key(_e=None):
+            app.set(key, txt.get("1.0", "end-1c"))
+
+        txt.bind("<KeyRelease>", on_key)
+        # 粘贴/剪切不触发 KeyRelease，单独补一次；切焦点时也补，避免漏写
+        txt.bind("<<Paste>>", lambda e: txt.after(0, on_key))
+        txt.bind("<<Cut>>", lambda e: txt.after(0, on_key))
+        txt.bind("<FocusOut>", on_key)
+        self._ctrls[key] = {"kind": "text", "widget": txt}
 
     def _choose_color(self, key):
         """系统调色板：任意 RGB 都能选（预设色块只有 6 个，覆盖不到）。"""
@@ -1930,6 +2086,13 @@ class ControlPanel:
                 c["repaint"]()
             elif c["kind"] == "choices":  # 分段选择（如宠物种类），重画描边
                 c["refresh"]()
+            elif c["kind"] == "text":     # 多行文本（如点击文字列表）
+                w = c["widget"]
+                cur = str(v)
+                # 值没变就别动：写回会把光标顶到开头，正在打字时尤其难受
+                if w.get("1.0", "end-1c") != cur:
+                    w.delete("1.0", "end")
+                    w.insert("1.0", cur)
         for refresh in self._swatches.values():
             refresh()
 

@@ -79,7 +79,8 @@ def main():
     # 且直接等于分类表的导航顺序 —— 侧栏分组不允许在 UI 里再写一份
     import fx_kinds
     assert seen == ["下雨", "下雪", "落樱", "流星雨", "聚光灯", "颜料盘",
-                    "宠物跟随", "涟漪", "真实水波", "窗口水波", "其它"], seen
+                    "宠物跟随", "涟漪", "真实水波", "点击表情", "点击文字",
+                    "窗口水波", "其它"], seen
     assert seen == fx_kinds.nav_order(), (seen, fx_kinds.nav_order())
 
 

@@ -155,6 +155,30 @@ DEFAULTS = {
     "pet_opacity": 1.0,
     # 光标停住多少秒后渐隐（0 = 一直跟着不消失）
     "pet_idle_fade": 1.6,
+    # ---- 点击表情（点一下在光标处炸开一簇图案）----
+    # 图案由 fx_effects 用 PIL 现画（与宠物同一套做法），所以换图案/颜色只需
+    # 重建精灵缓存，不依赖任何图片资源或系统字体。
+    "click_emoji_enabled": False,
+    "click_emoji_shape": "爱心",
+    "click_emoji_count": 12.0,      # 一次点击炸开几个
+    "click_emoji_size": 22.0,       # 单个图案的像素尺寸
+    "click_emoji_spread": 90.0,     # 扩散：粒子的初速（像素/秒）
+    "click_emoji_life": 1.1,        # 一簇从出现到消失的秒数
+    "click_emoji_color": "#FF6B8E",
+    "click_emoji_gravity": 1.0,     # 1=向下飘落，0=水平四散
+    "click_emoji_rotate": True,     # 粒子自旋
+    "click_emoji_opacity": 1.0,
+    # ---- 点击文字（点一下弹出文字，可内嵌彩带 / 星光）----
+    "click_text_enabled": False,
+    # 一行一个，点一次轮换取下一个（轮换而不是随机，方便确认每条都生效）
+    "click_text_list": "好耶\n太棒了\n漂亮",
+    "click_text_color": "#FFFFFF",
+    "click_text_size": 34.0,
+    "click_text_font": "微软雅黑",
+    "click_text_deco": "彩带",       # 无 / 彩带 / 星光
+    "click_text_rise": 90.0,        # 上飘距离（像素）
+    "click_text_life": 1.4,         # 从弹出到消失的秒数
+    "click_text_opacity": 1.0,
     # ---- 窗口水波（窗口移动 / 缩放 / 最小化 / 恢复时扰动水面）----
     # 它**不自己画**：窗口只是水面的一个扰动源 —— 和鼠标共用同一片水（见
     # WaterRippleField.push_rect / dome_rect），所以这里只剩"扰动多大、多宽"
@@ -421,6 +445,57 @@ PRESETS = {
                  pet_enabled=True, pet_kind="小猫", pet_count=10,
                  pet_size=36, pet_follow=0.72, pet_color="#9FD8C0",
                  pet_opacity=1.0, pet_idle_fade=2.2),
+    # ---- 点击表情 ----
+    # 像「水面」一样把全屏特效显式关掉：预设是"整套方案"，只写自己那几个键
+    # 会让用户上一次开着的雨继续下，看起来像没生效。
+    "爱心雨": dict(rain_enabled=False, snow_enabled=False,
+                petal_enabled=False, meteor_enabled=False,
+                click_emoji_enabled=True, click_emoji_shape="爱心",
+                click_emoji_count=14, click_emoji_size=24, click_emoji_spread=95,
+                click_emoji_life=1.2, click_emoji_color="#FF6B8E",
+                click_emoji_gravity=1.0, click_emoji_rotate=True,
+                click_emoji_opacity=1.0),
+    "彩带庆祝": dict(rain_enabled=False, snow_enabled=False,
+                 petal_enabled=False, meteor_enabled=False,
+                 click_emoji_enabled=True, click_emoji_shape="彩带",
+                 click_emoji_count=18, click_emoji_size=26, click_emoji_spread=130,
+                 click_emoji_life=1.5, click_emoji_color="#FFC145",
+                 click_emoji_gravity=1.0, click_emoji_rotate=True,
+                 click_emoji_opacity=1.0),
+    "星光闪烁": dict(rain_enabled=False, snow_enabled=False,
+                 petal_enabled=False, meteor_enabled=False,
+                 click_emoji_enabled=True, click_emoji_shape="星星",
+                 click_emoji_count=10, click_emoji_size=20, click_emoji_spread=70,
+                 click_emoji_life=1.0, click_emoji_color="#FFD166",
+                 click_emoji_gravity=0.0, click_emoji_rotate=True,
+                 click_emoji_opacity=1.0),
+    "泡泡上浮": dict(rain_enabled=False, snow_enabled=False,
+                 petal_enabled=False, meteor_enabled=False,
+                 click_emoji_enabled=True, click_emoji_shape="气泡",
+                 click_emoji_count=12, click_emoji_size=26, click_emoji_spread=80,
+                 click_emoji_life=1.6, click_emoji_color="#A8E6FF",
+                 click_emoji_gravity=-0.25, click_emoji_rotate=False,
+                 click_emoji_opacity=0.9),
+    # ---- 点击文字 ----
+    "好耶": dict(rain_enabled=False, snow_enabled=False,
+               petal_enabled=False, meteor_enabled=False,
+               click_text_enabled=True, click_text_list="好耶\n太棒了\n漂亮",
+               click_text_color="#FFFFFF", click_text_size=34,
+               click_text_font="微软雅黑", click_text_deco="彩带",
+               click_text_rise=90, click_text_life=1.4, click_text_opacity=1.0),
+    "加油": dict(rain_enabled=False, snow_enabled=False,
+               petal_enabled=False, meteor_enabled=False,
+               click_text_enabled=True, click_text_list="加油！\n你可以的\n冲鸭",
+               click_text_color="#FFE066", click_text_size=40,
+               click_text_font="雅黑粗体", click_text_deco="星光",
+               click_text_rise=110, click_text_life=1.5, click_text_opacity=1.0),
+    "简洁无装饰": dict(rain_enabled=False, snow_enabled=False,
+                  petal_enabled=False, meteor_enabled=False,
+                  click_text_enabled=True, click_text_list="已收到",
+                  click_text_color="#EAF6FF", click_text_size=30,
+                  click_text_font="等线", click_text_deco="无",
+                  click_text_rise=60, click_text_life=1.1,
+                  click_text_opacity=1.0),
 }
 
 # 预设方案下沉到各特效页内部：每个特效页显示自己的预设方案
@@ -437,6 +512,9 @@ PRESET_GROUPS = {
     "真实水波": ["微风拂面", "月下湖面", "真实水波", "暴雨打点", "惊涛"],
     "窗口水波": ["水面"],
     "宠物跟随": ["小猫", "小狗", "一队小猫", "一群小动物"],
+    # ---- 点击特效 ----
+    "点击表情": ["爱心雨", "彩带庆祝", "星光闪烁", "泡泡上浮"],
+    "点击文字": ["好耶", "加油", "简洁无装饰"],
 }
 
 

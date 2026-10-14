@@ -628,12 +628,12 @@ def test_registry():
     info = fx_kinds.EFFECTS.get("宠物跟随")
     if info is None:
         return False, "fx_kinds.EFFECTS 里没有「宠物跟随」"
-    if info["cat"] != "鼠标特效" or info["layer"] != "mouse":
+    if info["cat"] != "鼠标拖动特效" or info["layer"] != "mouse":
         return False, f"归属不对：{info}"
     if info["enable"] not in d.DEFAULTS:
         return False, f"启停键 {info['enable']} 不在 DEFAULTS 里"
     if "宠物跟随" not in fx_kinds.NAV_GROUPS[1][1]:
-        return False, "侧栏「鼠标特效」分组里没有它"
+        return False, "侧栏「鼠标拖动特效」分组里没有它"
     if "宠物跟随" not in d.PRESET_GROUPS:
         return False, "PRESET_GROUPS 里没有宠物跟随页"
     for n in d.PRESET_GROUPS["宠物跟随"]:
@@ -681,26 +681,31 @@ def test_kind_and_values_sane():
 
 # ------------------------------------------------- 7. 负向对照（判据灵敏性）
 def test_negative_copy_instead_of_over():
-    """把 `_blit` 换成覆盖写法，`test_blend_depends_on_destination` 必须变红。
+    """把共用的 over 混合换成覆盖写法，`test_blend_depends_on_destination` 必须变红。
 
     没有这条，上面那个用例可能只是在测"我新写的东西自洽"，而不是真的在测
     "混合方式正确"。
+
+    混合实现已抽到模块级 `_over_blend`（宠物与点击特效共用），标记行是那条
+    `dst[...] = out` —— 它在全文件只该出现一次，出现两次说明有人又抄了一份
+    混合代码出来，那正是这份对照要拦的。
     """
     src = open(os.path.join(HERE, "fx_effects.py"), encoding="utf-8").read()
-    marker = "        dst[...] = out\n"
+    marker = "    dst[...] = out\n"
     if src.count(marker) != 1:
-        return False, f"定位不到 _blit 的写回语句（找到 {src.count(marker)} 处）"
+        return False, (f"定位不到共用的混合写回语句（找到 {src.count(marker)} 处）"
+                       f" —— 混合实现被抄成了多份？")
     # 换成"覆盖"写法：直接用精灵像素写回，完全不读 dst。这是本文件其它特效
     # 惯用的那套写法，但在有羽化边缘的精灵上就是错的。
     stripped = src.replace(marker,
-                           "        dst[...] = (np.clip(sub[:, :, 2] * sc, 0.0, 255.0)\n"
-                           "                    .astype(np.uint32)\n"
-                           "                    | (np.clip(sub[:, :, 1] * sc, 0.0, 255.0)\n"
-                           "                       .astype(np.uint32) << np.uint32(8))\n"
-                           "                    | (np.clip(sub[:, :, 0] * sc, 0.0, 255.0)\n"
-                           "                       .astype(np.uint32) << np.uint32(16))\n"
-                           "                    | (np.clip(a * 255.0, 0.0, 255.0)\n"
-                           "                       .astype(np.uint32) << np.uint32(24)))\n")
+                           "    dst[...] = (np.clip(sub[:, :, 2] * sc, 0.0, 255.0)\n"
+                           "                .astype(np.uint32)\n"
+                           "                | (np.clip(sub[:, :, 1] * sc, 0.0, 255.0)\n"
+                           "                   .astype(np.uint32) << np.uint32(8))\n"
+                           "                | (np.clip(sub[:, :, 0] * sc, 0.0, 255.0)\n"
+                           "                   .astype(np.uint32) << np.uint32(16))\n"
+                           "                | (np.clip(a * 255.0, 0.0, 255.0)\n"
+                           "                   .astype(np.uint32) << np.uint32(24)))\n")
 
     import types
     mod = types.ModuleType("fxeff_copy_mod")

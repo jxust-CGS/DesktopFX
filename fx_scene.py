@@ -14,7 +14,8 @@ import numpy as np
 
 from fx_effects import (RainField, RippleField, MeteorField, MouseProbe,
                         PaintField, PetalField, SnowField, SpotlightField,
-                        PetField, WaterRippleField, WindowProbe, hex_to_bgr)
+                        PetField, ClickEmojiField, ClickTextField,
+                        WaterRippleField, WindowProbe, hex_to_bgr)
 
 
 class Scene:
@@ -32,6 +33,8 @@ class Scene:
         self.mouse = MouseProbe()
         self.spot = SpotlightField(w, h, seed=17)       # 聚光灯
         self.pets = PetField(w, h, seed=53)             # 宠物跟随
+        self.click_emoji = ClickEmojiField(w, h, seed=73)   # 点击表情
+        self.click_text = ClickTextField(w, h, seed=79)     # 点击文字
         self.win = WindowProbe()                        # 窗口枚举（窗口交互地基）
 
         # 覆盖层在虚拟屏幕里的左上角偏移（鼠标坐标要折算进来）
@@ -80,6 +83,8 @@ class Scene:
         的真实活跃状态判，而不是按 ripple_enabled —— 后者开着但用户没动鼠标时
         池子是空的。宠物同理按"队伍是否真的摆在场上了"判（`pets.active()`），
         而不是按 pet_enabled：开关开着但队伍还没落位时不该让它一直上屏。
+        两个点击特效也按"场上还有没有粒子 / 弹字"判 —— 它们绝大多数时间都是空的
+        （要点一下才有），这一条比别的都划算。
         """
         cfg = self.cfg
         fs = bool(cfg.get("rain_enabled", True) or cfg.get("snow_enabled", False)
@@ -102,7 +107,9 @@ class Scene:
                   or ((cfg.get("wave_enabled", False)
                        or cfg.get("win_ripple_enabled", False)) and self.wave._alive)
                   or self.ripples.active.any()
-                  or self.pets.active())
+                  or self.pets.active()
+                  or self.click_emoji.active()
+                  or self.click_text.active())
         return fs, ms
 
     def resize(self, w, h):
@@ -115,6 +122,8 @@ class Scene:
         self.wave.resize(w, h)
         self.spot.resize(w, h)
         self.pets.resize(w, h)
+        self.click_emoji.resize(w, h)
+        self.click_text.resize(w, h)
 
     def _ripple_color(self):
         c = self.cfg.get("ripple_color", "#7FE7FF")
@@ -322,6 +331,27 @@ class Scene:
             self.pets.draw(buf_ms, w, h, cfg)
         else:
             self.pets.reset()
+
+        # ---------------- 点击特效（点一下炸开一簇 / 弹出一行字）
+        # 画在最后 = 鼠标层最上：它们是**瞬时事件**，被谁盖住都可惜 ——
+        # 一次点击就那么零点几秒，正好压在宠物和水波之上才看得清。
+        # 两者默认互斥（同属「鼠标点击特效」分类），所以通常只有一个在跑，
+        # 但各自仍要按自己的开关独立 reset，否则关掉的那个会留着残影。
+        self.click_emoji.set_pointer(float(self.mouse.mx), float(self.mouse.my),
+                                     int(self.mouse.clicked))
+        if cfg.get("click_emoji_enabled", False):
+            self.click_emoji.update(dt, cfg)
+            self.click_emoji.draw(buf_ms, w, h, cfg)
+        else:
+            self.click_emoji.reset()
+
+        self.click_text.set_pointer(float(self.mouse.mx), float(self.mouse.my),
+                                    int(self.mouse.clicked))
+        if cfg.get("click_text_enabled", False):
+            self.click_text.update(dt, cfg)
+            self.click_text.draw(buf_ms, w, h, cfg)
+        else:
+            self.click_text.reset()
 
     # ------------------------------------------------------------ 真实水波
     def _wave_trigger(self, cfg, dist, w, h, dt):

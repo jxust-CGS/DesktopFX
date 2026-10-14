@@ -1,0 +1,680 @@
+# -*- coding: utf-8 -*-
+"""点击特效（点击表情 / 点击文字）与分组重构的专项验证。
+
+覆盖五块：
+
+  1. **图案精灵** —— 8 种图案都画得出东西、预乘合法、旋转档位互不相同
+     （同档位说明旋转没生效）、缓存不无界增长。
+  2. **爆发物理** —— 粒子数正确、扩散（速度）与重力生效、到时自动清空、
+     乱序输入无 NaN、池满时不越界。
+  3. **文字** —— 多行解析（空行 / 空白 / CRLF）、多条目轮换、字号档位、
+     空文字不崩、文字画得出来且**带描边**（浅底上也读得清）。
+  4. **分组重构** —— 4 个分组、拖动/点击各自成组、`multi_key_of` 落到鼠标层、
+     点击分组内两个特效**默认互斥**。
+  5. **跨文件一致性** —— fx_ui 里的图案/字体/装饰表必须与 fx_effects 的实现
+     一一对应（少了会画出空白、多了会静默退回默认，都不报错）。
+
+结尾带负向对照：把 `_over_blend` 换成覆盖写法，混合类断言必须变红。
+
+不建窗口、不构造 App，只碰内存缓冲。
+"""
+import os
+import sys
+
+import numpy as np
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import desktop_fx as d                              # noqa: E402
+import fx_effects as F                              # noqa: E402
+import fx_kinds                                     # noqa: E402
+from fx_effects import ClickEmojiField, ClickTextField   # noqa: E402
+
+W, H = 640, 480
+
+
+def _ecfg(**over):
+    cfg = dict(click_emoji_enabled=True, click_emoji_shape="爱心",
+               click_emoji_count=12.0, click_emoji_size=22.0,
+               click_emoji_spread=90.0, click_emoji_life=1.1,
+               click_emoji_color="#FF6B8E", click_emoji_gravity=1.0,
+               click_emoji_rotate=True, click_emoji_opacity=1.0)
+    cfg.update(over)
+    return cfg
+
+
+def _tcfg(**over):
+    cfg = dict(click_text_enabled=True, click_text_list="好耶\n太棒了",
+               click_text_color="#FFFFFF", click_text_size=34.0,
+               click_text_font="微软雅黑", click_text_deco="彩带",
+               click_text_rise=90.0, click_text_life=1.4,
+               click_text_opacity=1.0)
+    cfg.update(over)
+    return cfg
+
+
+def _run(field, cfg, fps, secs, target, click=0, first_click=True):
+    for k in range(max(1, int(fps * secs))):
+        field.set_pointer(target[0], target[1],
+                          click if (k == 0 and first_click) else 0)
+        field.update(1.0 / fps, cfg)
+
+
+# ---------------------------------------------------------- 1. 图案精灵
+def test_all_shapes_draw():
+    """8 种图案都要画得出东西，且预乘合法（rgb ≤ alpha）。"""
+    for name in F._SHAPE_NAMES:
+        spr = F._shape_sprite(name, "#FF6B8E", 32, 0, 12)
+        if spr.shape != (32, 32, 4):
+            return False, f"{name}: 形状是 {spr.shape}"
+        a = spr[:, :, 3]
+        nz = int((a > 0.05).sum())
+        if nz < 40:
+            return False, f"{name}: 非透明像素只有 {nz}（图案画空了？）"
+        if a.max() < 0.9:
+            return False, f"{name}: 没有接近不透明的主体像素"
+        over = float((spr[:, :, :3].max(axis=2) - a).max())
+        if over > 1e-3:
+            return False, f"{name}: 预乘不合法，rgb 比 alpha 大 {over:.4f}"
+    return True, f"{len(F._SHAPE_NAMES)} 种图案：非空、不透明、预乘合法"
+
+
+def test_shape_names_and_ui_lists_match():
+    """fx_ui 的三张选择表必须与 fx_effects 的实现一一对应。
+
+    这是**跨文件一致性**，不锁住就会出两种静默故障：UI 里多一项会悄悄退回
+    默认图案（用户以为选了雪花其实是爱心），少一项则新图案永远选不到。
+    """
+    import fx_ui
+    if list(fx_ui.CLICK_SHAPES) != list(F._SHAPE_NAMES):
+        return False, (f"图案表不一致：UI={fx_ui.CLICK_SHAPES} / "
+                       f"实现={list(F._SHAPE_NAMES)}")
+    if sorted(fx_ui.CLICK_FONTS) != sorted(F._FONT_FILES):
+        return False, (f"字体表不一致：UI={sorted(fx_ui.CLICK_FONTS)} / "
+                       f"实现={sorted(F._FONT_FILES)}")
+    # 装饰表对应 ClickTextField.update() 的三个分支
+    if set(fx_ui.CLICK_DECOS) != {"无", "彩带", "星光"}:
+        return False, f"装饰表与实现分支不符：{fx_ui.CLICK_DECOS}"
+    for name in fx_ui.CLICK_FONTS:
+        if name not in F._FONT_FILES:
+            return False, f"UI 提供了实现里没有的字体 {name}"
+    return True, (f"图案 {len(fx_ui.CLICK_SHAPES)} / 字体 {len(fx_ui.CLICK_FONTS)}"
+                  f" / 装饰 {len(fx_ui.CLICK_DECOS)} 三张表与实现一致")
+
+
+def test_rotation_steps_differ():
+    """12 个旋转档必须互不相同 —— 全一样说明旋转根本没生效。"""
+    base = F._shape_sprite("星星", "#FFD166", 32, 0, 12)
+    diffs = []
+    for k in range(1, 12):
+        other = F._shape_sprite("星星", "#FFD166", 32, k, 12)
+        diffs.append(float(np.abs(other - base).max()))
+    if min(diffs) < 0.3:
+        return False, f"有旋转档与第 0 档几乎相同（最小差 {min(diffs):.3f}）"
+    # 转半圈（6 档）应该跟原图差得最远 —— 星星是中心对称的，这条只做粗校验
+    if max(diffs) < 0.5:
+        return False, f"所有旋转档差异都太小（最大 {max(diffs):.3f}）"
+    return True, f"11 个非零档与第 0 档的差异落在 {min(diffs):.2f}~{max(diffs):.2f}"
+
+
+def test_shape_cache_bounded():
+    """精灵缓存必须封顶：配置驱动重建很便宜，但无界累积会吃内存。"""
+    F._SHAPE_CACHE.clear()
+    for k in range(3):
+        F._shape_sprite("爱心", "#FF6B8E", 20 + k, 0, 12)
+    if len(F._SHAPE_CACHE) < 3:
+        return False, "缓存没生效（同样的键重复构建）"
+    for k in range(F._SHAPE_CACHE_MAX + 40):
+        F._shape_sprite("星星", "#%06X" % (k * 7 % 0xFFFFFF), 24, 0, 12)
+    if len(F._SHAPE_CACHE) > F._SHAPE_CACHE_MAX + 12:
+        return False, f"缓存涨到 {len(F._SHAPE_CACHE)} 条，封顶没生效"
+    return True, f"缓存有封顶（上限 {F._SHAPE_CACHE_MAX}，实测 {len(F._SHAPE_CACHE)}）"
+
+
+# ---------------------------------------------------------- 2. 爆发物理
+def test_burst_spawn_and_expire():
+    f = ClickEmojiField(W, H)
+    cfg = _ecfg(click_emoji_count=16.0)
+    f.set_pointer(300.0, 240.0, 1)
+    f.update(1.0 / 60.0, cfg)
+    if f.engine.count != 16:
+        return False, f"点一次应炸开 16 个，实际 {f.engine.count}"
+    if not f.active():
+        return False, "有粒子却报 active=False（该层会被判空、粒子冻住）"
+    # 过了寿命就该清空
+    _run(f, cfg, 60, 1.1 * 1.25 + 0.5, (300.0, 240.0), first_click=False)
+    if f.engine.count != 0 or f.active():
+        return False, f"过了寿命仍有 {f.engine.count} 个粒子"
+    return True, "一次点击 16 个粒子，寿命到点自动清空"
+
+
+def test_spread_controls_travel():
+    """扩散（初速）调大，同样时间后粒子应该飞得更远。"""
+    def extent(spread):
+        f = ClickEmojiField(W, H)
+        cfg = _ecfg(click_emoji_count=20.0, click_emoji_spread=spread,
+                    click_emoji_gravity=0.0, click_emoji_life=3.0)
+        f.set_pointer(320.0, 240.0, 1)
+        f.update(1.0 / 60.0, cfg)
+        _run(f, cfg, 60, 0.5, (320.0, 240.0), first_click=False)
+        dx = np.abs(f.engine.px[:f.engine.count] - 320.0)
+        dy = np.abs(f.engine.py[:f.engine.count] - 240.0)
+        return float(np.sqrt(dx * dx + dy * dy).mean())
+
+    near = extent(40.0)
+    far = extent(200.0)
+    if far <= near * 1.8:
+        return False, f"扩散 40 → {near:.1f} 像素、200 → {far:.1f} 像素，没拉开"
+    return True, f"扩散生效：40 → 平均 {near:.1f} 像素，200 → {far:.1f} 像素"
+
+
+def test_gravity_pulls_down():
+    """重力为正时下半部分的粒子应明显多于无重力（且明显多于上半）。"""
+    def below_ratio(grav):
+        f = ClickEmojiField(W, H)
+        cfg = _ecfg(click_emoji_count=40.0, click_emoji_spread=60.0,
+                    click_emoji_gravity=grav, click_emoji_life=3.0)
+        f.set_pointer(320.0, 240.0, 1)
+        f.update(1.0 / 60.0, cfg)
+        _run(f, cfg, 60, 0.8, (320.0, 240.0), first_click=False)
+        ys = f.engine.py[:f.engine.count]
+        return float((ys > 240.0).mean())
+
+    flat = below_ratio(0.0)
+    heavy = below_ratio(1.0)
+    if heavy < 0.62:
+        return False, f"有重力时只有 {heavy:.0%} 的粒子在下方，重力没生效"
+    if heavy <= flat + 0.15:
+        return False, f"重力 0 → {flat:.0%} 在下方、重力 1 → {heavy:.0%}，没拉开"
+    return True, f"重力生效：0 → {flat:.0%} 在下半，1 → {heavy:.0%}"
+
+
+def test_rotate_spins():
+    f = ClickEmojiField(W, H)
+    cfg = _ecfg(click_emoji_count=10.0, click_emoji_rotate=True,
+                click_emoji_life=3.0)
+    f.set_pointer(320.0, 240.0, 1)
+    f.update(1.0 / 60.0, cfg)
+    r0 = f.engine.rot[:f.engine.count].copy()
+    _run(f, cfg, 60, 0.4, (320.0, 240.0), first_click=False)
+    r1 = f.engine.rot[:f.engine.count]
+    if float(np.abs(r1 - r0).max()) < 0.5:
+        return False, "开了自旋但角度没变"
+    # 关掉自旋角度就该纹丝不动
+    f2 = ClickEmojiField(W, H)
+    c2 = _ecfg(click_emoji_count=10.0, click_emoji_rotate=False,
+               click_emoji_life=3.0)
+    f2.set_pointer(320.0, 240.0, 1)
+    f2.update(1.0 / 60.0, c2)
+    a0 = f2.engine.rot[:f2.engine.count].copy()
+    _run(f2, c2, 60, 0.4, (320.0, 240.0), first_click=False)
+    if float(np.abs(f2.engine.rot[:f2.engine.count] - a0).max()) > 1e-5:
+        return False, "关了自旋角度仍在变"
+    return True, "开自旋会转、关自旋不动"
+
+
+def test_pool_overflow_is_safe():
+    """连点把池子打满时不能越界 / 不能 NaN。"""
+    f = ClickEmojiField(W, H)
+    cfg = _ecfg(click_emoji_count=40.0, click_emoji_life=3.0)
+    for k in range(30):
+        f.set_pointer(100.0 + k * 12, 240.0, 1)
+        f.update(1.0 / 60.0, cfg)
+        f.update(1.0 / 60.0, cfg)
+    n = f.engine.count
+    if n > F._BurstEngine.MAX:
+        return False, f"粒子数 {n} 超过池上限 {F._BurstEngine.MAX}"
+    vals = np.concatenate([f.engine.px[:n], f.engine.py[:n],
+                           f.engine.vx[:n], f.engine.vy[:n],
+                           f.engine.rot[:n]])
+    if not np.isfinite(vals).all():
+        return False, "连点后出现 NaN / Inf"
+    if n <= 0:
+        return False, "连点之后一个粒子都没有"
+    return True, f"连点 30 次后池内 {n} 个（上限 {F._BurstEngine.MAX}），无 NaN"
+
+
+def test_wild_input_no_nan():
+    f = ClickEmojiField(W, H)
+    rng = np.random.default_rng(5)
+    for _ in range(300):
+        cfg = _ecfg(click_emoji_count=float(rng.integers(1, 40)),
+                    click_emoji_size=float(rng.uniform(8, 64)),
+                    click_emoji_spread=float(rng.uniform(20, 300)),
+                    click_emoji_gravity=float(rng.uniform(-0.5, 1.5)),
+                    click_emoji_life=float(rng.uniform(0.4, 3.0)))
+        f.set_pointer(float(rng.uniform(-5e3, 5e3)),
+                      float(rng.uniform(-5e3, 5e3)),
+                      1 if rng.random() < 0.4 else 0)
+        f.update(float(rng.uniform(0.0, 0.5)), cfg)
+    n = f.engine.count
+    vals = np.concatenate([f.engine.px[:n], f.engine.py[:n],
+                           f.engine.vx[:n], f.engine.vy[:n]])
+    if not np.isfinite(vals).all():
+        return False, "乱序输入后出现 NaN / Inf"
+    return True, "300 次随机参数（含越大越界的坐标与 dt=0~0.5）无 NaN"
+
+
+def test_confetti_uses_palette():
+    """彩带忽略主色、用整套调色板 —— 这是它在界面上唯一特殊的地方。"""
+    f = ClickEmojiField(W, H)
+    cfg = _ecfg(click_emoji_shape="彩带", click_emoji_count=30.0,
+                click_emoji_color="#000000")
+    f.set_pointer(320.0, 240.0, 1)
+    f.update(1.0 / 60.0, cfg)
+    n = f.engine.count
+    uniq = {tuple(int(v) for v in c) for c in f.engine.rgb[:n]}
+    if len(uniq) < 3:
+        return False, f"彩带只有 {len(uniq)} 种颜色（应多彩）"
+    # 非彩带图案则整簇同一个颜色
+    f2 = ClickEmojiField(W, H)
+    f2.set_pointer(320.0, 240.0, 1)
+    f2.update(1.0 / 60.0, _ecfg(click_emoji_shape="爱心",
+                                click_emoji_count=30.0))
+    u2 = {tuple(int(v) for v in c) for c in f2.engine.rgb[:f2.engine.count]}
+    if len(u2) != 1:
+        return False, f"单色图案却有 {len(u2)} 种颜色"
+    return True, f"彩带 {len(uniq)} 种颜色、单色图案 1 种（主色被正确忽略/采用）"
+
+
+def test_draws_into_buffer():
+    """真的画得上屏，而且不该把整屏涂满。"""
+    f = ClickEmojiField(W, H)
+    cfg = _ecfg(click_emoji_count=20.0)
+    f.set_pointer(W * 0.5, H * 0.5, 1)
+    f.update(1.0 / 60.0, cfg)
+    buf = np.zeros(W * H, np.uint32)
+    for _ in range(4):
+        buf[:] = 0
+        f.update(1.0 / 60.0, cfg)
+        f.draw(buf, W, H, cfg)
+    n = int((buf > 0).sum())
+    if n <= 0:
+        return False, "画完之后一个像素都没有"
+    if n > W * H * 0.6:
+        return False, f"改动 {n} 像素（超过 60% 画面），范围失控"
+    # 不透明度 0 时一个像素都不该落
+    f2 = ClickEmojiField(W, H)
+    c0 = _ecfg(click_emoji_count=20.0, click_emoji_opacity=0.0)
+    f2.set_pointer(W * 0.5, H * 0.5, 1)
+    f2.update(1.0 / 60.0, c0)
+    b2 = np.zeros(W * H, np.uint32)
+    f2.draw(b2, W, H, c0)
+    if (b2 > 0).any():
+        return False, "不透明度 0 时仍然落了像素"
+    return True, f"落屏 {n} 像素（占 {100.0 * n / (W * H):.1f}%），不透明度 0 不落"
+
+
+# ---------------------------------------------------------- 3. 文字
+def test_text_list_parsing():
+    t = ClickTextField(W, H)
+    cases = [
+        ("好耶\n太棒了", ["好耶", "太棒了"]),
+        ("  只有一个  ", ["只有一个"]),
+        ("a\n\n\nb", ["a", "b"]),            # 空行要去掉
+        ("a\r\nb", ["a", "b"]),              # CRLF
+        ("", []),
+        ("   \n  \t ", []),
+        ("1\n2\n3\n4", ["1", "2", "3", "4"]),
+    ]
+    for raw, want in cases:
+        got = t.texts_of(dict(click_text_list=raw))
+        if got != want:
+            return False, f"{raw!r} 解析成 {got}，期望 {want}"
+    return True, f"{len(cases)} 组写法（含空行 / CRLF / 全空白）解析正确"
+
+
+def test_text_rotation():
+    """多条文字按点击**轮换**，不是随机 —— 随机无法确认每条都生效。"""
+    t = ClickTextField(W, H)
+    cfg = _tcfg(click_text_list="甲\n乙\n丙", click_text_deco="无")
+    seq = []
+    for _ in range(7):
+        t.set_pointer(320.0, 240.0, 1)
+        t.update(1.0 / 60.0, cfg)
+        t.pops = [p for p in t.pops if p["t"] < 0.05]   # 只留最新一条
+        seq.append(t.pops[-1]["idx"])
+    if seq != [0, 1, 2, 0, 1, 2, 0]:
+        return False, f"轮换顺序是 {seq}，期望 [0,1,2,0,1,2,0]"
+    # 换成两条，游标要按新长度取模而不是越界
+    t.reset()
+    c2 = _tcfg(click_text_list="甲\n乙", click_text_deco="无")
+    for _ in range(3):
+        t.set_pointer(320.0, 240.0, 1)
+        t.update(1.0 / 60.0, c2)
+    if t.pops[-1]["idx"] >= 2:
+        return False, f"改成两条后序号越界：{t.pops[-1]['idx']}"
+    return True, "多条目按 0→1→2→0 轮换；条目数变化后不越界"
+
+
+def test_text_pop_scales():
+    """弹字用多个字号档（直接重渲染），开头小、中段过冲、之后稳定。"""
+    steps = F._TEXT_POP_STEPS
+    if len(steps) < 3:
+        return False, f"缩放档只有 {len(steps)} 个"
+    if max(steps) <= steps[-1] or max(steps) <= steps[0]:
+        return False, f"没有过冲：{steps}"
+    sizes = [F._text_sprite("好", "微软雅黑", 40, "#FFFFFF", s).shape[0]
+             for s in steps]
+    if sizes[-1] <= sizes[0]:
+        return False, f"末档不该比首档小：{sizes}"
+    return True, f"5 档字号 {'/'.join(str(s) for s in sizes)}，末档回到稳定尺寸"
+
+
+def test_text_has_outline():
+    """文字必须带描边：白字落在浅色桌面上没有描边就会糊掉。
+
+    判据是"最外圈存在半透明的深色像素" —— 直接比对具体颜色会依赖字体渲染细节。
+    """
+    spr = F._text_sprite("好耶", "微软雅黑", 40, "#FFFFFF", 1.0)
+    a = spr[:, :, 3]
+    ys, xs = np.nonzero(a > 0.02)
+    if ys.size == 0:
+        return False, "文字渲染成了空白"
+    # 取描边区域：alpha 较低（描边是半透明的）且颜色偏暗
+    rgb = np.where(a[..., None] > 1e-6,
+                   spr[:, :, :3] / np.maximum(a[..., None], 1e-6), 0.0)
+    lum = rgb[:, :, 0] * 0.299 + rgb[:, :, 1] * 0.587 + rgb[:, :, 2] * 0.114
+    edge = (a > 0.25) & (a < 0.85) & (lum < 0.35)
+    if int(edge.sum()) < 12:
+        return False, (f"找不到描边像素（{int(edge.sum())} 个）—— "
+                       f"白字在浅色桌面上会看不清")
+    return True, f"文字带描边（{int(edge.sum())} 个半透明暗像素）"
+
+
+def test_text_empty_is_safe():
+    t = ClickTextField(W, H)
+    cfg = _tcfg(click_text_list="", click_text_deco="无")
+    t.set_pointer(320.0, 240.0, 1)
+    t.update(1.0 / 60.0, cfg)
+    buf = np.zeros(W * H, np.uint32)
+    t.draw(buf, W, H, cfg)
+    if (buf > 0).any():
+        return False, "文字清空后仍然画了东西"
+    if t.active():
+        return False, "文字清空后仍报 active（该层会被一直提交）"
+    return True, "文字留空时不崩、不画、不占层"
+
+
+def test_text_deco():
+    """装饰按设置生效：选了彩带就有粒子，选「无」就没有。"""
+    for deco, want in (("彩带", True), ("星光", True), ("无", False)):
+        t = ClickTextField(W, H)
+        cfg = _tcfg(click_text_deco=deco)
+        t.set_pointer(320.0, 240.0, 1)
+        t.update(1.0 / 60.0, cfg)
+        got = t.deco.count > 0
+        if got != want:
+            return False, f"装饰「{deco}」粒子数 {t.deco.count}，期望有={want}"
+        if want and t.deco._shape not in F._SHAPE_NAMES:
+            return False, f"装饰「{deco}」用了未知图案 {t.deco._shape}"
+    return True, "彩带 / 星光会撒粒子，选「无」则只有文字"
+
+
+def test_text_draws_and_rises():
+    """文字要真的画出来，且随时间向上移动。"""
+    t = ClickTextField(W, H)
+    cfg = _tcfg(click_text_deco="无", click_text_rise=120.0)
+    t.set_pointer(320.0, 300.0, 1)
+    t.update(1.0 / 60.0, cfg)
+    buf = np.zeros(W * H, np.uint32)
+    t.draw(buf, W, H, cfg)
+    n0 = int((buf > 0).sum())
+    if n0 <= 0:
+        return False, "弹字一帧都没画出来"
+    # 行号 = 扁平下标 // 宽。跑一段后平均行号应更小（更靠上）
+    y0 = float((np.nonzero(buf > 0)[0] // W).mean())
+    _run(t, cfg, 60, 0.6, (320.0, 300.0), first_click=False)
+    buf2 = np.zeros(W * H, np.uint32)
+    t.draw(buf2, W, H, cfg)
+    if not (buf2 > 0).any():
+        return False, "上飘途中文字消失了"
+    y1 = float((np.nonzero(buf2 > 0)[0] // W).mean())
+    if y1 >= y0 - 3.0:
+        return False, f"平均行号 {y0:.0f} → {y1:.0f}，没有上飘"
+    return True, f"弹出 {n0} 像素，0.6 秒后平均行号 {y0:.0f} → {y1:.0f}（在上飘）"
+
+
+# ---------------------------------------------------------- 4. 分组重构
+def test_categories():
+    want = ["全屏特效", "鼠标拖动特效", "鼠标点击特效", "其他特效"]
+    if list(fx_kinds.CATEGORY_ORDER) != want:
+        return False, f"分组是 {fx_kinds.CATEGORY_ORDER}，期望 {want}"
+    if fx_kinds.effects_of("鼠标点击特效") != ["点击表情", "点击文字"]:
+        return False, ("鼠标点击特效组的内容是 "
+                       f"{fx_kinds.effects_of('鼠标点击特效')}")
+    drag = fx_kinds.effects_of("鼠标拖动特效")
+    for name in ("聚光灯", "颜料盘", "宠物跟随", "涟漪", "真实水波"):
+        if name not in drag:
+            return False, f"{name} 不在鼠标拖动特效组里"
+    for cat in fx_kinds.CATEGORY_ORDER:
+        if not fx_kinds.effects_of(cat):
+            return False, f"{cat} 分组是空的"
+    # 侧栏顺序 = 分组顺序拼起来
+    flat = [p for _, ps in fx_kinds.NAV_GROUPS for p in ps]
+    if flat != fx_kinds.nav_order()[:len(flat)]:
+        return False, "侧栏顺序与分组顺序对不上"
+    return True, (f"{len(fx_kinds.CATEGORY_ORDER)} 个分组，点击组含 "
+                  f"{fx_kinds.effects_of('鼠标点击特效')}")
+
+
+def test_click_effects_are_exclusive():
+    """两个点击特效默认互斥（用户选的"只生效一个"），且都在鼠标层。"""
+    for name in ("点击表情", "点击文字"):
+        if fx_kinds.layer_of(name) != "mouse":
+            return False, f"{name} 不在鼠标层，而画在 {fx_kinds.layer_of(name)}"
+        if fx_kinds.multi_key_of(name) != "multi_mouse":
+            return False, (f"{name} 的多开键是 {fx_kinds.multi_key_of(name)}，"
+                           f"期望 multi_mouse")
+    # 默认 multi_mouse=False -> 开一个会关掉另一个
+    app = d.App.__new__(d.App)
+    app.cfg = dict(d.DEFAULTS)
+    app.snapshot = dict(app.cfg)
+    app.user_presets = {}
+    app._autosave_dirty = False
+    app.set("click_emoji_enabled", True)
+    if app.cfg["click_text_enabled"]:
+        return False, "前提不成立：一开始文字就是开着的"
+    app.set("click_text_enabled", True)
+    if app.cfg["click_emoji_enabled"]:
+        return False, "开了「点击文字」却没有关掉「点击表情」—— 互斥没生效"
+    if not app.cfg["click_text_enabled"]:
+        return False, "「点击文字」没能打开"
+    # 打开多开就都留着
+    app.set("multi_mouse", True)
+    app.set("click_emoji_enabled", True)
+    if not (app.cfg["click_emoji_enabled"] and app.cfg["click_text_enabled"]):
+        return False, "允许多开之后两个仍不能共存"
+    return True, "默认互斥（开文字会关掉表情）；允许多开后两个共存"
+
+
+def test_registry_and_defaults():
+    for k in ("click_emoji_enabled", "click_emoji_shape", "click_emoji_count",
+              "click_emoji_size", "click_emoji_spread", "click_emoji_life",
+              "click_emoji_color", "click_emoji_gravity",
+              "click_emoji_rotate", "click_emoji_opacity",
+              "click_text_enabled", "click_text_list", "click_text_color",
+              "click_text_size", "click_text_font", "click_text_deco",
+              "click_text_rise", "click_text_life", "click_text_opacity"):
+        if k not in d.DEFAULTS:
+            return False, f"DEFAULTS 缺 {k}"
+    if d.DEFAULTS["click_emoji_shape"] not in F._SHAPE_NAMES:
+        return False, f"默认图案 {d.DEFAULTS['click_emoji_shape']!r} 没有实现"
+    if d.DEFAULTS["click_text_font"] not in F._FONT_FILES:
+        return False, f"默认字体 {d.DEFAULTS['click_text_font']!r} 没有实现"
+    if d.DEFAULTS["click_text_deco"] not in ("无", "彩带", "星光"):
+        return False, f"默认装饰 {d.DEFAULTS['click_text_deco']!r} 非法"
+    for page in ("点击表情", "点击文字"):
+        if page not in d.PRESET_GROUPS:
+            return False, f"PRESET_GROUPS 缺 {page}"
+        for n in d.PRESET_GROUPS[page]:
+            if n not in d.PRESETS:
+                return False, f"预设 {n} 没定义"
+            bad = [k for k in d.PRESETS[n] if k not in d.DEFAULTS]
+            if bad:
+                return False, f"预设 {n} 含未登记的键：{bad}"
+    return True, "19 个配置键齐全，默认值都指向已实现的图案/字体，预设全部已登记"
+
+
+def test_scene_wiring():
+    """接进 Scene：只落鼠标层；关掉后清干净；layer_activity 认它们。
+
+    `MouseProbe` 读的是**真实光标**，测试环境里位置不定、也点不到 —— 直接用
+    桩替换 `update()`，第一帧给一次点击，之后不再点。同时把 mx/my 钉在画面
+    中央，免得宠物/特效被整只裁到屏幕外（那样"没画出像素"与功能坏掉就分不清）。
+    """
+    from _verify_kinds import _base_cfg
+    from fx_scene import Scene
+
+    box = {"fired": True}
+
+    def fake_update(dt, ox, oy):
+        sc.mouse.mx, sc.mouse.my = W * 0.5, H * 0.5
+        sc.mouse.clicked = 0 if box["fired"] else 1
+        return 0.0
+
+    for key, page in (("click_emoji_enabled", "点击表情"),
+                      ("click_text_enabled", "点击文字")):
+        sc = Scene(W, H)
+        sc.mouse.update = fake_update
+        sc.cfg = _base_cfg(**{key: True})
+        fs = np.zeros(W * H, np.uint32)
+        ms = np.zeros(W * H, np.uint32)
+        for k in range(20):
+            box["fired"] = k >= 1          # 只在第一帧点击一次
+            fs[:] = 0
+            ms[:] = 0
+            sc.step(1.0 / 60.0, fs, W, H, ms)
+        if not ms.any():
+            return False, f"{page}：开着却一个像素都没落到鼠标层"
+        if fs.any():
+            return False, f"{page}：像素跑进了全屏层"
+        if not sc.layer_activity()[1]:
+            return False, f"{page}：有内容却报鼠标层为空 -> 会被冻住"
+
+        # 关掉之后必须清干净
+        sc2 = Scene(W, H)
+        sc2.mouse.update = fake_update
+        sc2.cfg = _base_cfg()
+        blank = np.zeros(W * H, np.uint32)
+        for _ in range(30):
+            sc2.step(1.0 / 60.0, blank, W, H, blank)
+        if sc2.click_emoji.active() or sc2.click_text.active():
+            return False, f"{page}：关掉之后仍报 active（残留未清）"
+        if sc2.layer_activity()[1]:
+            return False, f"{page}：全关之后鼠标层仍报有内容"
+    return True, "两个点击特效只落鼠标层、参与判空、关掉后清干净"
+
+
+# ------------------------------------------------- 5. 负向对照
+def test_negative_copy_instead_of_over():
+    """把共用的 over 混合换成覆盖写法，混合类断言必须变红。
+
+    点击特效和宠物共用同一份 `_over_blend`，所以这条同时守着两边。
+    """
+    src = open(os.path.join(HERE, "fx_effects.py"), encoding="utf-8").read()
+    marker = "    dst[...] = out\n"
+    if src.count(marker) != 1:
+        return False, f"定位不到共用的混合写回（找到 {src.count(marker)} 处）"
+    stripped = src.replace(marker, "    dst[...] = np.zeros(dst.shape, np.uint32)\n")
+    if stripped == src:
+        return False, "负向对照没改到源码"
+
+    import types
+    mod = types.ModuleType("fxeff_click_copy")
+    mod.__dict__["__name__"] = "fxeff_click_copy"
+    mod.__dict__["__file__"] = os.path.join(HERE, "fx_effects.py")
+    try:
+        exec(compile(stripped, "fx_effects_click_copy.py", "exec"), mod.__dict__)
+    except Exception as e:
+        return False, f"负向对照模块编译失败：{type(e).__name__}: {e}"
+
+    # 覆盖写法下，**被写过的区域内**两种底色应逐像素完全相同（根本没读底色）。
+    #
+    # ⚠️ 必须先把范围收进"真的被改动的像素"：直接比整块缓冲是没意义的 ——
+    # 没被写到的地方本来就各自保持着底色，两种底色当然处处不同，那会给出
+    # 一个看着很漂亮的失败（或成功）数字，却什么都没测到。
+    cfg = _ecfg(click_emoji_count=24.0, click_emoji_life=3.0)
+    bg_bright = np.uint32(0xFFF0F0F0)
+    bg_dark = np.uint32(0xFF202020)
+
+    def draw_on(pack):
+        f = mod.ClickEmojiField(W, H)
+        f.set_pointer(W * 0.5, H * 0.5, 1)
+        f.update(1.0 / 60.0, cfg)
+        for _ in range(6):
+            f.update(1.0 / 60.0, cfg)
+        buf = np.full(W * H, np.uint32(pack), np.uint32)
+        f.draw(buf, W, H, cfg)
+        return buf
+
+    bright = draw_on(bg_bright)
+    dark = draw_on(bg_dark)
+    painted = (bright != bg_bright) | (dark != bg_dark)
+    n_painted = int(painted.sum())
+    if n_painted < 100:
+        return False, f"负向对照没画上东西（只改动 {n_painted} 像素），无法判断"
+    edge = painted & (bright != dark)
+    if int(edge.sum()) != 0:
+        return False, (f"负向对照失效：被写过的 {n_painted} 个像素里仍有 "
+                       f"{int(edge.sum())} 个随底色变化")
+    return True, (f"覆盖写法下被写过的 {n_painted} 个像素两种底完全一致"
+                  f"（判据确实在测混合方式，而非底色本身）")
+
+
+# ------------------------------------------------------------------ 驱动
+def main():
+    tests = [
+        test_all_shapes_draw,
+        test_shape_names_and_ui_lists_match,
+        test_rotation_steps_differ,
+        test_shape_cache_bounded,
+        test_burst_spawn_and_expire,
+        test_spread_controls_travel,
+        test_gravity_pulls_down,
+        test_rotate_spins,
+        test_pool_overflow_is_safe,
+        test_wild_input_no_nan,
+        test_confetti_uses_palette,
+        test_draws_into_buffer,
+        test_text_list_parsing,
+        test_text_rotation,
+        test_text_pop_scales,
+        test_text_has_outline,
+        test_text_empty_is_safe,
+        test_text_deco,
+        test_text_draws_and_rises,
+        test_categories,
+        test_click_effects_are_exclusive,
+        test_registry_and_defaults,
+        test_scene_wiring,
+        test_negative_copy_instead_of_over,
+    ]
+    print("== 点击特效 + 分组 ==")
+    bad = 0
+    for fn in tests:
+        try:
+            r = fn()
+        except Exception as e:
+            import traceback
+            r = (False, f"exception: {type(e).__name__}: {e}\n"
+                        + traceback.format_exc().splitlines()[-3])
+        if r is None:
+            print(f"  [SKIP] {fn.__name__}")
+            continue
+        ok, msg = r
+        if not ok:
+            bad += 1
+        print(f"  [{'PASS' if ok else 'FAIL'}] {fn.__name__}: {msg}")
+    print()
+    if bad:
+        print(f"== CLICK FAILED ==  {bad} 项失败")
+        raise SystemExit(1)
+    print(f"== CLICK VERIFIED ==  {len(tests)} 项")
+    raise SystemExit(0)
+
+
+if __name__ == "__main__":
+    main()

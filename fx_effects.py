@@ -21,11 +21,15 @@ from _win32 import user32, HANDLE, INT, SHORT
 try:
     from PIL import Image as _PImage
     from PIL import ImageDraw as _PDraw
+    from PIL import ImageFont as _PImageFont
     _LANCZOS = _PImage.Resampling.LANCZOS
+    _BICUBIC = _PImage.Resampling.BICUBIC
 except Exception:                       # pragma: no cover - 打包环境必有 PIL
     _PImage = None
     _PDraw = None
+    _PImageFont = None
     _LANCZOS = None
+    _BICUBIC = None
 
 # ---- Win32 窗口枚举（仅 Windows 下可用；非 Windows 仅跳过，不报错）----
 try:
@@ -71,6 +75,42 @@ def hex_to_bgr(s):
 def _premul_pack(b, g, r, a):
     """把 4 个 uint32 通道打包成 0xAARRGGBB。"""
     return b | (g << np.uint32(8)) | (r << np.uint32(16)) | (a << np.uint32(24))
+
+
+def _over_blend(dst, sub, a, sc):
+    """把**预乘**精灵 `sub` 以覆盖率 `a` 叠加到 `dst` 上（原地写回 dst 子区域）。
+
+    这是真正的 over 混合，而不是本文件其它特效惯用的"非零覆盖"：
+
+        dst = src + dst·(1 − src_a)
+
+    缓冲本身就是预乘格式，所以 over 不必再除 alpha。**有羽化边缘的精灵必须走
+    这里** —— 覆盖写法会把半透明边缘像素写成"实心但偏暗"，叠在涟漪 / 水面上
+    就是一圈脏边。不透明粒子（雨滴、雪花的实心核）用覆盖就够了。
+
+    参数：
+        dst  目标：`u32.reshape(h, w)[y0:y1, x0:x1]` 的切片视图
+        sub  精灵的对应子区域（预乘 RGBA float32，0~1）
+        a    每像素覆盖率 = 精灵 alpha × 整体不透明度
+        sc   常量缩放 = 255 × 整体不透明度（把预乘色转回 0~255 整数）
+    """
+    inv = 1.0 - a
+    d = dst.astype(np.uint32)
+    dr = ((d >> np.uint32(16)) & np.uint32(0xFF)).astype(np.float32)
+    dg = ((d >> np.uint32(8)) & np.uint32(0xFF)).astype(np.float32)
+    db = (d & np.uint32(0xFF)).astype(np.float32)
+    da = ((d >> np.uint32(24)) & np.uint32(0xFF)).astype(np.float32)
+
+    nr = sub[:, :, 0] * sc + dr * inv
+    ng = sub[:, :, 1] * sc + dg * inv
+    nb = sub[:, :, 2] * sc + db * inv
+    na = a * 255.0 + da * inv      # a 已含不透明度
+
+    out = (np.clip(nb, 0.0, 255.0).astype(np.uint32)
+           | (np.clip(ng, 0.0, 255.0).astype(np.uint32) << np.uint32(8))
+           | (np.clip(nr, 0.0, 255.0).astype(np.uint32) << np.uint32(16))
+           | (np.clip(na, 0.0, 255.0).astype(np.uint32) << np.uint32(24)))
+    dst[...] = out
 
 
 def _smooth5(a, k, passes=1):
@@ -3356,11 +3396,8 @@ class PetField:
     def _blit(self, u32, w, h, img, cx, cy, op, center=True):
         """把预乘 RGBA 精灵**叠加**到缓冲上（默认以 (cx, cy) 为中心）。
 
-        这里做真正的 over 混合，而不是本文件其它特效惯用的"非零覆盖"：
-        宠物有羽化边缘，覆盖写法会把半透明边缘像素写成"实心但偏暗"，叠在
-        涟漪 / 水面上就是一圈脏边。
-        缓冲是预乘格式，所以 over 就是 `dst = src + dst·(1 − src_a)`，不必
-        再除 alpha。混合只作用在精灵包围盒上（几十像素见方），开销可忽略。
+        混合本身走模块级的 `_over_blend`（宠物与点击特效共用同一份实现）。
+        这里只负责"把精灵对到屏幕坐标 + 裁掉出屏部分"。
 
         `center=False` 时 (cx, cy) 是左上角 —— 闭眼覆盖层已经裁剪过，用左上角
         定位比换算中心更直接。
@@ -3377,27 +3414,9 @@ class PetField:
         a = sub[:, :, 3] * op
         if not (a > 0.004).any():
             return
-        inv = 1.0 - a
-
         dst = u32.reshape(int(h), int(w))[gy0:gy1, gx0:gx1]
-        d = dst.astype(np.uint32)
-        dr = ((d >> np.uint32(16)) & np.uint32(0xFF)).astype(np.float32)
-        dg = ((d >> np.uint32(8)) & np.uint32(0xFF)).astype(np.float32)
-        db = (d & np.uint32(0xFF)).astype(np.float32)
-        da = ((d >> np.uint32(24)) & np.uint32(0xFF)).astype(np.float32)
-
         # 精灵已是预乘色（rgb 内含 alpha），乘 op 就是"整体调不透明度"
-        sc = 255.0 * op
-        nr = sub[:, :, 0] * sc + dr * inv
-        ng = sub[:, :, 1] * sc + dg * inv
-        nb = sub[:, :, 2] * sc + db * inv
-        na = a * 255.0 + da * inv      # a 已含 op
-
-        out = (np.clip(nb, 0.0, 255.0).astype(np.uint32)
-               | (np.clip(ng, 0.0, 255.0).astype(np.uint32) << np.uint32(8))
-               | (np.clip(nr, 0.0, 255.0).astype(np.uint32) << np.uint32(16))
-               | (np.clip(na, 0.0, 255.0).astype(np.uint32) << np.uint32(24)))
-        dst[...] = out
+        _over_blend(dst, sub, a, 255.0 * op)
 
     # ------------------------------------------------------------ 精灵
     def _ensure_sprite(self, cfg):
@@ -3611,6 +3630,577 @@ class PetField:
         cir(0.774, 0.355, 0.021, white)
         line([(0.808, 0.510), (0.768, 0.548)], mid, lw)                   # 嘴
         line([(0.808, 0.510), (0.848, 0.548)], mid, lw)
+
+
+# ------------------------------------------------------------------ 点击特效
+# 图案精灵的进程级缓存。
+# 键 = (图案, 颜色, 尺寸, 旋转步) -> 预乘 RGBA 数组。
+# 放在模块级而不是实例里：两个点击特效（表情 / 文字里的装饰）会用到同几种
+# 图案，各存一份纯属浪费；而且图案只取决于配置，与是哪个特效实例无关。
+_SHAPE_CACHE = {}
+_SHAPE_CACHE_MAX = 400          # 超了就整体清空（配置驱动，重建很便宜）
+
+# 彩带用一整套调色板而不是单色 —— 单色彩带看着像一堆纸片，多彩才有"彩带"感。
+# 这是唯一一个**忽略主色**的图案，UI 上会说明。
+_CONFETTI_COLORS = ("#FF5D73", "#FFC145", "#4ADE80", "#38BDF8", "#A78BFA",
+                    "#FB7185", "#FDE68A", "#5EEAD4")
+
+_SHAPE_NAMES = ("爱心", "星星", "彩带", "雪花", "气泡", "火焰", "花瓣", "音符")
+
+
+def _shape_sprite(shape, color_hex, size, rot_step=0, rot_steps=12):
+    """画一个图案精灵（预乘 RGBA），带缓存。
+
+    `rot_step` 是预渲染的旋转档位：旋转不能在每帧对每个粒子现算（要重采样，
+    几十个粒子根本扛不住），所以**按固定档位预渲染一批**，绘制时取最近的档。
+    12 档在视觉上已经看不出跳变。
+    """
+    size = max(8, int(size))
+    key = (shape, color_hex, size, rot_step, rot_steps)
+    hit = _SHAPE_CACHE.get(key)
+    if hit is not None:
+        return hit
+    if len(_SHAPE_CACHE) > _SHAPE_CACHE_MAX:
+        _SHAPE_CACHE.clear()
+    spr = _build_shape(shape, color_hex, size, rot_step, rot_steps)
+    _SHAPE_CACHE[key] = spr
+    return spr
+
+
+def _build_shape(shape, color_hex, size, rot_step, rot_steps):
+    """真正画图案。坐标一律归一化到 0~1，与最终像素尺寸无关。"""
+    SS = 3                                  # 超采样倍数
+    W = size * SS
+    img = _PImage.new("RGBA", (W, W), (0, 0, 0, 0))
+    dr = _PDraw.Draw(img)
+
+    bgr = hex_to_bgr(color_hex)
+    rgb = (int(bgr[2]), int(bgr[1]), int(bgr[0]))
+    fill = rgb + (255,)
+    light = tuple(int(v + (255 - v) * 0.55) for v in rgb) + (255,)
+    dark = tuple(int(v * 0.55) for v in rgb) + (255,)
+
+    def ell(cx, cy, rx, ry, col):
+        dr.ellipse([(cx - rx) * W, (cy - ry) * W,
+                    (cx + rx) * W, (cy + ry) * W], fill=col)
+
+    def poly(pts, col):
+        dr.polygon([(x * W, y * W) for x, y in pts], fill=col)
+
+    def line(pts, col, wd):
+        dr.line([(x * W, y * W) for x, y in pts], fill=col,
+                width=max(1, int(wd)), joint="curve")
+
+    if shape == "爱心":
+        # 两个圆瓣 + 一个倒三角拼出心形（与宠物那套同样的构造）
+        ell(0.355, 0.365, 0.205, 0.205, fill)
+        ell(0.645, 0.365, 0.205, 0.205, fill)
+        poly([(0.155, 0.435), (0.845, 0.435), (0.500, 0.880)], fill)
+        ell(0.300, 0.305, 0.062, 0.045, light)      # 高光，否则整块颜色太平
+    elif shape == "星星":
+        pts = []
+        for j in range(10):
+            rr = 0.46 if j % 2 == 0 else 0.185
+            aa = -math.pi / 2 + j * math.pi / 5
+            pts.append((0.5 + rr * math.cos(aa), 0.5 + rr * math.sin(aa)))
+        poly(pts, fill)
+        ell(0.5, 0.52, 0.10, 0.10, light)
+    elif shape == "彩带":
+        # 一条斜向的缎带：主体矩形 + 两端的斜切口。颜色在生成调用处逐粒子给，
+        # 这里拿到的已经是该粒子的那一色。
+        poly([(0.22, 0.30), (0.78, 0.16), (0.80, 0.46), (0.24, 0.60)], fill)
+        poly([(0.24, 0.60), (0.80, 0.46), (0.76, 0.78), (0.20, 0.92)], dark)
+        line([(0.26, 0.34), (0.77, 0.20)], light, max(1, W * 0.02))
+    elif shape == "雪花":
+        # 六条主枝 + 每枝一对小叉。只画细线，雪花才是"结晶"而不是"六角星"
+        wd = max(1, int(W * 0.055))
+        for j in range(6):
+            aa = j * math.pi / 3
+            dx, dy = math.cos(aa), math.sin(aa)
+            line([(0.5 - 0.44 * dx, 0.5 - 0.44 * dy),
+                  (0.5 + 0.44 * dx, 0.5 + 0.44 * dy)], fill, wd)
+            for s in (-1, 1):
+                bx, by = 0.5 + 0.30 * dx, 0.5 + 0.30 * dy
+                aa2 = aa + s * 0.85
+                line([(bx, by), (bx + 0.16 * math.cos(aa2),
+                                 by + 0.16 * math.sin(aa2))], fill, wd * 0.8)
+        ell(0.5, 0.5, 0.075, 0.075, light)
+    elif shape == "气泡":
+        # 空心圆 + 左上一点高光；内部留透，叠在桌面上才像泡
+        wd = max(1, int(W * 0.07))
+        dr.ellipse([0.09 * W, 0.09 * W, 0.91 * W, 0.91 * W],
+                   outline=fill, width=wd)
+        ell(0.34, 0.31, 0.115, 0.085, light)
+        ell(0.68, 0.72, 0.055, 0.055, light)
+    elif shape == "火焰":
+        # 泪滴形：下半圆 + 上半收成尖，再点一个亮芯
+        poly([(0.50, 0.06), (0.80, 0.52), (0.20, 0.52)], fill)
+        ell(0.50, 0.62, 0.30, 0.30, fill)
+        ell(0.50, 0.70, 0.145, 0.185, light)
+    elif shape == "花瓣":
+        # 与「落樱」同一套花瓣轮廓，整体缩到 0.1~0.9
+        pts = [(5.5, 5.5), (7.5, 3.0), (9.0, 5.0), (10.5, 3.0), (12.5, 5.5),
+               (12.5, 10.5), (9.0, 15.0), (5.5, 10.5), (5.5, 5.5)]
+        poly([((x - 1.0) / 16.0, (y - 0.5) / 16.0) for x, y in pts], fill)
+        ell(0.42, 0.42, 0.07, 0.055, light)
+    else:   # 音符
+        ell(0.335, 0.735, 0.185, 0.135, fill)               # 符头
+        line([(0.505, 0.720), (0.505, 0.215)], fill, max(2, W * 0.075))
+        line([(0.505, 0.215), (0.700, 0.290), (0.760, 0.430)],
+             fill, max(2, W * 0.070))
+
+    # 旋转：在超采样画布上转，再降采样 —— 先缩后转会把锯齿一起转进去
+    if rot_step:
+        img = img.rotate(-360.0 * rot_step / rot_steps, resample=_BICUBIC,
+                         expand=False)
+    img = img.resize((size, size), _LANCZOS)
+    arr = np.asarray(img).astype(np.float32) * (1.0 / 255.0)
+    arr[..., :3] *= arr[..., 3:4]           # 直通 alpha -> 预乘
+    return np.ascontiguousarray(arr)
+
+
+def _text_sprite(text, font_name, size, color_hex, scale=1.0):
+    """把一行文字渲染成预乘 RGBA（带描边，保证在任何桌面底色上都读得清）。
+
+    字号按 `scale` 直接**重新渲染**而不是缩放位图 —— 文字是矢量轮廓，重渲染
+    比放大位图清楚得多，而且这里只在"弹出"的几个档位上各渲一次，成本可忽略。
+    """
+    px = max(8, int(round(size * scale)))
+    font = _font(font_name, px)
+    bgr = hex_to_bgr(color_hex)
+    rgb = (int(bgr[2]), int(bgr[1]), int(bgr[0]), 255)
+
+    # 先量尺寸（含描边留白），再按量到的尺寸建画布
+    tmp = _PImage.new("RGBA", (1, 1))
+    box = _PDraw.Draw(tmp).textbbox((0, 0), text, font=font,
+                                    stroke_width=max(1, px // 14))
+    pad = max(2, px // 6)
+    w = max(1, box[2] - box[0]) + pad * 2
+    h = max(1, box[3] - box[1]) + pad * 2
+    img = _PImage.new("RGBA", (w, h), (0, 0, 0, 0))
+    dr = _PDraw.Draw(img)
+    # 描边用半透明黑：亮字在浅色桌面上会糊掉，一圈描边把它托起来
+    dr.text((pad - box[0], pad - box[1]), text, font=font, fill=rgb,
+            stroke_width=max(1, px // 14), stroke_fill=(0, 0, 0, 190))
+
+    arr = np.asarray(img).astype(np.float32) * (1.0 / 255.0)
+    arr[..., :3] *= arr[..., 3:4]
+    return np.ascontiguousarray(arr)
+
+
+_FONT_FILES = {
+    "微软雅黑": "msyh.ttc",
+    "雅黑粗体": "msyhbd.ttc",
+    "黑体": "simhei.ttf",
+    "宋体": "simsun.ttc",
+    "楷体": "simkai.ttf",
+    "等线": "Deng.ttf",
+}
+_FONT_CACHE = {}
+
+
+def _font(name, px):
+    """按名字取字体。取不到就退回雅黑；雅黑也没有则让调用方去兜（返回默认）。"""
+    key = (name, px)
+    hit = _FONT_CACHE.get(key)
+    if hit is not None:
+        return hit
+    fname = _FONT_FILES.get(name, _FONT_FILES["微软雅黑"])
+    try:
+        f = _PImageFont.truetype(fname, px)
+    except Exception:
+        f = _PImageFont.truetype(_FONT_FILES["微软雅黑"], px)
+    if len(_FONT_CACHE) > 120:
+        _FONT_CACHE.clear()
+    _FONT_CACHE[key] = f
+    return f
+
+
+class _BurstEngine:
+    """点击粒子爆发的物理与上屏（不含配置解析）。
+
+    参数模型参考 pizzazz 那个点击特效库：一次点击炸开 `count` 个粒子，
+    速度方向随机（决定"散得多开"）、可加重力（像彩纸往下飘）、可自旋、
+    寿命内淡出。
+
+    做成独立的"引擎"而不是直接写进某个特效里，是因为**两个点击特效都要用**：
+    「点击表情」整个就是一次爆发，「点击文字」的彩带/星光装饰也是。
+    两个特效互斥（同时只开一个），但代码没有必要抄两份。
+    """
+
+    MAX = 200                   # 粒子池上限（一次爆发最多这么多）
+    ROT_STEPS = 12
+
+    def __init__(self, seed=71):
+        n = self.MAX
+        self.rng = np.random.default_rng(seed)
+        self.px = np.zeros(n, np.float32)
+        self.py = np.zeros(n, np.float32)
+        self.vx = np.zeros(n, np.float32)
+        self.vy = np.zeros(n, np.float32)
+        self.t = np.zeros(n, np.float32)
+        self.life = np.zeros(n, np.float32)
+        self.size = np.zeros(n, np.float32)
+        self.rot = np.zeros(n, np.float32)
+        self.spin = np.zeros(n, np.float32)
+        self.rgb = np.zeros((n, 3), np.float32)
+        self.count = 0              # 已用槽位数（紧凑存放，死掉的会被换到前面）
+
+    def active(self):
+        return self.count > 0
+
+    def reset(self):
+        self.count = 0
+
+    def spawn(self, x, y, shape, colors, count, size, spread, gravity,
+              rotate, life, up_bias=0.0, size_jitter=0.45):
+        """在 (x, y) 炸开一簇粒子。
+
+        `colors` 是 RGB 三元组列表（0~255）：单色图案传一个，彩带传一整盘，
+        每个粒子随机取一个。`up_bias` > 0 时整体偏向上方 —— 「点击文字」的
+        装饰要往文字那边飘，而不是均匀四散。
+        """
+        count = max(0, min(int(count), self.MAX))
+        if count == 0 or size <= 0:
+            return
+        # 池满时先让老粒子让位：点击是新事件，比正在淡出的旧粒子重要
+        if self.count + count > self.MAX:
+            self._drop_oldest(self.count + count - self.MAX)
+
+        idx = slice(self.count, self.count + count)
+        k = count
+        rng = self.rng
+        ang = rng.uniform(0.0, 2.0 * math.pi, k)
+        # 速度按 sqrt(uniform) 分布：均匀取半径会让粒子在中心堆成一坨，
+        # 开方之后才像"从中心均匀铺开的一张圆盘"
+        spd = spread * np.sqrt(rng.uniform(0.12, 1.0, k))
+        self.vx[idx] = (np.cos(ang) * spd).astype(np.float32)
+        self.vy[idx] = (np.sin(ang) * spd - up_bias * spread * 0.75).astype(np.float32)
+        self.px[idx] = float(x)
+        self.py[idx] = float(y)
+        self.t[idx] = 0.0
+        self.life[idx] = (life * rng.uniform(0.75, 1.25, k)).astype(np.float32)
+        self.size[idx] = (size * rng.uniform(1.0 - size_jitter,
+                                             1.0 + size_jitter, k)).astype(np.float32)
+        self.rot[idx] = rng.uniform(0.0, 2.0 * math.pi, k)
+        self.spin[idx] = ((rng.uniform(-1.0, 1.0, k) * 7.5) if rotate
+                          else np.zeros(k))
+        pal = np.asarray(colors, np.float32).reshape(-1, 3)
+        pick = rng.integers(0, len(pal), k)
+        self.rgb[idx] = pal[pick]
+        self._gravity = float(gravity)
+        self.count += count
+
+    def _drop_oldest(self, need):
+        """丢掉最老的 need 个粒子，给新粒子腾位置（把存活的后移压实）。"""
+        need = min(need, self.count)
+        if need <= 0:
+            return
+        keep = self.count - need
+        src = slice(need, self.count)
+        for arr in (self.px, self.py, self.vx, self.vy, self.t, self.life,
+                    self.size, self.rot, self.spin):
+            arr[:keep] = arr[src]
+        self.rgb[:keep] = self.rgb[src]
+        self.count = keep
+
+    def update(self, dt):
+        if self.count == 0:
+            return
+        n = self.count
+        sl = slice(0, n)
+        self.t[sl] += dt
+        if getattr(self, "_gravity", 0.0):
+            self.vy[sl] += 260.0 * dt
+        # 空气阻力：让粒子末段慢下来，比匀速飞出去自然（也顺手把速度压住，
+        # 免得长时间不点击后速度累积成天文数字）
+        damp = max(0.0, 1.0 - 1.6 * dt)
+        self.vx[sl] *= damp
+        self.vy[sl] *= damp
+        self.px[sl] += self.vx[sl] * dt
+        self.py[sl] += self.vy[sl] * dt
+        self.rot[sl] += self.spin[sl] * dt
+
+        dead = np.nonzero(self.t[sl] >= self.life[sl])[0]
+        if dead.size:
+            alive = np.nonzero(self.t[sl] < self.life[sl])[0]
+            m = alive.size
+            for arr in (self.px, self.py, self.vx, self.vy, self.t, self.life,
+                        self.size, self.rot, self.spin):
+                arr[:m] = arr[alive]
+            self.rgb[:m] = self.rgb[alive]
+            self.count = m
+
+    def draw(self, u32, w, h, opacity=1.0, tint=None):
+        """上屏。`tint` 非空时整簇用同一个颜色（点击表情的"主色"模式）。"""
+        if self.count == 0 or opacity <= 0.004:
+            return
+        for i in range(self.count):
+            t = float(self.t[i])
+            life = float(self.life[i])
+            if life <= 0.0:
+                continue
+            u = t / life
+            # 生灭包络：开场极快亮起、尾段渐渐淡出。两端都留一点缓冲，
+            # 否则粒子会"啪"地出现又"啪"地消失。
+            env = min(1.0, t / 0.06) * min(1.0, (1.0 - u) / 0.42)
+            a = opacity * max(0.0, env)
+            if a <= 0.01:
+                continue
+            r, g, b = (self.rgb[i] if tint is None else tint)
+            hexc = "#%02X%02X%02X" % (int(r), int(g), int(b))
+            shape = getattr(self, "_shape", "爱心")
+            step = int(round(float(self.rot[i]) / (2.0 * math.pi)
+                             * self.ROT_STEPS)) % self.ROT_STEPS
+            size = int(max(8, round(float(self.size[i]))))
+            # 颜色进缓存键：彩带逐粒子不同色，单色图案则整簇共用一条缓存
+            spr = _shape_sprite(shape, hexc, size, step, self.ROT_STEPS)
+            S = spr.shape[0]
+            x0 = int(round(float(self.px[i]) - S * 0.5))
+            y0 = int(round(float(self.py[i]) - S * 0.5))
+            gx0, gy0 = max(0, x0), max(0, y0)
+            gx1, gy1 = min(int(w), x0 + S), min(int(h), y0 + S)
+            if gx1 <= gx0 or gy1 <= gy0:
+                continue
+            sub = spr[gy0 - y0:gy1 - y0, gx0 - x0:gx1 - x0]
+            aa = sub[:, :, 3] * a
+            if not (aa > 0.004).any():
+                continue
+            dst = u32.reshape(int(h), int(w))[gy0:gy1, gx0:gx1]
+            _over_blend(dst, sub, aa, 255.0 * a)
+
+
+# 「弹出」的几个缩放档位（直接按不同字号重渲染，不是缩放位图）。
+# 中段 1.08 是一次**过冲** —— 正是它给出"啵"地弹出来的手感，线性放大到 1
+# 会显得很平。
+_TEXT_POP_STEPS = (0.55, 0.78, 0.95, 1.08, 1.00)
+_TEXT_CACHE = {}
+_TEXT_CACHE_MAX = 60
+
+
+def _text_sprites(text, font_name, size, color_hex):
+    """取一行文字的 5 档缩放精灵（预乘 RGBA 列表），带缓存。"""
+    key = (text, font_name, int(size), color_hex)
+    hit = _TEXT_CACHE.get(key)
+    if hit is not None:
+        return hit
+    if len(_TEXT_CACHE) > _TEXT_CACHE_MAX:
+        _TEXT_CACHE.clear()
+    out = [_text_sprite(text, font_name, int(size), color_hex, s)
+           for s in _TEXT_POP_STEPS]
+    _TEXT_CACHE[key] = out
+    return out
+
+
+class ClickEmojiField:
+    """点击表情：每点一下在光标处炸开一簇图案。
+
+    与「鼠标拖动特效」的区别在于触发方式 —— 它不是跟着光标连续铺开，而是
+    **一次点击一个瞬时爆发**。参数模型参考 pizzazz 那个点击特效库
+    （数量 / 尺寸 / 扩散 / 重力 / 自旋），但图案全部由代码绘制。
+
+    粒子物理与上屏在 `_BurstEngine` 里（「点击文字」的装饰也用它）。
+    """
+
+    def __init__(self, w, h, seed=73):
+        self.rng = np.random.default_rng(seed)
+        self.w, self.h = w, h
+        self._mx = w * 0.5
+        self._my = h * 0.5
+        self._clicked = 0
+        self.engine = _BurstEngine(seed=seed)
+
+    def set_pointer(self, x, y, clicked=0):
+        self._mx = float(x)
+        self._my = float(y)
+        if clicked:
+            self._clicked = int(clicked)
+
+    def resize(self, w, h):
+        self.w, self.h = w, h
+
+    def reset(self):
+        self.engine.reset()
+        self._clicked = 0
+
+    def active(self):
+        return self.engine.active()
+
+    def update(self, dt, cfg):
+        dt = min(max(float(dt), 0.0), 0.05)
+        clicked = self._clicked
+        self._clicked = 0
+        if clicked:
+            shape = str(cfg.get("click_emoji_shape", _SHAPE_NAMES[0]))
+            if shape not in _SHAPE_NAMES:
+                shape = _SHAPE_NAMES[0]
+            # 彩带忽略主色：单色彩带看着像一堆纸片，多彩才有"彩带"感。
+            # 这一点在面板上写明了，免得用户以为色块坏了。
+            if shape == "彩带":
+                colors = [_hex_rgb(c) for c in _CONFETTI_COLORS]
+            else:
+                colors = [_hex_rgb(str(cfg.get("click_emoji_color",
+                                                "#FF6B8E")))]
+            self.engine._shape = shape
+            self.engine.spawn(
+                self._mx, self._my, shape, colors,
+                count=int(cfg.get("click_emoji_count", 12)),
+                size=float(cfg.get("click_emoji_size", 22)),
+                spread=float(cfg.get("click_emoji_spread", 90)),
+                gravity=float(cfg.get("click_emoji_gravity", 1.0)),
+                rotate=bool(cfg.get("click_emoji_rotate", True)),
+                life=float(cfg.get("click_emoji_life", 1.1)))
+        self.engine.update(dt)
+
+    def draw(self, u32, w, h, cfg):
+        op = float(np.clip(float(cfg.get("click_emoji_opacity", 1.0)), 0.0, 1.0))
+        self.engine.draw(u32, w, h, op)
+
+
+class ClickTextField:
+    """点击文字：点击处弹出文字并上飘淡出，可内嵌彩带 / 星光。
+
+    * **多个文字**：配置里一行一个，每次点击**轮换**取下一个 —— 轮换而不是
+      随机，是为了让"我配了三条"能一眼确认三条都生效了。
+    * **弹出**：开头按 5 档字号递进（中段有轻微过冲），不是缩放位图 ——
+      文字是矢量轮廓，按字号重渲染才清楚。
+    * **可读性**：文字带半透明描边，否则白字落在浅色桌面上会糊掉。
+    * **装饰**：彩带 / 星光复用 `_BurstEngine`，`up_bias` 让它们整体偏上，
+      朝着文字飘而不是均匀四散。
+    """
+
+    def __init__(self, w, h, seed=79):
+        self.rng = np.random.default_rng(seed)
+        self.w, self.h = w, h
+        self._mx = w * 0.5
+        self._my = h * 0.5
+        self._clicked = 0
+        self.pops = []              # [{x, y, t, life, idx}]
+        self._next_idx = 0          # 多条文字轮换用的游标
+        self.deco = _BurstEngine(seed=seed + 1)
+        self._failed = False
+
+    def set_pointer(self, x, y, clicked=0):
+        self._mx = float(x)
+        self._my = float(y)
+        if clicked:
+            self._clicked = int(clicked)
+
+    def resize(self, w, h):
+        self.w, self.h = w, h
+
+    def reset(self):
+        self.pops = []
+        self.deco.reset()
+        self._clicked = 0
+        self._next_idx = 0
+
+    def active(self):
+        return bool(self.pops) or self.deco.active()
+
+    @staticmethod
+    def texts_of(cfg):
+        """把配置里的多行文字解析成列表（去空行、去首尾空白）。"""
+        raw = str(cfg.get("click_text_list", ""))
+        return [s.strip() for s in raw.replace("\r", "\n").split("\n")
+                if s.strip()]
+
+    def update(self, dt, cfg):
+        if self._failed:
+            return
+        dt = min(max(float(dt), 0.0), 0.05)
+        clicked = self._clicked
+        self._clicked = 0
+        life = max(0.2, float(cfg.get("click_text_life", 1.4)))
+
+        if clicked:
+            texts = self.texts_of(cfg)
+            if texts:
+                self.pops.append({
+                    "x": float(self._mx), "y": float(self._my), "t": 0.0,
+                    "life": life, "idx": self._next_idx % len(texts),
+                })
+                self._next_idx = (self._next_idx + 1) % len(texts)
+            # 装饰：与文字同一个爆发点，整体偏上
+            deco = str(cfg.get("click_text_deco", "彩带"))
+            if deco != "无":
+                if deco == "星光":
+                    shape, colors, grav, rot = (
+                        "星星", [_hex_rgb(str(cfg.get("click_text_color",
+                                                      "#FFFFFF")))], 0.0, True)
+                else:
+                    shape, colors, grav, rot = (
+                        "彩带", [_hex_rgb(c) for c in _CONFETTI_COLORS], 1.0,
+                        True)
+                self.deco._shape = shape
+                self.deco.spawn(
+                    self._mx, self._my, shape, colors,
+                    count=14, size=float(cfg.get("click_text_size", 34)) * 0.62,
+                    spread=95.0, gravity=grav, rotate=rot, life=life,
+                    up_bias=0.45)
+
+        if self.pops:
+            for pp in self.pops:
+                pp["t"] += dt
+            self.pops = [pp for pp in self.pops if pp["t"] < pp["life"]]
+        self.deco.update(dt)
+
+    def draw(self, u32, w, h, cfg):
+        if self._failed:
+            return
+        op = float(np.clip(float(cfg.get("click_text_opacity", 1.0)), 0.0, 1.0))
+        if self.pops and op > 0.004:
+            try:
+                texts = self.texts_of(cfg)
+                font_name = str(cfg.get("click_text_font", "微软雅黑"))
+                size = float(cfg.get("click_text_size", 34))
+                color = str(cfg.get("click_text_color", "#FFFFFF"))
+                rise = float(cfg.get("click_text_rise", 90))
+                for pp in self.pops:
+                    if pp["idx"] >= len(texts):
+                        continue
+                    steps = _text_sprites(texts[pp["idx"]], font_name,
+                                          size, color)
+                    u = pp["t"] / max(pp["life"], 1e-4)
+                    # 选缩放档：弹出段走 5 档递进，之后固定最大档
+                    si = min(len(steps) - 1,
+                             int(pp["t"] / 0.055)) if pp["t"] < 0.22 else len(steps) - 1
+                    spr = steps[max(0, si)]
+                    # 上飘用 ease-out：开头冲上去、末段慢下来，比匀速自然
+                    ease = 1.0 - (1.0 - min(1.0, u)) ** 2
+                    alpha = min(1.0, pp["t"] / 0.08) \
+                        * min(1.0, (1.0 - u) / 0.35)
+                    a = op * max(0.0, alpha)
+                    if a <= 0.01:
+                        continue
+                    self._blit(u32, w, h, spr, pp["x"], pp["y"] - rise * ease, a)
+            except Exception:
+                # 只报一次：反复抛会耗光"连续失败"配额把整个渲染线程熔断，
+                # 一个文字效果画不出来不该让雨也停。
+                self._failed = True
+                raise
+        self.deco.draw(u32, w, h, op)
+
+    def _blit(self, u32, w, h, img, cx, cy, a):
+        S = img.shape[0]
+        x0 = int(round(cx - S * 0.5))
+        y0 = int(round(cy - S * 0.5))
+        gx0, gy0 = max(0, x0), max(0, y0)
+        gx1, gy1 = min(int(w), x0 + S), min(int(h), y0 + S)
+        if gx1 <= gx0 or gy1 <= gy0:
+            return
+        sub = img[gy0 - y0:gy1 - y0, gx0 - x0:gx1 - x0]
+        aa = sub[:, :, 3] * a
+        if not (aa > 0.004).any():
+            return
+        dst = u32.reshape(int(h), int(w))[gy0:gy1, gx0:gx1]
+        _over_blend(dst, sub, aa, 255.0 * a)
+
+
+def _hex_rgb(hex_str):
+    """#RRGGBB -> (R, G, B) 的 0~255 整数三元组。"""
+    bgr = hex_to_bgr(hex_str)
+    return (int(bgr[2]), int(bgr[1]), int(bgr[0]))
 
 
 # ------------------------------------------------------------------ 聚光灯
