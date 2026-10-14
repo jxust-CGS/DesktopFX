@@ -314,8 +314,10 @@ def main():
     check("win_h" not in saved, f"自适应后 ui_state 里没有 win_h：{saved}")
     check(saved.get("win_w") == p.W,
           f"自适应高度不改宽度：{saved.get('win_w')} == {p.W}")
-    check(p.H == p._clamp_h(max(p.H_MIN, p._content_h + p._chrome)),
-          f"自适应高度 {p.H} = 内容 {p._content_h} + chrome {p._chrome}")
+    check(p.H == p._clamp_h(max(p.H_MIN, p._content_h + p._chrome
+                                + p._fab_clear())),
+          f"自适应高度 {p.H} = 内容 {p._content_h} + chrome {p._chrome}"
+          f" + 操作条让位 {p._fab_clear()}")
     sr = p._size_rows["win_h"]
     check(int(sr["var"].get()) == p.H and sr["label"].cget("text") == f"{p.H} 像素",
           f"自适应后「窗口高度」显示 {sr['label'].cget('text')!r}"
@@ -365,7 +367,8 @@ def main():
     fx_ui._UI_STATE_PATH = fresh
     p3 = fx_ui.ControlPanel(_StubApp())
     p3.root.update()
-    expect_h = p3._clamp_h(max(p3.H_MIN, p3._content_h + p3._chrome))
+    expect_h = p3._clamp_h(max(p3.H_MIN, p3._content_h + p3._chrome
+                               + p3._fab_clear()))
     check(p3.W == p3.W_DEF, f"默认宽度 {p3.W}（期望 {p3.W_DEF}）")
     check(p3.H == expect_h,
           f"默认高度按内容自适应 {p3.H}（期望 {expect_h}）")

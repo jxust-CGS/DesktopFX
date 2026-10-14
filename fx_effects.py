@@ -19,6 +19,7 @@ import time
 import numpy as np
 
 from _win32 import user32, HANDLE, INT, SHORT
+from _paths import res_path as _res_path
 
 # 宠物跟随的卡通形象用 PIL 画（超采样 + LANCZOS，与 fx_ui._render_aa 同一套
 # 先例）：三角耳朵 / 多段尾巴 / 细胡须这类形状用绘图原语表达要干净得多。
@@ -1132,6 +1133,19 @@ class Lightning:
 class MouseProbe:
     VK_LBUTTON = 0x01
     VK_RBUTTON = 0x02
+    # 「键盘点击」要监听的键。只认"输入字符 / 打字"那批键，不认 Ctrl/Shift
+    # 这类纯修饰键 —— 按住 Shift 打大写字母会连响两下。
+    _KEY_VKS = (0x08, 0x09, 0x0D, 0x20, 0x25, 0x26, 0x27, 0x28,
+                0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,
+                0x38, 0x39, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46,
+                0x47, 0x48, 0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E,
+                0x4F, 0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56,
+                0x57, 0x58, 0x59, 0x5A,
+                0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67,
+                0x68, 0x69, 0x6A, 0x6B, 0x6C, 0x6D, 0x6E, 0x6F,
+                0x6A, 0x6B, 0x6D, 0x6E, 0x6F, 0x70, 0x71, 0x72, 0x73,
+                0xBA, 0xBB, 0xBC, 0xBD, 0xBE, 0xBF, 0xC0,
+                0xDB, 0xDC, 0xDD, 0xDE)
 
     def __init__(self):
         self.pt = wt.POINT()
@@ -1141,8 +1155,10 @@ class MouseProbe:
         self.prev_y = 0
         self._lb = False
         self._rb = False
+        self._keys_down = 0
         self.acc = 0.0
         self.clicked = 0        # 1=左键 2=右键
+        self.key_clicked = 0    # 本帧按下的键数（键盘点击音效用）
         self.speed = 0.0
         self.mx = self.x
         self.my = self.y
@@ -1158,8 +1174,12 @@ class MouseProbe:
         self.prev_x, self.prev_y = self.x, self.y
         self.x, self.y = int(self.pt.x), int(self.pt.y)
 
-    def update(self, dt, ov_x, ov_y):
-        """折算到覆盖层坐标系（虚拟屏幕左上角为原点）。"""
+    def update(self, dt, ov_x, ov_y, keys=False):
+        """折算到覆盖层坐标系（虚拟屏幕左上角为原点）。
+
+        `keys=True` 时才去查键盘（`GetAsyncKeyState` 每键一次内核调用，
+        80 个键就是 80 次 —— 没人开键盘点击音效时这笔钱不该付）。
+        """
         self._probe()
         dx = self.x - self.prev_x
         dy = self.y - self.prev_y
@@ -1174,6 +1194,20 @@ class MouseProbe:
         elif rb and not self._rb:
             self.clicked = 2
         self._lb, self._rb = lb, rb
+
+        self.key_clicked = 0
+        if keys:
+            n = 0
+            for vk in self._KEY_VKS:
+                # 只看 0x8000（当前按下）；**不能用 0x0001（"本帧按过"）** ——
+                # 那个标志要靠 PeekMessage 消费消息才会更新，而本进程根本没有
+                # 消息循环处理键盘，标志会一直挂着。
+                if user32.GetAsyncKeyState(vk) & 0x8000:
+                    n += 1
+            # 多键同按（比如方向键 + 字母）只算一次触发，不然一个字打下来
+            # 会叠着一串音效
+            self.key_clicked = 1 if n > self._keys_down else 0
+            self._keys_down = n
 
         self.mx = self.x - ov_x
         self.my = self.y - ov_y
@@ -4038,6 +4072,17 @@ CLICK_PICK_MULTI = "随机多图"       # 每颗粒子各自随机
 CLICK_PICK_ONE = "整簇同图"         # 一次点击只用同一张
 CLICK_PICKS = (CLICK_PICK_MULTI, CLICK_PICK_ONE)
 
+# 用图片当图案时，精灵朝哪边。
+#   竖直       = 保持图片原朝向（默认）；
+#   随扩散方向 = 图片跟着自己飞出去的方向转。
+CLICK_ALIGN_VERTICAL = "竖直"
+CLICK_ALIGN_SPREAD = "随扩散方向"
+CLICK_ALIGNS = (CLICK_ALIGN_VERTICAL, CLICK_ALIGN_SPREAD)
+# 旋转角的量化档数。**必须量化**：旋转一张位图要走一次重采样，逐帧逐粒子
+# 现转的话（40 颗粒子 × 60 帧）光这一项就能吃掉半帧；量化成 12 档之后，
+# 同一次爆发里各颗粒子最多只多认 12 张缓存，第二次点击起就全是命中。
+CLICK_ALIGN_ROT_STEPS = 12
+
 
 def normalize_source(value):
     """来源值归一化（含把旧的「自定义图片」认成「图片文件夹」）。"""
@@ -4644,16 +4689,159 @@ class VoicePlayer:
         finally:
             try:
                 _mci_send("close %s" % _VOICE_ALIAS)
-            except Exception:
-                pass
-            # 无论怎么结束都要放行 —— 少了这一步就"只响一次，之后永远是忙"
-            with self._lock:
-                self._busy = False
+            finally:
+                with self._lock:
+                    self._busy = False
+
+
+# ---------------------------------------------------------------- 点击音效
+# 「鼠标点击音效」是一个**独立的特效分类**：它不画任何像素，只负责"点一下
+# 响一声"。与「点击表情 / 点击文字」里那两个语音来源的区别在于它跟画什么
+# 无关 —— 想只要声音、不要任何图案时用它。
+#
+# 音效来源三档，与图案来源同一套语义（内置 / 单文件 / 文件夹）：
+#   内置音效  -> assets/sfx 里的那几个（随程序打包，开箱就能响）
+#   单个音效  -> 用户挑的某一个文件，每次点击都响它
+#   音效文件夹 -> 每次点击从整个文件夹里随机挑一条
+SFX_SOURCE_BUILTIN = "内置音效"
+SFX_SOURCE_FILE = "单个音效"
+SFX_SOURCE_FOLDER = "音效文件夹"
+SFX_SOURCES = (SFX_SOURCE_BUILTIN, SFX_SOURCE_FILE, SFX_SOURCE_FOLDER)
+# 旧取值 / 界面改名前留下的写法，归一化时一并认掉
+SFX_SOURCE_LEGACY = {"内置": SFX_SOURCE_BUILTIN,
+                     "自定义音效": SFX_SOURCE_FOLDER,
+                     "自定义声音": SFX_SOURCE_FOLDER}
+
+
+def normalize_sfx_source(value):
+    """音效来源归一化；未知取值 -> 内置音效。"""
+    s = str(value or "")
+    if s in SFX_SOURCES:
+        return s
+    return SFX_SOURCE_LEGACY.get(s, SFX_SOURCE_BUILTIN)
+
+
+def builtin_sfx_dir():
+    """内置音效目录（`assets/sfx`）。
+
+    `res_path` 会优先取 PyInstaller 解包目录，所以打包后照样找得到。
+    """
+    return _res_path(os.path.join("assets", "sfx"))
+
+
+def list_builtin_sfx():
+    """内置音效的路径列表（按文件名排序）。"""
+    return _scan_files(builtin_sfx_dir(), _AUDIO_EXTS)
+
+
+def sfx_target(cfg):
+    """配置 -> `(要用的音频列表, 是否随机取)`。
+
+    与 `click_source_target` 同一个套路：把这层判断收在一处，场景、面板、
+    测试共用。列表为空 = 这一档没配到东西（调用方回退内置音效）。
+    """
+    src = normalize_sfx_source(cfg.get("click_sfx_source", SFX_SOURCE_BUILTIN))
+    if src == SFX_SOURCE_FILE:
+        p = str(cfg.get("click_sfx_file", "") or "")
+        return ([p] if p and os.path.isfile(p) else []), False
+    if src == SFX_SOURCE_FOLDER:
+        return list_audio(cfg.get("click_sfx_dir", "")), True
+    # 内置：挑定的那一个优先；没挑（或那个文件被删了）就全部随机
+    items = list_builtin_sfx()
+    want = str(cfg.get("click_sfx_builtin", "") or "")
+    if want:
+        for p in items:
+            if os.path.basename(p) == want:
+                return [p], False
+    return items, True
+
+
+def sfx_label(path):
+    """音效路径 -> 界面上显示的名字（去扩展名、去音轨号）。"""
+    return audio_label(path)
+
+
+def builtin_sfx_names():
+    """内置音效的显示名列表（界面上那排按钮用）。"""
+    return [audio_label(p) for p in list_builtin_sfx()]
+
+
+class ClickSfx:
+    """鼠标点击音效：**不画任何像素**，只在"点一下"时响一声。
+
+    做成独立的特效（独立分类、独立开关）而不是塞进「点击表情」页，是因为
+    它跟画什么完全无关 —— 只想要声音、不要图案/文字是常见需求。
+
+    播放复用与两个点击特效**同一个 `VoicePlayer`**：一次点击只响一声，
+    上一段没播完时新的点击直接丢弃（不排队、更不叠着放）。
+    """
+
+    def __init__(self, player, seed=89):
+        self.player = player
+        self._rng = random.Random(seed)
+        self._played = 0
+
+    def reset(self):
+        """本特效没有任何可残留的视觉状态 —— 留着是为了与别的特效同签名。"""
+
+    def active(self):
+        """永远返回 False：它不上屏，不该让鼠标层白提交一帧。"""
+        return False
+
+    def trigger(self, cfg):
+        """一次点击（鼠标或键盘）到了，按来源放一段。返回是否真的播了。"""
+        items, _rand = sfx_target(cfg)
+        if not items:
+            return False
+        if self.player.play_path(self._rng.choice(items)):
+            self._played += 1
+            return True
+        return False
+
+    def stats(self):
+        return self._played
+
+
+# 旋转过的精灵缓存：{(id(原帧), 档位): (原帧, 旋转后)}。
+# 键里带着**原帧对象本身**，是为了让 id() 复用不会撞车（原帧只要还在缓存里
+# 就不会被回收，id 也就不会被别的对象占用）。
+_ROT_CACHE = {}
+_ROT_CACHE_MAX = 512
+
+
+def _rotate_premul(spr, step, steps=CLICK_ALIGN_ROT_STEPS):
+    """把预乘 RGBA float32 精灵旋转 `step/steps` 圈（顺时针），带缓存。
+
+    顺时针而不是逆时针：屏幕坐标 y 朝下，"飞向右边"的粒子要把它原本朝上的
+    图头转成朝右，在视觉上就是顺时针转 90°。
+
+    预乘数据**可以直接**交给 PIL 逐通道重采样：预乘表示本来就是线性的，
+    通道插值恰好等于"先合成再插值"的正确结果；换成直通 alpha 反而会在边缘
+    渗出半透明的错色。
+    """
+    if _PImage is None or spr is None:
+        return spr
+    key = (id(spr), int(step) % int(steps))
+    hit = _ROT_CACHE.get(key)
+    if hit is not None:
+        return hit[1]
+    ang = 360.0 * (int(step) % int(steps)) / float(steps)
+    if ang <= 0.0:
+        out = spr
+    else:
+        if len(_ROT_CACHE) > _ROT_CACHE_MAX:
+            _ROT_CACHE.clear()
+        u8 = np.clip(spr * 255.0 + 0.5, 0, 255).astype(np.uint8)
+        im = _PImage.fromarray(u8, "RGBA").rotate(-ang, resample=_BICUBIC,
+                                                  expand=True)
+        out = np.ascontiguousarray(
+            np.asarray(im).astype(np.float32) * (1.0 / 255.0))
+    _ROT_CACHE[key] = (spr, out)
+    return out
 
 
 class _BurstEngine:
     """点击粒子爆发的物理与上屏（不含配置解析）。
-
     参数模型参考 pizzazz 那个点击特效库：一次点击炸开 `count` 个粒子，
     速度方向随机（决定"散得多开"）、可加重力（像彩纸往下飘）、可自旋、
     寿命内淡出。
@@ -4686,6 +4874,13 @@ class _BurstEngine:
         # 各按各的节奏循环。不做成"每颗粒子各自的相位"是因为那样得为每个
         # 粒子再加一个时间数组；而同一次点击的粒子本来就该看起来整齐。
         self._anim_t = 0.0
+        self._gravity = 0.0
+        self._shape = "爱心"        # 内置图案路径当前用的形状（由 spawn 的调用方设）
+        # 自定义素材路径是否要按飞行方向旋转精灵（「图片方向随扩散方向」）。
+        # **实例级的开关而不是参数**：它只在 draw 里用一次，而 draw 每帧都被
+        # 调用、spawn 只在点击那一帧调用 —— 放在这里不必给 draw 再加参数，
+        # 也不必每帧从 cfg 里重新解析。
+        self._img_align = False
         self.count = 0              # 已用槽位数（紧凑存放，死掉的会被换到前面）
 
     def active(self):
@@ -4695,7 +4890,8 @@ class _BurstEngine:
         self.count = 0
 
     def spawn(self, x, y, shape, colors, count, size, spread, gravity,
-              rotate, life, up_bias=0.0, size_jitter=0.45, spr_ids=None):
+              rotate, life, up_bias=0.0, size_jitter=0.45, spr_ids=None,
+              align=False):
         """在 (x, y) 炸开一簇粒子。
 
         `colors` 是 RGB 三元组列表（0~255）：单色图案传一个，彩带传一整盘，
@@ -4704,6 +4900,11 @@ class _BurstEngine:
 
         `spr_ids` 给定（长度 = count）时这簇改用**外部精灵表**上屏（自定义
         表情包），`shape` / `colors` 都不再参与绘制，只为保持调用形状一致。
+
+        `align=True` 时把每个粒子的 `rot` 写成**它自己飞出去的方向**的量化档
+        （而不是随机角），上屏时据此把精灵转过去。"图片方向随扩散方向"靠它。
+        spin 在这条路径上恒为 0，所以 `rot` 写进去是多少就一直是那个值，不必
+        每帧重算方向。
         """
         count = max(0, min(int(count), self.MAX))
         if count == 0 or size <= 0:
@@ -4727,7 +4928,14 @@ class _BurstEngine:
         self.life[idx] = (life * rng.uniform(0.75, 1.25, k)).astype(np.float32)
         self.size[idx] = (size * rng.uniform(1.0 - size_jitter,
                                              1.0 + size_jitter, k)).astype(np.float32)
-        self.rot[idx] = rng.uniform(0.0, 2.0 * math.pi, k)
+        if align:
+            # 屏幕坐标 y 朝下：精灵原本"朝上"对应角度 -90°，要让图头指向
+            # 飞行方向 ang，顺时针得转 ang + 90°，量化成 12 档。
+            step = np.floor((ang + math.pi * 0.5) / (2.0 * math.pi)
+                            * CLICK_ALIGN_ROT_STEPS + 0.5)
+            self.rot[idx] = (step % CLICK_ALIGN_ROT_STEPS).astype(np.float32)
+        else:
+            self.rot[idx] = rng.uniform(0.0, 2.0 * math.pi, k)
         self.spin[idx] = ((rng.uniform(-1.0, 1.0, k) * 7.5) if rotate
                           else np.zeros(k))
         pal = np.asarray(colors, np.float32).reshape(-1, 3)
@@ -4819,6 +5027,10 @@ class _BurstEngine:
                 # `counts == 1` 那条分支，等于直接返回）。
                 spr = anim.frame_at(j, self._anim_t) if anim is not None \
                     else imgs[j]
+                # 「图片方向随扩散方向」：按粒子飞出去的方向把图转过去。
+                # 档位在 spawn 时就算好了（写在 rot 里），这里只是一次缓存查表。
+                if self._img_align:
+                    spr = _rotate_premul(spr, self.rot[i])
             else:
                 r, g, b = (self.rgb[i] if tint is None else tint)
                 hexc = "#%02X%02X%02X" % (int(r), int(g), int(b))
@@ -4952,6 +5164,10 @@ class ClickEmojiField:
         else:
             colors = [_hex_rgb(color)]
         self.engine._shape = shape
+        # 内置图案各向同性（爱心/星星怎么转都一样），而且它自带 12 档旋转
+        # 缓存 —— 这里必须显式关掉图片那条旋转路径，否则上一次"随扩散方向"
+        # 留下的开关会让内置图案也去吃一次位图旋转。
+        self.engine._img_align = False
         self.engine.spawn(
             self._mx, self._my, shape, colors,
             count=int(cfg.get("click_emoji_count", 12)),
@@ -4970,6 +5186,8 @@ class ClickEmojiField:
 
         不自旋、不做尺寸抖动 —— 图片精灵不是矢量，两者都要重采样；而"图
         随机 × 池子里两档尺寸"本来就提供了同样的视觉变化，白付那笔账不划算。
+        例外是「图片方向随扩散方向」：那个旋转是**用户明确要的**，量化成
+        12 档 + 缓存之后，一次爆发最多多认 12 张图，第二次点击起全是命中。
         """
         count = max(0, min(int(cfg.get("click_emoji_count", 12)),
                            self.engine.MAX))
@@ -4980,6 +5198,9 @@ class ClickEmojiField:
             ids = np.full(count, int(self.rng.integers(0, n)), np.int32)
         else:
             ids = self.rng.integers(0, n, count)
+        align = str(cfg.get("click_emoji_align", CLICK_ALIGN_VERTICAL)) \
+            == CLICK_ALIGN_SPREAD
+        self.engine._img_align = align
         self.engine.spawn(
             self._mx, self._my, "", [(255, 255, 255)],
             count=count,
@@ -4989,7 +5210,8 @@ class ClickEmojiField:
             rotate=False,
             life=float(cfg.get("click_emoji_life", 1.1)),
             size_jitter=0.0,
-            spr_ids=ids)
+            spr_ids=ids,
+            align=align)
         self._imgs = sprites
 
     def update(self, dt, cfg):

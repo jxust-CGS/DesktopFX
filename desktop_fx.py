@@ -179,6 +179,12 @@ DEFAULTS = {
     # 一次点击里怎么用这些素材：随机多图 = 每颗粒子各自随机；
     # 整簇同图 = 一次点击只用同一张（动图尤其明显：十几个粒子同步播同一段）。
     "click_emoji_pick": "随机多图",
+    # 用图片当图案时，精灵朝哪边：
+    #   竖直       = 保持图片原来的朝向（默认，最像"贴纸撒开"）；
+    #   随扩散方向 = 图片跟着自己飞出去的方向转（飞向哪边就朝哪边），
+    #                画出来是一条条"甩出去"的轨迹，动感强得多。
+    # 内置图案不受影响（它本来就是各向同性的形状）。
+    "click_emoji_align": "竖直",
     "click_emoji_shape": "爱心",
     "click_emoji_count": 12.0,      # 一次点击炸开几个
     "click_emoji_size": 22.0,       # 单个图案的像素尺寸
@@ -218,6 +224,21 @@ DEFAULTS = {
     # 排队会让连点变成一串越来越滞后的拖音。
     "click_voice_enabled": False,
     "click_voice_dir": "",
+    # ---- 点击音效（独立特效「点击音效」，与上面那个语音包不是同一件事）----
+    # 上面 `click_voice_*` 是挂在「点击表情」页里的语音，这里则是**一个独立
+    # 的特效分类**：不画任何像素，只负责"点一下响一声"。两者的差别在用途 ——
+    # 只想要声音、不要任何图案/文字时用这一个。
+    # 三个来源：内置音效（随程序打包的 assets/sfx）/ 单个音效文件 / 音效文件夹
+    # 随机。后两档与图案来源同一套语义。
+    "click_sfx_enabled": False,
+    "click_sfx_source": "内置音效",
+    # 内置音效里挑定的那一个（存文件名）；留空 = 每次从全部内置里随机
+    "click_sfx_builtin": "",
+    "click_sfx_file": "",            # 「单个音效」用的那一个文件
+    "click_sfx_dir": "",             # 「音效文件夹」用的目录（每次随机取一条）
+    # 键盘敲击也触发（默认关）：开着时打字每按一次键也会响一声。
+    # 只认"能出字符"的那批键，Ctrl / Shift 这类修饰键不算。
+    "click_sfx_keyboard": False,
     # ---- 窗口水波（窗口移动 / 缩放 / 最小化 / 恢复时扰动水面）----
     # 它**不自己画**：窗口只是水面的一个扰动源 —— 和鼠标共用同一片水（见
     # WaterRippleField.push_rect / dome_rect），所以这里只剩"扰动多大、多宽"
@@ -543,6 +564,27 @@ PRESETS = {
                  click_emoji_life=1.3, click_emoji_color="#A78BFA",
                  click_emoji_gravity=-0.5, click_emoji_rotate=True,
                  click_emoji_opacity=1.0),
+    # ---- 点击音效（独立分类：不画像素，只发声）----
+    # 三个内置音效各给一个预设：开箱就能试听出差别，不用先去配路径。
+    # 都显式关掉全屏特效（与上面几个预设同一个理由：预设是"整套方案"）。
+    "青轴打字音": dict(rain_enabled=False, snow_enabled=False,
+                 petal_enabled=False, meteor_enabled=False,
+                 click_sfx_enabled=True, click_sfx_source="内置音效",
+                 click_sfx_builtin="青轴.wav",
+                 click_sfx_file="", click_sfx_dir="",
+                 click_sfx_keyboard=True),
+    "木鱼": dict(rain_enabled=False, snow_enabled=False,
+               petal_enabled=False, meteor_enabled=False,
+               click_sfx_enabled=True, click_sfx_source="内置音效",
+               click_sfx_builtin="木鱼2.wav",
+               click_sfx_file="", click_sfx_dir="",
+               click_sfx_keyboard=False),
+    "水滴": dict(rain_enabled=False, snow_enabled=False,
+               petal_enabled=False, meteor_enabled=False,
+               click_sfx_enabled=True, click_sfx_source="内置音效",
+               click_sfx_builtin="水滴声.wav",
+               click_sfx_file="", click_sfx_dir="",
+               click_sfx_keyboard=False),
     # ---- 点击文字 ----
     # 三路内容：日常夸夸 / 网络梗 / 职场黑话。字体、颜色、装饰都跟着内容走，
     # 换预设不只是换几个字 —— 同一个"打字弹出"在不同字体下的气质差很远。
@@ -627,6 +669,7 @@ PRESET_GROUPS = {
     # ---- 点击特效 ----
     "点击表情": ["爱心雨", "彩带庆祝", "星光闪烁", "花瓣纷飞", "雪花飘落",
                "泡泡上浮", "烈焰升腾", "音符跳动"],
+    "点击音效": ["青轴打字音", "木鱼", "水滴"],
     "点击文字": ["好耶", "绝绝子", "破防了", "冲鸭", "打工人",
                "互联网黑话", "古风", "简洁无装饰"],
 }

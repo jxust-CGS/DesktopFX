@@ -216,8 +216,10 @@ def test_layer_taxonomy():
           if e.get("layer") == "fullscreen"}
     ms = {n for n, e in fx_kinds.EFFECTS.items() if e.get("layer") == "mouse"}
     want_fs = {"下雨", "下雪", "落樱", "流星雨"}
+    # 「点击音效」不画像素，但它是鼠标事件驱动的，归在鼠标层语义最顺
+    # （它 active() 恒 False，不会让鼠标层白提交帧 —— 由 _verify_click 守）
     want_ms = {"聚光灯", "颜料盘", "宠物跟随", "涟漪", "真实水波",
-               "点击表情", "点击文字", "窗口水波"}
+               "点击表情", "点击文字", "点击音效", "窗口水波"}
     if fs != want_fs:
         return False, f"全屏层归类变了：{sorted(fs)}（期望 {sorted(want_fs)}）"
     if ms != want_ms:
@@ -236,7 +238,7 @@ def test_layer_taxonomy():
         return False, "未知特效的 layer_of 应当返回 None"
     return True, ("全屏特效开关 → 下雨/下雪/落樱/流星雨；"
                   "鼠标特效开关 → 聚光灯/颜料盘/宠物跟随/涟漪/真实水波/"
-                  "点击表情/点击文字/窗口水波")
+                  "点击表情/点击文字/点击音效/窗口水波")
 
 
 # ------------------------------------------------------------------ 2. 非法值归一

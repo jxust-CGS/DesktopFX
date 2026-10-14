@@ -14,7 +14,7 @@ import numpy as np
 
 from fx_effects import (RainField, RippleField, MeteorField, MouseProbe,
                         PaintField, PetalField, SnowField, SpotlightField,
-                        PetField, ClickEmojiField, ClickTextField,
+                        PetField, ClickEmojiField, ClickTextField, ClickSfx,
                         WaterRippleField, WindowProbe, VoicePlayer, hex_to_bgr)
 
 
@@ -38,6 +38,10 @@ class Scene:
         # 点击语音：不画任何东西，只是"点一下随机播一段"。整段播放跑在它
         # 自己的后台线程里，渲染循环只负责在点击那一帧登记一次。
         self.voice = VoicePlayer()
+        # 「点击音效」是独立的特效分类，但**共用上面这一个播放器** —— 一次
+        # 点击最多响一声：上一个来源占了播放器，后面的直接丢弃（不排队、
+        # 更不叠着放）。两个 Player 会各放各的，那就成了"点一下响两声"。
+        self.click_sfx = ClickSfx(self.voice)
         self.win = WindowProbe()                        # 窗口枚举（窗口交互地基）
 
         # 覆盖层在虚拟屏幕里的左上角偏移（鼠标坐标要折算进来）
@@ -156,7 +160,11 @@ class Scene:
         buf_ms = u32 if u32_mouse is None else u32_mouse
 
         # 鼠标坐标最先更新：聚光灯与鼠标涟漪都要用到当前光标
-        dist = self.mouse.update(dt, self.ov_x, self.ov_y)
+        # 键盘只在"点击音效开着、且勾了键盘触发"时才去查 —— 一个键一次内核
+        # 调用，八十来个键就是八十来次，没人要这功能时不该白付。
+        keys = bool(cfg.get("click_sfx_enabled", False)
+                    and cfg.get("click_sfx_keyboard", False))
+        dist = self.mouse.update(dt, self.ov_x, self.ov_y, keys=keys)
 
         # ---------------- 窗口水波（窗口移动 / 缩放 / 最小化 / 恢复 -> 扰动水面）
         # 窗口是水面上的障碍物，把它当活塞：四条边各按**自身速度**推水（见
@@ -368,6 +376,17 @@ class Scene:
             self.voice.play_path(path)
         elif self.mouse.clicked and cfg.get("click_voice_enabled", False):
             self.voice.play_random(str(cfg.get("click_voice_dir", "")))
+
+        # ---------------- 点击音效（独立分类：只发声、不上屏）
+        # 排在最后：上面那两个来源若已经占了播放器，这一次点击就静默丢弃 ——
+        # "一次点击只响一声"是共用一个播放器自然得到的结果，不用额外判重。
+        # 键盘也走这里（用户勾了才触发），与鼠标点击同等对待。
+        if cfg.get("click_sfx_enabled", False):
+            hit = bool(self.mouse.clicked) or bool(self.mouse.key_clicked)
+            if hit:
+                self.click_sfx.trigger(cfg)
+        else:
+            self.click_sfx.reset()
 
     # ------------------------------------------------------------ 真实水波
     def _wave_trigger(self, cfg, dist, w, h, dt):

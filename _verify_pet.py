@@ -255,7 +255,7 @@ def _pin_mouse(sc, x, y, travel=0.0):
     state = {"n": 0}
     start_x = float(x) - travel
 
-    def fake(dt, ox, oy):
+    def fake(dt, ox, oy, keys=False):
         if travel > 0.0 and state["n"] < 12:
             state["n"] += 1
             sc.mouse.mx = start_x + travel * (state["n"] / 12.0)

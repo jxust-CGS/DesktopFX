@@ -2,6 +2,7 @@
 """UI 运行时冒烟：在真实 Tk 下实例化面板，遍历分组页 / 应用预设 / 就地刷新，
 确认侧栏导航 + 可滚动内容 + 预设就地刷新这条新代码路径不抛异常。"""
 import queue
+import time
 import tkinter as tk
 import desktop_fx as d
 import fx_effects
@@ -84,7 +85,7 @@ def main():
     import fx_kinds
     assert seen == ["下雨", "下雪", "落樱", "流星雨", "聚光灯", "颜料盘",
                     "宠物跟随", "涟漪", "真实水波", "点击表情", "点击文字",
-                    "窗口水波", "其它"], seen
+                    "点击音效", "窗口水波", "其它"], seen
     assert seen == fx_kinds.nav_order(), (seen, fx_kinds.nav_order())
 
 
@@ -391,6 +392,287 @@ def main():
     got = screen_pixel(0, 0)
     assert got is None or (len(got) == 3 and all(0 <= v <= 255 for v in got)), got
     assert screen_pixel(-4, -4) is None, "越界坐标应当返回 None"
+
+    # ---------------------------------------------------------- 8) 新布局
+    # 8a) 「点击表情」页按来源条件显隐：内置图案只显示图案/颜色，
+    #     自选图片只显示素材行/单次选择。判据用**真的映射到屏幕上**
+    #     （winfo_ismapped 会沿父链传：行被 pack_forget 时子 Label 也
+    #     算未映射）——只看 pack 状态会分不出"行藏着"和"页没显示"。
+    def _find_label(w, text):
+        for c in w.winfo_children():
+            try:
+                if c.winfo_class() == "Label" and str(c.cget("text")) == text:
+                    return c
+            except Exception:
+                pass
+            r = _find_label(c, text)
+            if r is not None:
+                return r
+        return None
+
+    def _shown(page, text):
+        p._show_page(page)
+        p.root.update_idletasks()
+        lb = _find_label(p._pages[page], text)
+        assert lb is not None, f"{page} 页找不到「{text}」这一行"
+        return bool(lb.winfo_ismapped())
+
+    def _walk_labels(w, out=None):
+        if out is None:
+            out = []
+        for c in w.winfo_children():
+            try:
+                if c.winfo_class() == "Label" and str(c.cget("text")):
+                    out.append(c)
+            except Exception:
+                pass
+            _walk_labels(c, out)
+        return out
+
+    app.cfg["click_emoji_source"] = "内置图案"
+    p._sync_from_cfg()
+    p.root.update_idletasks()
+    assert _shown("点击表情", "图案"), "内置图案时「图案」行应当可见"
+    assert _shown("点击表情", "颜色"), "内置图案时「颜色」行应当可见"
+    assert not _shown("点击表情", "图片素材"), \
+        "内置图案时「图片素材」行应当整行藏掉"
+    assert not _shown("点击表情", "单次选择"), \
+        "内置图案时「单次选择」行应当整行藏掉"
+    app.cfg["click_emoji_source"] = "自选图片"
+    p._sync_from_cfg()
+    p.root.update_idletasks()
+    assert not _shown("点击表情", "图案"), \
+        "自选图片时「图案」行应当整行藏掉"
+    assert not _shown("点击表情", "颜色"), \
+        "自选图片时「颜色」行应当整行藏掉"
+    assert _shown("点击表情", "图片素材"), "自选图片时「图片素材」行应当可见"
+    assert _shown("点击表情", "单次选择"), "自选图片时「单次选择」行应当可见"
+    # 素材行只留当前来源那一个按钮（互斥，另一个 pack_forget）
+    _row = _find_label(p._pages["点击表情"], "图片素材")
+    _row = _row.master
+    _btns = {str(c.cget("text")): c for c in _row.winfo_children()
+             if c.winfo_class() == "Button"}
+    assert _btns["选图片"].winfo_ismapped(), "自选图片时「选图片」应显示"
+    assert not _btns["选文件夹"].winfo_ismapped(), \
+        "自选图片时「选文件夹」应藏掉"
+    app.cfg["click_emoji_source"] = "图片文件夹"
+    p._sync_from_cfg()
+    p.root.update_idletasks()
+    assert _btns["选文件夹"].winfo_ismapped(), "文件夹时「选文件夹」应显示"
+    assert not _btns["选图片"].winfo_ismapped(), "文件夹时「选图片」应藏掉"
+    app.cfg["click_emoji_source"] = "内置图案"
+    p._sync_from_cfg()
+
+    # 8b) 来源置顶 + 文字页语音包前置：卡片里的**行顺序**必须按登记的
+    #     pack 顺序读（行是 Frame 包着 Label，直接翻控件树拿不到顺序）
+    def _row_texts(page, n=3):
+        p._show_page(page)
+        p.root.update_idletasks()
+        # 页面的第一个子控件是页头，卡片是**登记过行**的那个 Frame
+        cards = [c for c in p._pages[page].winfo_children()
+                 if c in p._card_rows]
+        assert cards, f"{page} 没有任何登记过行的卡片"
+        rows = p._card_rows[cards[0]]
+        out = []
+        for r in rows:
+            lbs = _walk_labels(r["w"])
+            if lbs:
+                out.append(str(lbs[0].cget("text")))
+            if len(out) >= n:
+                break
+        return out
+
+    assert _row_texts("点击表情", 2) == ["启用点击表情", "图案来源"], \
+        f"点击表情前两行顺序不对：{_row_texts('点击表情', 2)}"
+    assert _row_texts("点击文字", 3) == ["启用点击文字", "语音包文件夹",
+                                        "语音与文字统一"], \
+        f"点击文字前三行顺序不对：{_row_texts('点击文字', 3)}"
+    assert _row_texts("点击音效", 2) == ["启用点击音效", "音效来源"], \
+        f"点击音效前两行顺序不对：{_row_texts('点击音效', 2)}"
+
+    # 8c) 悬浮提示：停在名称上 0.4 秒弹出，离开即收；行被藏起来时不弹
+    p._show_page("点击表情")
+    p.root.update_idletasks()
+    _lb = _find_label(p._pages["点击表情"], "数量")
+    assert _lb is not None
+    _lb.event_generate("<Enter>")
+    _t0 = time.time()
+    _up = False
+    while time.time() - _t0 < 2.0:
+        p.root.update()
+        if p._tip_win is not None and p._tip_win.winfo_ismapped():
+            _up = True
+            break
+        time.sleep(0.02)
+    assert _up, "鼠标停在配置项名称上 0.4 秒后应当弹出提示"
+    assert "一次点击炸出多少颗" in p._tip_lb.cget("text"), \
+        p._tip_lb.cget("text")
+    _lb.event_generate("<Leave>")
+    p.root.update()
+    assert not p._tip_win.winfo_ismapped(), "离开后提示应当收起"
+    # 8c2) 提示浮层必须**压在面板之上**，而且面板每 1 秒抢一次置顶位之后仍然
+    #      压得住 —— 用户报的就是"提示一闪就沉到窗口下层看不见了"。
+    #      只读窗口样式/可见性查不出这件事（窗口状态全正常），所以直接查 z 序：
+    #      从面板往上走（GW_HWNDPREV）应当能碰到提示窗。
+    _lb.event_generate("<Enter>")
+    _t0 = time.time()
+    while time.time() - _t0 < 2.0:
+        p.root.update()
+        if p._tip_win is not None and p._tip_win.winfo_ismapped():
+            break
+        time.sleep(0.02)
+    from _win32 import hwnd_int, user32, HWND, top_hwnd
+    _tip_h = top_hwnd(p._tip_win)
+    assert user32.GetWindowLongPtrW(HWND(_tip_h), -8) == p._hwnd(), \
+        ("提示浮层没有成为面板的从属窗口 —— 面板抢置顶位时会把它挤下去"
+         f"（owner={user32.GetWindowLongPtrW(HWND(_tip_h), -8)}，"
+         f"面板={p._hwnd()}）")
+    p._raise_top()          # 面板抢一次置顶位（每 1 秒都会发生）
+    p.root.update()
+    GW_HWNDPREV = 3
+    _above = []
+    _cur = p._hwnd()
+    for _ in range(40):
+        _cur = hwnd_int(user32.GetWindow(HWND(_cur), GW_HWNDPREV))
+        if not _cur:
+            break
+        _above.append(_cur)
+    assert _tip_h in _above, (
+        f"面板抢完置顶位后提示被压到下面（上面只有 {_above[:4]}…，"
+        f"提示 hwnd={_tip_h}）")
+    assert p._tip_win.winfo_ismapped(), "抢位之后提示仍然可见"
+    p._tip_hide()
+    # 行藏了（来源=自选图片）时不该弹：否则提示会漂在页面上没有主人
+    app.cfg["click_emoji_source"] = "自选图片"
+    p._sync_from_cfg()
+    p.root.update_idletasks()
+    _lb2 = _find_label(p._pages["点击表情"], "图案")
+    assert _lb2 is not None and not _lb2.winfo_ismapped()
+    p._tip_show(_lb2, "这一行正藏着，不该弹")
+    p.root.update()
+    assert not p._tip_win.winfo_ismapped(), "行被藏起来时不该弹提示"
+    app.cfg["click_emoji_source"] = "内置图案"
+    p._sync_from_cfg()
+
+    # 8d) 侧栏分组可折叠 + 滚轮可滚 + 悬浮操作条永远在窗口内
+    _grp = "鼠标拖动特效"
+    assert p._nav_groups[_grp]["open"] is True
+    _items_before = [n for n in ("聚光灯", "颜料盘", "宠物跟随", "涟漪", "真实水波")
+                     if p._nav[n]["frame"].winfo_ismapped()]
+    assert len(_items_before) == 5, _items_before
+    p._toggle_nav_group(_grp)
+    p.root.update_idletasks()
+    assert p._nav_groups[_grp]["open"] is False
+    assert "▶" in p._nav_groups[_grp]["label"].cget("text"), \
+        p._nav_groups[_grp]["label"].cget("text")
+    for n in ("聚光灯", "颜料盘", "宠物跟随", "涟漪", "真实水波"):
+        assert not p._nav[n]["frame"].winfo_ismapped(), f"折叠后 {n} 应藏起来"
+    assert _grp in p._ui.get("nav_collapsed", []), "折叠状态应落盘"
+    p._toggle_nav_group(_grp)
+    p.root.update_idletasks()
+    assert all(p._nav[n]["frame"].winfo_ismapped()
+               for n in ("聚光灯", "颜料盘", "宠物跟随", "涟漪", "真实水波")), \
+        "再点一次应整组回来"
+    assert p._ui.get("nav_collapsed") == [], "展开后落盘应清空"
+
+    # 活动页所在分组被折叠时，_show_page 要自动展开（重启恢复上次页会踩到）
+    p._toggle_nav_group(_grp)
+    p._show_page("宠物跟随")
+    p.root.update_idletasks()
+    assert p._nav_groups[_grp]["open"] is True, "活动页的分组应被自动展开"
+    assert p._nav["宠物跟随"]["frame"].winfo_ismapped()
+
+    # 压矮窗口：侧栏要能滚（否则下面的组永远点不到）
+    p.root.geometry(f"{p.W}x{p.H_MIN}")
+    p.root.update()
+    p.root.update_idletasks()
+    assert p._nav_need_scroll(), "压矮后侧栏应当需要滚动"
+    _before = p._nav_cv.yview()[0]
+    p._nav["真实水波"]["frame"].event_generate("<MouseWheel>", delta=-120)
+    p.root.update()
+    assert p._nav_cv.yview()[0] > _before, "侧栏滚轮应当生效"
+    # 滚到底后最后一项必须整个落在悬浮操作条**上方**（条子压在侧栏左下角，
+    # 不预留的话「其它设置」正好躲到它后面 —— 看得见标题点不着）
+    for _ in range(40):
+        p._nav["其它"]["frame"].event_generate("<MouseWheel>", delta=-120)
+        p.root.update()
+    _last = p._nav["其它"]["frame"]
+    assert p._nav_cv.yview()[0] > 0.5, \
+        f"侧栏滚不到底：yview={p._nav_cv.yview()}"
+    # 坐标系必须换算到**屏幕**：导航项在 canvas 里，winfo_y() 是相对 inner 的，
+    # 与 fab.winfo_y()（相对 root）不是一个坐标系，直接比会得到荒谬的差值。
+    _last_bottom = _last.winfo_rooty() + _last.winfo_height()
+    assert _last_bottom <= p._fab.winfo_rooty() + 1, \
+        (f"滚到底后最后一项仍被操作条压住：项底 {_last_bottom} > "
+         f"条顶 {p._fab.winfo_rooty()}")
+    # 侧栏滚轮不能把内容区一起滚走（bind_all 上只挂了一个分派器）
+    _cb = p._canvas.yview()[0]
+    p._nav["真实水波"]["frame"].event_generate("<MouseWheel>", delta=-120)
+    p.root.update()
+    assert p._canvas.yview()[0] == _cb, "侧栏滚轮不应带动内容区"
+
+    # 悬浮操作条：最小尺寸下仍在窗口内、不盖住左下角缩放手柄
+    p._set_size(win_w=p.W_MIN, win_h=p.H_MIN)
+    p.root.update()
+    fx, fy = p._fab.winfo_x(), p._fab.winfo_y()
+    fw, fh = p._fab.winfo_width(), p._fab.winfo_height()
+    assert p._fab.winfo_manager() == "place", p._fab.winfo_manager()
+    assert p._fab.place_info().get("anchor") == "sw", \
+        f"操作条应贴在左下角：{p._fab.place_info()}"
+    assert 0 <= fx and 0 <= fy and fx + fw <= p.W + 1 and fy + fh <= p.H + 1, \
+        f"操作条越界：{fx},{fy} {fw}x{fh} 窗口 {p.W}x{p.H}"
+    assert fx >= p.GRIP_CORNER, \
+        f"操作条压住了左下角手柄：左 {fx} < {p.GRIP_CORNER}"
+    assert fy + fh <= p.H - p.GRIP + 1, \
+        f"操作条压住了底边手柄：底 {fy + fh} > {p.H - p.GRIP}"
+    assert p.pause_btn.winfo_ismapped(), "暂停按钮应可见"
+    p._fit_height()
+    p.root.update_idletasks()
+
+    # 8e) 「点击音效」页：来源三档的条件显隐 + 键都注册上了
+    for k in ("click_sfx_enabled", "click_sfx_source", "click_sfx_builtin",
+              "click_sfx_file", "click_sfx_dir", "click_sfx_keyboard"):
+        assert k in p._ctrls, f"点击音效页缺少控件 {k}"
+    assert p._ctrls["click_sfx_source"]["kind"] == "choices"
+    assert p._ctrls["click_sfx_keyboard"]["kind"] == "toggle"
+    assert p._ctrls["click_sfx_source"]["refresh"] is not None
+    for k in ("click_sfx_file", "click_sfx_dir"):
+        assert p._ctrls[k]["kind"] == "path", (k, p._ctrls[k]["kind"])
+        assert p._ctrls[k]["label"] in p._hints, f"{k} 的路径行没注册折行宽度"
+    app.cfg["click_sfx_source"] = "内置音效"
+    p._sync_from_cfg()
+    p.root.update_idletasks()
+    assert _shown("点击音效", "内置音效"), "内置档应当显示「内置音效」选择行"
+    assert not _shown("点击音效", "音效素材"), "内置档不该显示素材行"
+    app.cfg["click_sfx_source"] = "单个音效"
+    p._sync_from_cfg()
+    p.root.update_idletasks()
+    assert _shown("点击音效", "音效素材"), "单个音效档应当显示素材行"
+    assert not _shown("点击音效", "内置音效"), "单个音效档不该显示内置选择行"
+    app.cfg["click_sfx_source"] = "音效文件夹"
+    p._sync_from_cfg()
+    p.root.update_idletasks()
+    assert _shown("点击音效", "音效素材"), "文件夹档应当显示素材行"
+    app.cfg["click_sfx_source"] = "内置音效"
+    p._sync_from_cfg()
+    # 三个来源都要有对应的配置键占位（键名与 fx_effects 的实现一致）
+    for v in fx_effects.SFX_SOURCES:
+        assert v in fx_effects.SFX_SOURCES
+    assert fx_effects.builtin_sfx_names(), "内置音效扫不到（assets/sfx 没打包？）"
+
+    # 8f) 配置项名称上挂了提示：随便抽查几个跨页面的项
+    _tip_hosts = 0
+    for page in ("下雨", "点击表情", "点击音效", "其它"):
+        for c in _walk_labels(p._pages[page]):
+            if "all" in c.bindtags():
+                _tip_hosts += 1
+    # 提示是绑在控件上的（<Enter> + <Leave>），Tk 里 listbox 会列出来
+    _probe = _find_label(p._pages["其它"], "帧率上限")
+    assert _probe is not None, "其它页找不到「帧率上限」"
+    _bound = p.root.tk.call("bind", str(_probe), "<Enter>")
+    assert _bound, "「帧率上限」的名称上没有挂提示（<Enter> 无绑定）"
+    _bound2 = p.root.tk.call("bind", str(_probe), "<Leave>")
+    assert _bound2, "「帧率上限」的名称上没有挂收起提示的绑定（<Leave>）"
 
     p.root.destroy()
     # 清理测试写出的 UI 状态文件，避免污染实机默认页

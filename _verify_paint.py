@@ -839,7 +839,7 @@ def test_scene_step():
     sc.cfg = paint_cfg()
     # Scene.step 开头会调 mouse.update() 去读真实光标，把手动设的 mx/my 冲掉；
     # 这里把它换成空实现，测试才能自己控制指针轨迹。
-    sc.mouse.update = lambda dt, ox, oy: 0.0
+    sc.mouse.update = lambda dt, ox, oy, keys=False: 0.0
     buf, u32 = _fresh(W, H)
     for i in range(40):
         u32[:] = 0

@@ -463,12 +463,18 @@ def test_text_draws_and_rises():
 
 # ---------------------------------------------------------- 4. 分组重构
 def test_categories():
-    want = ["全屏特效", "鼠标拖动特效", "鼠标点击特效", "其他特效"]
+    want = ["全屏特效", "鼠标拖动特效", "鼠标点击特效", "鼠标点击音效",
+            "其他特效"]
     if list(fx_kinds.CATEGORY_ORDER) != want:
         return False, f"分组是 {fx_kinds.CATEGORY_ORDER}，期望 {want}"
     if fx_kinds.effects_of("鼠标点击特效") != ["点击表情", "点击文字"]:
         return False, ("鼠标点击特效组的内容是 "
                        f"{fx_kinds.effects_of('鼠标点击特效')}")
+    # 「点击音效」独立成类：它跟画什么无关，跟点击特效挤在一起会让用户
+    # 一开声音就得关掉图案。
+    if fx_kinds.effects_of("鼠标点击音效") != ["点击音效"]:
+        return False, ("鼠标点击音效组的内容是 "
+                       f"{fx_kinds.effects_of('鼠标点击音效')}")
     drag = fx_kinds.effects_of("鼠标拖动特效")
     for name in ("聚光灯", "颜料盘", "宠物跟随", "涟漪", "真实水波"):
         if name not in drag:
@@ -481,7 +487,8 @@ def test_categories():
     if flat != fx_kinds.nav_order()[:len(flat)]:
         return False, "侧栏顺序与分组顺序对不上"
     return True, (f"{len(fx_kinds.CATEGORY_ORDER)} 个分组，点击组含 "
-                  f"{fx_kinds.effects_of('鼠标点击特效')}")
+                  f"{fx_kinds.effects_of('鼠标点击特效')}，"
+                  f"音效单独一组")
 
 
 def test_click_effects_are_exclusive():
@@ -555,7 +562,7 @@ def test_scene_wiring():
 
     box = {"fired": True}
 
-    def fake_update(dt, ox, oy):
+    def fake_update(dt, ox, oy, keys=False):
         sc.mouse.mx, sc.mouse.my = W * 0.5, H * 0.5
         sc.mouse.clicked = 0 if box["fired"] else 1
         return 0.0
@@ -1233,7 +1240,7 @@ def test_scene_voice_wiring():
     sc.voice = _Spy()
     box = {"fired": True}
 
-    def fake_update(dt, ox, oy):
+    def fake_update(dt, ox, oy, keys=False):
         sc.mouse.mx, sc.mouse.my = W * 0.5, H * 0.5
         sc.mouse.clicked = 0 if box["fired"] else 1
         return 0.0
@@ -1801,12 +1808,355 @@ def test_no_shadowed_module_defs():
     return True, f"{checked} 个产品模块的顶层 def/class 无重名"
 
 
+def test_img_align_rotation_direction():
+    """「图片方向随扩散方向」：旋转角度必须**真的朝飞行方向**。
+
+    判据用一张"顶部亮"的贴纸：飞向右边时亮带必须落在**右侧**。只断言"转过了"
+    是不够的 —— 转错 90°（甚至倒过来转）同样能通过"形状变了"这种弱判据，
+    而用户看到的会是"图片横着飞"。
+    """
+    if F._PImage is None:
+        return None
+    spr = np.zeros((20, 20, 4), np.float32)
+    spr[0:4, :, :3] = 1.0
+    spr[0:4, :, 3] = 1.0
+    right = F._rotate_premul(spr, 3, 12)       # 飞行方向 = 向右（ang=0 -> 档 3）
+    cols = right[:, :, 3].sum(axis=0)
+    rows = right[:, :, 3].sum(axis=1)
+    cx = float((np.arange(right.shape[1]) * cols).sum() / max(1e-6, cols.sum()))
+    cy = float((np.arange(right.shape[0]) * rows).sum() / max(1e-6, rows.sum()))
+    mid = (right.shape[1] - 1) / 2.0
+    if cx < mid + 2:
+        return False, (f"飞向右时亮带却停在 x={cx:.1f}（图宽 {right.shape[1]}，"
+                       f"中点 {mid}）—— 旋转方向或角度不对")
+    if abs(cy - (right.shape[0] - 1) / 2.0) > 3:
+        return False, f"转过之后亮带没落在水平中线上（y={cy:.1f}）"
+    if right.shape[2] != 4 or right.dtype != np.float32:
+        return False, f"旋转后格式变了：{right.shape} {right.dtype}"
+    if not bool((right[..., :3] <= right[..., 3:4] + 1e-5).all()):
+        return False, "旋转后不再是预乘（边缘会渗出错色）"
+    if float(right.max()) > 1.0 + 1e-5:
+        return False, f"旋转后取值超过 1：{float(right.max())}"
+    return True, (f"顶部亮带旋转后落在 x={cx:.1f}/{right.shape[1] - 1}"
+                  f"（右侧），仍是预乘 float32 RGBA")
+
+
+def test_img_align_wiring():
+    """档位写进 `rot`：必须正好等于 `(飞行角 + 90°)` 的量化档。
+
+    90° 的偏移不能省：精灵"朝上"在屏幕坐标里是 -90°，要让图头指向飞行方向
+    ang，顺时针得转 ang + 90°。写成 ang 就会让所有图都歪 90°。
+    """
+    eng = F._BurstEngine(seed=5)
+    for strength in (0.0,):
+        pass
+    eng.spawn(100.0, 100.0, "", [(255, 255, 255)], count=20, size=20.0,
+              spread=200.0, gravity=0.0, rotate=False, life=1.0,
+              spr_ids=np.zeros(20, np.int32), align=True)
+    if eng.count != 20:
+        return False, f"粒子数 {eng.count}"
+    want = np.floor((np.arctan2(eng.vy[:20], eng.vx[:20])
+                     + np.pi * 0.5) / (2.0 * np.pi) * 12 + 0.5) % 12
+    got = eng.rot[:20]
+    diff = int((np.abs(got - want) > 1e-4).sum())
+    if diff:
+        return False, f"{diff}/20 个粒子的旋转档与飞行方向不符"
+    if not bool(((got >= 0) & (got < 12)).all()):
+        return False, f"档位越界：{got.min()}~{got.max()}"
+    if bool((eng.spin[:20] != 0).any()):
+        return False, "align 模式下 spin 必须为 0（否则档位会被逐帧搅乱）"
+    # 默认（align=False）时 rot 仍是随机角：判据是"不是整数档"而不是"超过 12"
+    # —— 随机角恒在 [0, 2π) 内，本来就 ≤ 12，用"上界"判等于什么都没验。
+    eng2 = F._BurstEngine(seed=5)
+    eng2.spawn(100.0, 100.0, "", [(255, 255, 255)], count=20, size=20.0,
+               spread=200.0, gravity=0.0, rotate=False, life=1.0,
+               spr_ids=np.zeros(20, np.int32))
+    r2 = eng2.rot[:20]
+    if bool(np.allclose(r2, np.round(r2), atol=1e-4)):
+        return False, f"不勾选时 rot 也被写成了整数档：{r2[:5]}"
+    return True, "20 个粒子的旋转档 = (飞行角 + 90°) 的 12 档量化，spin 归零"
+
+
+def test_img_align_builtin_unaffected():
+    """内置图案不吃图片那条旋转路径（它自带 12 档旋转，两者会打架）。"""
+    from _verify_kinds import _base_cfg
+    cfg = _base_cfg(click_emoji_enabled=True, click_emoji_source="内置图案")
+    f = ClickEmojiField(W, H)
+    # 强制留下"随扩散方向"的脏状态（模拟上一簇用过图片 + 对齐）
+    f.engine._img_align = True
+    f._spawn_builtin(cfg)
+    if f.engine._img_align:
+        return False, "回退内置图案后 _img_align 仍是 True —— 内置图案会去走位图旋转"
+    return True, "回退到内置图案时显式关掉图片旋转路径"
+
+
+def test_ui_align_list_matches_impl():
+    """fx_ui 的「图片方向」选项表必须与 fx_effects 的常量一一对应。"""
+    import fx_ui
+    if list(fx_ui.IMG_ALIGNS) != list(F.CLICK_ALIGNS):
+        return False, (f"选项表不一致：UI={fx_ui.IMG_ALIGNS} / "
+                       f"实现={F.CLICK_ALIGNS}")
+    for v in fx_ui.IMG_ALIGNS:
+        if not isinstance(v, str) or not v:
+            return False, f"选项值非法：{v!r}"
+    if d.DEFAULTS.get("click_emoji_align") != F.CLICK_ALIGN_VERTICAL:
+        return False, f"默认值应是「竖直」：{d.DEFAULTS.get('click_emoji_align')!r}"
+    return True, f"{len(fx_ui.IMG_ALIGNS)} 个取向选项与实现一致，默认竖直"
+
+
+# ------------------------------------------------- 12. 点击音效（独立分类）
+def test_builtin_sfx_available():
+    """内置音效目录必须真的有音频，且能被扫到、名字能被清洗。"""
+    items = F.list_builtin_sfx()
+    if len(items) < 3:
+        return False, f"内置音效只有 {len(items)} 个（assets/sfx 是不是没带上？）"
+    bad = [p for p in items if not os.path.isfile(p)]
+    if bad:
+        return False, f"扫出来的路径不存在：{bad[:2]}"
+    names = F.builtin_sfx_names()
+    if len(names) != len(items) or any(not n for n in names):
+        return False, f"显示名异常：{names}"
+    if not any("青轴" in n for n in names):
+        return False, f"没扫到「青轴」：{names}"
+    return True, f"{len(items)} 个内置音效：{' / '.join(names)}"
+
+
+def test_sfx_source_normalize_and_target():
+    """三个来源 + 旧值归一化 + `sfx_target` 的选择逻辑。"""
+    if F.normalize_sfx_source("") != F.SFX_SOURCE_BUILTIN:
+        return False, "空值应当归到内置音效"
+    if F.normalize_sfx_source("内置") != F.SFX_SOURCE_BUILTIN:
+        return False, "旧值「内置」没认出来"
+    if F.normalize_sfx_source("自定义音效") != F.SFX_SOURCE_FOLDER:
+        return False, "旧值「自定义音效」没归到文件夹"
+    if F.normalize_sfx_source("乱七八糟") != F.SFX_SOURCE_BUILTIN:
+        return False, "未知取值应当兜底到内置音效"
+
+    # 内置：不指定就是全部；指定了那个文件就只要它
+    items, rnd = F.sfx_target({"click_sfx_source": F.SFX_SOURCE_BUILTIN})
+    if not items or rnd is not True:
+        return False, f"内置（未指定）应给全部并随机：{len(items)}/{rnd}"
+    one = os.path.basename(F.list_builtin_sfx()[0])
+    items2, rnd2 = F.sfx_target({"click_sfx_source": F.SFX_SOURCE_BUILTIN,
+                                 "click_sfx_builtin": one})
+    if len(items2) != 1 or rnd2 is not False:
+        return False, f"指定了内置音效应收敛到 1 个且不随机：{items2}/{rnd2}"
+    # 指定的名字不存在 -> 回退全部（不能变成"一声不响"）
+    items3, _ = F.sfx_target({"click_sfx_source": F.SFX_SOURCE_BUILTIN,
+                              "click_sfx_builtin": "不存在.wav"})
+    if len(items3) != len(items):
+        return False, "指定的内置音效不见了时应当回退到全部"
+
+    # 单个文件：存在才算，不存在给空（调用方据此什么都不播）
+    folder = _mk_audio_folder()
+    p0 = os.path.join(folder, sorted(os.listdir(folder))[0])
+    items4, rnd4 = F.sfx_target({"click_sfx_source": F.SFX_SOURCE_FILE,
+                                 "click_sfx_file": p0})
+    if items4 != [p0] or rnd4 is not False:
+        return False, f"单个文件来源不对：{items4}/{rnd4}"
+    items5, _ = F.sfx_target({"click_sfx_source": F.SFX_SOURCE_FILE,
+                              "click_sfx_file": os.path.join(folder, "无.wav")})
+    if items5:
+        return False, "文件不存在时应当返回空表"
+    # 文件夹：扫出全部音频
+    F.invalidate_media_cache()
+    items6, rnd6 = F.sfx_target({"click_sfx_source": F.SFX_SOURCE_FOLDER,
+                                 "click_sfx_dir": folder})
+    n_expect = F.count_audio(folder)
+    shutil.rmtree(folder, ignore_errors=True)
+    if len(items6) != n_expect or n_expect < 2 or rnd6 is not True:
+        return False, f"文件夹来源：{len(items6)}（期望 {n_expect}）/{rnd6}"
+    return True, ("三个来源都选对；未知值兜底内置；指定的内置音效缺失时回退全部；"
+                  "文件不存在返回空表")
+
+
+def test_click_sfx_triggers_and_dedups():
+    """`ClickSfx` 只在点到时触发，且**一次点击只响一声**（播放器忙则丢弃）。"""
+    played = []
+
+    class _Player:
+        def __init__(self):
+            self.busy = False
+
+        def play_path(self, p):
+            if self.busy:
+                return False
+            played.append(p)
+            self.busy = True
+            return True
+
+    pl = _Player()
+    sfx = F.ClickSfx(pl)
+    cfg = dict(click_sfx_enabled=True, click_sfx_source=F.SFX_SOURCE_BUILTIN,
+               click_sfx_builtin="")
+    if sfx.active() is not False:
+        return False, "active() 必须恒 False（它不上屏，否则鼠标层每帧白提交）"
+    if not sfx.trigger(cfg):
+        return False, "第一次触发应当成功"
+    if sfx.trigger(cfg):
+        return False, "播放器还忙着却又播了第二声（重叠了）"
+    if len(played) != 1:
+        return False, f"实际播了 {len(played)} 次"
+    if not os.path.isfile(played[0]) or not played[0].endswith(
+            (".wav", ".mp3", ".wma", ".m4a")):
+        return False, f"播的不是音频文件：{played[0]!r}"
+    pl.busy = False
+    # 换成"文件不存在"的来源：不该播，也不该抛
+    if sfx.trigger(dict(cfg, click_sfx_source=F.SFX_SOURCE_FILE,
+                        click_sfx_file="")):
+        return False, "来源没配到东西时不该播"
+    return True, "忙时丢弃不重叠；来源没配到时静默跳过，不抛异常"
+
+
+def test_scene_sfx_mouse_and_keyboard():
+    """场景接线：鼠标点击触发；键盘**默认不触发**，勾了才触发。"""
+    from _verify_kinds import _base_cfg
+    from fx_scene import Scene
+
+    calls = []
+
+    class _Spy:
+        def play_path(self, p):
+            calls.append(p)
+            return True
+
+        def play_random(self, f):
+            return False
+
+    sc = Scene(W, H)
+    sc.voice = _Spy()
+    sc.click_sfx.player = sc.voice
+    cfg_extra = {}
+    # 造两个假音效文件放进临时目录，走「音效文件夹」来源
+    folder = tempfile.mkdtemp(prefix="fx_sfx_")
+    for nm in ("a.wav", "b.wav"):
+        with open(os.path.join(folder, nm), "wb") as fh:
+            fh.write(b"\x00" * 16)
+    F.invalidate_media_cache()
+
+    state = {"mouse": 0, "key": 0}
+
+    def fake_update(dt, ox, oy, keys=False):
+        sc.mouse.mx, sc.mouse.my = W * 0.5, H * 0.5
+        sc.mouse.clicked = state["mouse"]
+        sc.mouse.key_clicked = state["key"] if keys else 0
+        return 0.0
+
+    sc.mouse.update = fake_update
+    buf = np.zeros(W * H, np.uint32)
+    base = dict(click_sfx_enabled=True, click_sfx_source=F.SFX_SOURCE_FOLDER,
+                click_sfx_dir=folder, click_sfx_keyboard=False)
+    sc.cfg = _base_cfg(**base)
+    state.update(mouse=1, key=0)
+    sc.step(1.0 / 60.0, buf, W, H, buf)
+    n_mouse = len(calls)
+    state.update(mouse=0, key=1)
+    for _ in range(3):
+        sc.step(1.0 / 60.0, buf, W, H, buf)
+    n_after_key_off = len(calls)
+    # 勾上键盘：这时才该响应
+    sc.cfg = _base_cfg(**dict(base, click_sfx_keyboard=True))
+    state.update(mouse=0, key=1)
+    sc.step(1.0 / 60.0, buf, W, H, buf)
+    n_key_on = len(calls)
+    # 关掉总开关：鼠标点击也不该响
+    sc.cfg = _base_cfg(**dict(base, click_sfx_enabled=False,
+                              click_sfx_keyboard=True))
+    state.update(mouse=1, key=1)
+    for _ in range(3):
+        sc.step(1.0 / 60.0, buf, W, H, buf)
+    n_off = len(calls)
+    shutil.rmtree(folder, ignore_errors=True)
+    if n_mouse != 1:
+        return False, f"鼠标点击触发了 {n_mouse} 次（期望 1）"
+    if n_after_key_off != n_mouse:
+        return False, "键盘开关关着时仍然因按键发声"
+    if n_key_on != n_after_key_off + 1:
+        return False, f"勾上键盘后按了键却没发声（{n_after_key_off} -> {n_key_on}）"
+    if n_off != n_key_on:
+        return False, "总开关关掉后仍在发声"
+    last = calls[-1]
+    if not last.startswith(folder):
+        return False, f"播的不是那个文件夹里的音频：{last!r}"
+    return True, ("鼠标点击触发一次；键盘默认不触发、勾上后按键触发；"
+                  "总开关关掉后都不触发")
+
+
+def test_sfx_independent_from_click_effects():
+    """「点击音效」是独立分类：与两个点击特效**互不挤占**，可同时开着。"""
+    app = d.App.__new__(d.App)
+    app.cfg = dict(d.DEFAULTS)
+    app.snapshot = dict(app.cfg)
+    app.user_presets = {}
+    app._autosave_dirty = False
+    app.set("click_emoji_enabled", True)
+    app.set("click_sfx_enabled", True)
+    if not app.cfg["click_emoji_enabled"]:
+        return False, "开启点击音效把点击表情挤掉了（分类没独立）"
+    if not app.cfg["click_sfx_enabled"]:
+        return False, "点击音效没打开"
+    # 同类的点击文字开起来，只该挤掉点击表情 —— 音效必须活下来
+    app.set("click_text_enabled", True)
+    if app.cfg["click_emoji_enabled"]:
+        return False, "点击文字与点击表情之间应当仍然互斥"
+    if not app.cfg["click_text_enabled"]:
+        return False, "点击文字没打开"
+    if not app.cfg["click_sfx_enabled"]:
+        return False, "点击文字开启时把独立分类的点击音效也挤掉了"
+    if fx_kinds.category_of("点击音效") == fx_kinds.category_of("点击表情"):
+        return False, "点击音效与点击表情仍在同一个分类里"
+    if fx_kinds.effects_of("鼠标点击音效") != ["点击音效"]:
+        return False, ("「鼠标点击音效」分类内容不对："
+                       f"{fx_kinds.effects_of('鼠标点击音效')}")
+    return True, "点击音效单独成类：可与点击文字同时开着，点击组内仍互斥"
+
+
+def test_sfx_never_reported_as_layer_content():
+    """开着点击音效不能让鼠标层被误判成"有内容"（否则每帧白提交一次全屏）。"""
+    from _verify_kinds import _base_cfg
+    from fx_scene import Scene
+    s = Scene(W, H)
+    s.cfg = _base_cfg(click_sfx_enabled=True)
+    fs, ms = s.layer_activity()
+    if ms:
+        return False, "只开着点击音效，鼠标层却被报成有内容（白付一次全屏提交）"
+    if fs:
+        return False, "只开着点击音效，全屏层却被报成有内容"
+    return True, "纯听觉特效不参与层活动信号"
+
+
+def test_click_sfx_defaults():
+    """点击音效的几个配置键：类型与默认值。"""
+    want = {"click_sfx_enabled": False,
+            "click_sfx_source": F.SFX_SOURCE_BUILTIN,
+            "click_sfx_builtin": "",
+            "click_sfx_file": "",
+            "click_sfx_dir": "",
+            "click_sfx_keyboard": False}
+    for k, v in want.items():
+        if k not in d.DEFAULTS:
+            return False, f"缺配置键 {k}"
+        if d.DEFAULTS[k] != v:
+            return False, f"{k} 默认值应为 {v!r}，实为 {d.DEFAULTS[k]!r}"
+    if "点击音效" not in d.PRESET_GROUPS:
+        return False, "「点击音效」页没有内置预设"
+    for nm in d.PRESET_GROUPS["点击音效"]:
+        if nm not in d.PRESETS:
+            return False, f"预设 {nm} 没有实体"
+    # 预设引用的内置音效文件必须真的在
+    for nm in d.PRESET_GROUPS["点击音效"]:
+        b = d.PRESETS[nm].get("click_sfx_builtin", "")
+        if b and not any(os.path.basename(p) == b for p in F.list_builtin_sfx()):
+            return False, f"预设「{nm}」引用的内置音效 {b} 不存在"
+    return True, (f"{len(want)} 个键默认值正确；"
+                  f"{len(d.PRESET_GROUPS['点击音效'])} 个预设引用的内置音效都在")
+
+
 def test_text_pack_defaults():
     """两个新配置键：类型正确、坏值被钳制、默认关闭。"""
     for k, t in (("click_text_voice_dir", str),
                  ("click_text_voice_match", bool)):
-        if k not in d.DEFAULTS:
-            return False, f"DEFAULTS 缺 {k}"
+        if k not in d.DEFAULTS:            return False, f"DEFAULTS 缺 {k}"
         if not isinstance(d.DEFAULTS[k], t):
             return False, f"{k} 默认值类型是 {type(d.DEFAULTS[k])}，期望 {t}"
     if d.DEFAULTS["click_text_voice_match"] is not False:
@@ -1852,7 +2202,7 @@ def test_scene_plays_the_matched_audio():
     def _drive(sc, frames=4, first_click=True):
         box = {"fired": not first_click}
 
-        def fake_update(dt, ox, oy):
+        def fake_update(dt, ox, oy, keys=False):
             sc.mouse.mx, sc.mouse.my = W * 0.5, H * 0.5
             sc.mouse.clicked = 0 if box["fired"] else 1
             return 0.0
@@ -1968,6 +2318,18 @@ def main():
         test_source_normalize_and_target,
         test_click_source_defaults,
         test_no_shadowed_module_defs,
+        # ---- 本轮新增：图片取向 + 点击音效 ----
+        test_img_align_rotation_direction,
+        test_img_align_wiring,
+        test_img_align_builtin_unaffected,
+        test_ui_align_list_matches_impl,
+        test_builtin_sfx_available,
+        test_sfx_source_normalize_and_target,
+        test_click_sfx_triggers_and_dedups,
+        test_scene_sfx_mouse_and_keyboard,
+        test_sfx_independent_from_click_effects,
+        test_sfx_never_reported_as_layer_content,
+        test_click_sfx_defaults,
     ]
     print("== 点击特效 + 分组 ==")
     bad = 0

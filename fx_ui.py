@@ -98,11 +98,24 @@ SHAPE_DEFAULT_COLORS = {
 CLICK_TEXT_COLORS = ["#FFFFFF", "#FFE066", "#7FE7FF", "#FF9DB6", "#A8E6A0",
                      "#FFB38A"]
 
+# 图片当图案时的朝向。取值与 fx_effects.CLICK_ALIGN_* 一一对应，
+# 一致性由 `_verify_click.py` 断言（少了画不出来、多了静默不生效）。
+IMG_ALIGNS = [fx_effects.CLICK_ALIGN_VERTICAL, fx_effects.CLICK_ALIGN_SPREAD]
+# 内置音效那一档的「随机」选项。它是个哨兵值（不是一个真文件名），
+# 从配置往返时按文件名归一化（见 ControlPanel._sfx_builtin_norm）。
+SFX_BUILTIN_RANDOM = "随机"
+
 FONT_LABEL = ("Microsoft YaHei UI", 9)
 FONT_TITLE = ("Microsoft YaHei UI", 10, "bold")   # 顶栏程序名
 FONT_H2 = ("Microsoft YaHei UI", 12, "bold")      # 页头大标题
 FONT_NUM = ("Consolas", 9)
 FONT_SMALL = ("Microsoft YaHei UI", 8)
+
+# ---- 悬浮提示 ----
+# 配置项的说明不再常驻在卡片里（页面高度是有限预算，见 MEMORY「面板高度」），
+# 改成挂在**配置项名称**上：鼠标停 0.4 秒弹出，离开或点击即收起。
+TIP_DELAY = 400      # 鼠标停多久才弹出（ms）
+TIP_WRAP = 300       # 提示文字折行宽度（px）
 
 HWND_TOPMOST = wt.HWND(-1)
 SWP_NOMOVE = 0x0002
@@ -461,6 +474,12 @@ class _NavIcon(tk.Canvas):
                   (5.0, 14.5), (5.0, 11.5), (3.5, 11.5), (3.5, 4.0)])
             line([(6.0, 6.6), (12.0, 6.6)], width=1.2)
             line([(6.0, 9.0), (10.5, 9.0)], width=1.2)
+        elif n == "点击音效":
+            # 喇叭 + 两道声波（纯听觉特效，图标要一眼看出"在发声"）
+            line([(2.6, 7.0), (5.4, 7.0), (8.6, 4.2), (8.6, 12.8),
+                  (5.4, 10.0), (2.6, 10.0), (2.6, 7.0)], width=1.3)
+            line([(11.0, 6.4), (12.6, 8.6), (11.0, 10.8)], width=1.3)
+            line([(13.4, 4.6), (15.2, 8.6), (13.4, 12.6)], width=1.3)
         else:  # 其它 / 设置：三条水平滑块
             for y, x1, x2 in ((5, 3, 9), (9, 6, 12), (13, 4, 10)):
                 line([x1, y, x2, y])
@@ -529,6 +548,11 @@ class _NavIcon(tk.Canvas):
                                5.0, 14.5, 5.0, 11.5, 3.5, 11.5, 3.5, 4.0], w)
             self._legacy_line([6.0, 6.6, 12.0, 6.6], 1.2)
             self._legacy_line([6.0, 9.0, 10.5, 9.0], 1.2)
+        elif n == "点击音效":
+            self._legacy_line([2.6, 7.0, 5.4, 7.0, 8.6, 4.2, 8.6, 12.8,
+                               5.4, 10.0, 2.6, 10.0, 2.6, 7.0], 1.3)
+            self._legacy_line([11.0, 6.4, 12.6, 8.6, 11.0, 10.8], 1.3)
+            self._legacy_line([13.4, 4.6, 15.2, 8.6, 13.4, 12.6], 1.3)
         else:  # 其它 / 设置
             for y, x1, x2 in ((5, 3, 9), (9, 6, 12), (13, 4, 10)):
                 self._legacy_line([x1, y, x2, y], w)
@@ -599,6 +623,21 @@ class ControlPanel:
         self._preset_title = {}   # 分组名 -> “预设方案”标题 Label
         self._preset_cells = {}   # 分组名 -> {预设名: 单元格 Frame}
         self._active = "下雨"
+
+        # 卡片行的可见性表：card -> [{"w","when","opts"}]。`when()` 为假的行
+        # 整行隐藏（如「图案来源=自选图片」时不该再显示内置图案选择）。
+        # 重排必须走 _repack（先全部 pack_forget 再按登记顺序 pack）——
+        # 直接 pack 一个刚显示的行会把它排到卡片末尾（pack 顺序即视觉顺序）。
+        self._card_rows = {}
+        # 侧栏顺序表：kind ∈ {"group","item","sep"}，折叠分组时按它重排
+        self._nav_entries = []
+        self._nav_groups = {}      # 组名 -> {"frame","label","open"}
+        self._nav_group_of = {}    # 页键 -> 组名（活动页被折起来时自动展开）
+        self._nav_collapsed = set(self._ui.get("nav_collapsed") or [])
+        # 悬浮提示的窗口与待弹计时器（懒创建）
+        self._tip_win = None
+        self._tip_lb = None
+        self._tip_after = None
 
         self._center()
         self._build()
@@ -884,6 +923,10 @@ class ControlPanel:
                                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
         except Exception:
             pass
+        # 提示浮层此刻可能正开着：抢完置顶位后补抬一次（它本来是**从属**于
+        # 面板的，正常压得住；这一手是兜底，防个别系统上 owner 关系被别处
+        # 重置 —— 提示一闪就不见，用户只会说"这提示根本看不见"）。
+        self._tip_relift()
         # 1s 一次（早先 2s）：对手（Citrix 那类十几 Hz 重新置顶的全屏窗）在
         # 两次之间的窗口期里会把面板压下去，面板一被压住就不能再给覆盖层当
         # 天花板 —— 覆盖层此时会退回"插到置顶组顶部"（见 Overlay._anchor），
@@ -893,6 +936,17 @@ class ControlPanel:
         # 尤其吵），而且对一个正在关闭的面板去抢置顶本身也没意义。
         if not getattr(self, "_quitting", False):
             self.root.after(1000, self._raise_top)
+
+    def _tip_relift(self):
+        """把可见的提示浮层再抬一次（面板刚抢完置顶位之后调）。"""
+        w = getattr(self, "_tip_win", None)
+        if w is None:
+            return
+        try:
+            if w.winfo_ismapped():
+                w.lift()
+        except Exception:
+            pass
 
     def _start_move(self, e):
         self._drag = (e.x_root, e.y_root)
@@ -904,6 +958,7 @@ class ControlPanel:
         self.root.geometry(f"+{self.root.winfo_x() + dx}+{self.root.winfo_y() + dy}")
 
     def hide(self):
+        self._tip_hide()
         self.root.withdraw()
 
     def show(self):
@@ -947,48 +1002,79 @@ class ControlPanel:
         main.pack(fill="both", expand=True)
         self._main = main
 
-        # ---- 侧栏 ----
+        # ---- 侧栏（可滚动 + 分组可折叠）----
         side = tk.Frame(main, bg=SIDEBAR_BG, width=120)
         side.pack(side="left", fill="y")
         side.pack_propagate(False)
+        # 13 个特效项 + 4 个分组标题，窗口被压矮时会溢出屏幕 —— 装进 Canvas
+        # 用滚轮兜底（装得下时不滚，理由同内容区）。折叠分组是更快的办法：
+        # 点分组标题整组收起，只留当前在用的那一组。
+        nav_cv = tk.Canvas(side, bg=SIDEBAR_BG, highlightthickness=0, bd=0)
+        nav_cv.pack(fill="both", expand=True)
+        nav_in = tk.Frame(nav_cv, bg=SIDEBAR_BG)
+        nav_win = nav_cv.create_window((0, 0), window=nav_in, anchor="nw")
+        # inner 尺寸一变就重算（折叠分组、增删项）。**必须走 `_sync_nav_scroll`**
+        # 而不是直接写 bbox：那里还要给左下角的悬浮操作条留出让位。写成
+        # `configure(scrollregion=bbox("all"))` 会让留白偶尔被冲掉 —— 表现是
+        # "有时滚到底最后一项能露出来、有时又躲到条子后面"。
+        nav_in.bind("<Configure>", lambda e: self._sync_nav_scroll())
+        nav_cv.bind("<Configure>",
+                    lambda e: (nav_cv.itemconfig(nav_win, width=e.width),
+                               self._sync_nav_scroll()))
+        # 滚轮**不能只绑在 canvas 上**：Tk 把滚轮事件发给光标正下方那个控件、
+        # 不会冒泡给父容器 —— 鼠标停在导航项（Frame/Label）上时一点反应都没有，
+        # 窗口一矮、分组一多，下面的组就永远点不到。统一挂到 bind_all 上、
+        # 由 _on_wheel_all 按归属分派（见那里）。
+        # **只能有一个 bind_all**：后来者会整条替换掉前面的绑定（不带 add="+"），
+        # 侧栏那一份就是这么被内容区那一份悄悄顶掉的。
+        self._nav_cv = nav_cv
+        self._nav_in = nav_in
 
         # 注意：name 必须与 _pages 的注册键一致，否则点击后右侧空白。
         # 分组与顺序取自 fx_kinds.NAV_GROUPS —— 侧栏分类、渲染分层、同类
         # 互斥共用同一份定义，避免"界面归了类、别处还对不上"。
         for cat, pages in fx_kinds.NAV_GROUPS:
-            self._nav_group(side, cat)
+            self._nav_group(nav_in, cat)
             for name in pages:
-                self._nav_item(side, fx_kinds.page_title(name), name)
-        self._nav_sep(side)
-        self._nav_item(side, "其他设置", "其它")
+                self._nav_group_of[name] = cat
+                self._nav_item(nav_in, fx_kinds.page_title(name), name, cat)
+        self._nav_sep(nav_in)
+        self._nav_item(nav_in, "其他设置", "其它", None)
 
-        fb = tk.Frame(side, bg=SIDEBAR_BG)
-        fb.pack(side="bottom", fill="x", pady=(8, 12))
-        # 暂停/继续：运行=中性底；暂停=强调色底(与保存同语言)，不用暖棕
+        # ---- 悬浮操作条：暂停 / 隐藏到托盘 / 退出 ----
+        # 这三个按钮原来在侧栏底部（pack 布局）：窗口一矮、特效项一多就被
+        # 挤得够不着。改成 place 贴在**窗口左下角**，再小的窗口也看得见；
+        # 位置抬离左下角 20px，把 12px 的角落缩放手柄整个让出来（被盖住
+        # 就没法从角落拖大窗口了）。
+        fab = tk.Frame(root, bg=CARD)
+        # x=16 而不是 10：左下角手柄宽 12px，贴太近会把它盖住（被盖住就
+        # 没法从角落拖大窗口）；y=-20 让条子底边避开 6px 的底边手柄。
+        fab.place(relx=0.0, rely=1.0, anchor="sw", x=16, y=-20)
+        self._fab = fab
         self._paused = False
-        self.pause_btn = tk.Button(fb, text="暂停", bg=BTN, fg=TEXT, bd=0,
-                                   relief="flat", font=FONT_LABEL, pady=8,
+        self.pause_btn = tk.Button(fab, text="暂停", bg=BTN, fg=TEXT, bd=0,
+                                   relief="flat", font=FONT_LABEL, padx=12,
+                                   pady=6, cursor="hand2",
                                    activebackground=ACCENT_HOVER,
                                    activeforeground=ON_ACCENT,
                                    command=self._pause)
-        self.pause_btn.pack(fill="x", padx=10, pady=4)
+        self.pause_btn.pack(side="left", padx=(8, 2), pady=6)
         self.pause_btn.bind("<Enter>", lambda e: self._paint_pause(True))
         self.pause_btn.bind("<Leave>", lambda e: self._paint_pause(False))
-        brow = tk.Frame(fb, bg=SIDEBAR_BG)
-        brow.pack(fill="x", padx=4, pady=(0, 4))
-        b2 = tk.Button(brow, text="隐藏到托盘", bg=BTN, fg=TEXT, bd=0, relief="flat",
-                       font=FONT_LABEL, pady=8,
-                       activebackground=BTN_H, command=self.hide)
-        b2.pack(side="left", fill="x", expand=True, padx=(6, 2))
-        b2.bind("<Enter>", lambda e: b2.config(bg=BTN_H))
-        b2.bind("<Leave>", lambda e: b2.config(bg=BTN))
-        b3 = tk.Button(brow, text="退出", bg=DANGER_SOFT, fg=DANGER_SOFT_FG,
-                       bd=0, relief="flat", font=FONT_LABEL, pady=8,
-                       activebackground=DANGER, activeforeground=WHITE,
-                       command=self._quit)
-        b3.pack(side="left", fill="x", expand=True, padx=(2, 6))
-        b3.bind("<Enter>", lambda e: b3.config(bg=DANGER, fg=WHITE))
-        b3.bind("<Leave>", lambda e: b3.config(bg=DANGER_SOFT, fg=DANGER_SOFT_FG))
+        self._bind_tip(self.pause_btn, "暂停或继续全部特效（Ctrl+Alt+R）。")
+        for txt, cmd, bg, fg, hbg, hfg, tip in (
+                ("隐藏到托盘", self.hide, BTN, TEXT, BTN_H, TEXT,
+                 "收进托盘图标；右键那个图标可以再唤出面板。"),
+                ("退出", self._quit, DANGER_SOFT, DANGER_SOFT_FG, DANGER,
+                 WHITE, "退出程序，特效与面板一起关闭。")):
+            b = tk.Button(fab, text=txt, bg=bg, fg=fg, bd=0, relief="flat",
+                          font=FONT_LABEL, padx=12, pady=6, cursor="hand2",
+                          activebackground=hbg, activeforeground=hfg,
+                          command=cmd)
+            b.pack(side="left", padx=2, pady=6)
+            b.bind("<Enter>", lambda e, w=b, c=hbg, f=hfg: w.config(bg=c, fg=f))
+            b.bind("<Leave>", lambda e, w=b, c=bg, f=fg: w.config(bg=c, fg=f))
+            self._bind_tip(b, tip)
 
         # ---- 内容区（无滚动条，滚轮仍可上下滚动）----
         cont = tk.Frame(main, bg=BG)
@@ -997,8 +1083,9 @@ class ControlPanel:
         canvas.pack(fill="both", expand=True)
         inner = tk.Frame(canvas, bg=BG)
         win = canvas.create_window((0, 0), window=inner, anchor="nw")
-        inner.bind("<Configure>",
-                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        # inner 尺寸一变就重算滚动区（切页、增删预设都会变）。走 _sync_scroll
+        # 而不是直接写 bbox：滚到底时还要给悬浮操作条留出让位（见那里）。
+        inner.bind("<Configure>", lambda e: self._sync_scroll())
         canvas.bind("<Configure>",
                     lambda e: (canvas.itemconfig(win, width=e.width),
                                self._sync_scroll()))
@@ -1006,9 +1093,11 @@ class ControlPanel:
         # 那个控件，不会冒泡到父容器 —— 鼠标停在页面里的卡片、滑块上时毫无反应，
         # 配置项一多，下面的"预设方案"就永远滚不到（颜料盘页踩过）。
         # 改成 bind_all + 归属判断：只有事件来自内容区才滚，对话框不受影响。
+        # 侧栏也走同一个 bind_all，由 _on_wheel_all 分派 —— 挂两个 bind_all
+        # 时后者会整条顶掉前者（不带 add="+"），这是踩过一次的真坑。
         canvas.bind("<MouseWheel>", self._on_wheel)
         inner.bind("<MouseWheel>", self._on_wheel)
-        root.bind_all("<MouseWheel>", self._on_wheel)
+        root.bind_all("<MouseWheel>", self._on_wheel_all)
         self._canvas = canvas
         self._inner = inner
 
@@ -1025,12 +1114,17 @@ class ControlPanel:
             "真实水波": self._page_wave,
             "点击表情": self._page_click_emoji,
             "点击文字": self._page_click_text,
+            "点击音效": self._page_click_sfx,
             "窗口水波": self._page_win,
             "其它": self._page_other,
         }
         # 按侧栏顺序注册：_pages 的键序即导航顺序，测试直接比对二者
         for name in fx_kinds.nav_order():
             self._pages[name] = builders[name](inner)
+        # 建页时所有行都是按创建顺序 pack 的（when 条件还没生效）—— 这里按
+        # 当前配置收一次：默认「内置图案」时不该看见素材行与单次选择。
+        # 必须赶在 _fit_height 量页面高度之前，否则量到的是"全都露出来"的高。
+        self._refresh_rows()
         for f in self._pages.values():
             f.pack_forget()
         self._show_page(self._load_last_page())
@@ -1043,16 +1137,47 @@ class ControlPanel:
 
     # ------------------------------------------------------------ 侧栏/导航
     def _nav_group(self, side, text):
-        """侧栏分组标题：小一号的次级灰字，与导航项拉开层级。"""
-        lbl = tk.Label(side, text=text, bg=SIDEBAR_BG, fg=SUB,
-                       font=FONT_SMALL, anchor="w")
-        lbl.pack(fill="x", padx=14, pady=(12, 2))
+        """侧栏分组标题：点一下折叠/展开整组。
+
+        特效项有 13 个，窗口压矮时侧栏会溢出屏幕 —— 除了滚轮，折叠是更快的
+        办法：只留当前在用的那一组。折叠状态存 ui_state，重启后还记得。
+        """
+        open_ = text not in self._nav_collapsed
+        b = tk.Frame(side, bg=SIDEBAR_BG, cursor="hand2")
+        b.pack(fill="x", padx=6, pady=(10, 2))
+        lbl = tk.Label(b, text=("▼  " if open_ else "▶  ") + text, bg=SIDEBAR_BG,
+                       fg=SUB, font=FONT_SMALL, anchor="w")
+        lbl.pack(fill="x", padx=8, pady=3)
+
+        def _enter(_e):
+            b.config(bg=NAV_HOVER)
+            lbl.config(bg=NAV_HOVER)
+
+        def _leave(_e):
+            b.config(bg=SIDEBAR_BG)
+            lbl.config(bg=SIDEBAR_BG)
+
+        def _toggle(_e=None):
+            self._toggle_nav_group(text)
+
+        for w in (b, lbl):
+            w.bind("<ButtonPress-1>", _toggle)
+            w.bind("<Enter>", _enter)
+            w.bind("<Leave>", _leave)
+        self._nav_groups[text] = {"frame": b, "label": lbl, "open": open_}
+        self._nav_entries.append({"w": b, "when": None,
+                                  "opts": dict(fill="x", padx=6,
+                                               pady=(10, 2))})
 
     def _nav_sep(self, side):
         """导航项与设置之间的发丝分隔线。"""
-        tk.Frame(side, bg=LINE, height=1).pack(fill="x", padx=12, pady=(12, 4))
+        f = tk.Frame(side, bg=LINE, height=1)
+        f.pack(fill="x", padx=12, pady=(12, 4))
+        self._nav_entries.append({"w": f, "when": None,
+                                  "opts": dict(fill="x", padx=12,
+                                               pady=(12, 4))})
 
-    def _nav_item(self, side, label, name):
+    def _nav_item(self, side, label, name, group=None):
         b = tk.Frame(side, bg=SIDEBAR_BG, height=44)
         b.pack(fill="x")
         b.pack_propagate(False)
@@ -1087,21 +1212,255 @@ class ControlPanel:
             w.bind("<Enter>", _enter)
             w.bind("<Leave>", _leave)
         self._nav[name] = {"frame": b, "label": txt, "line": line, "icon": icon}
+        # 分组折叠时这一项跟着藏起来；`when` 每次重排时现算，所以改完
+        # _nav_groups 的 open 立刻生效
+        if group is not None:
+            when = (lambda g=group: self._nav_groups[g]["open"])
+        else:
+            when = None
+        self._nav_entries.append({"w": b, "when": when,
+                                  "opts": dict(fill="x")})
+
+    def _toggle_nav_group(self, name):
+        """折叠/展开一个分组，并把状态落盘（重启后还记得）。"""
+        g = self._nav_groups.get(name)
+        if g is None:
+            return
+        g["open"] = not g["open"]
+        g["label"].config(text=("▼  " if g["open"] else "▶  ") + name)
+        if g["open"]:
+            self._nav_collapsed.discard(name)
+        else:
+            self._nav_collapsed.add(name)
+        self._ui["nav_collapsed"] = sorted(self._nav_collapsed)
+        self._save_ui_state()
+        self._repack(self._nav_entries)
+        self._sync_nav_scroll()
+
+    def _on_nav_wheel(self, e):
+        """侧栏滚轮：只认来自侧栏子树的滚轮事件。
+
+        装得下时不滚：这时候滚起来只会把分组标题拉出可见区。
+        返回值不用管 —— 分派由 `_on_wheel_all` 做（两处各绑一个 bind_all 时，
+        后绑的会整条替换掉先绑的，这个坑已经踩过一次）。
+        """
+        if not self._nav_need_scroll():
+            self._nav_cv.yview_moveto(0)
+            return
+        self._nav_cv.yview_scroll(int(-1 * (e.delta / 120)), "units")
+
+    def _in_subtree(self, w, anc):
+        """w 是否在 anc 的子树里（含 anc 自己）。
+
+        Tk 的 widget 树用 `master` 串起来，但 **bind_all 收到的 e.widget 可能是
+        内部子控件**（如 Text 的显示框），沿 master 一定走得回 anc。
+        """
+        while w is not None:
+            if w is anc:
+                return True
+            w = getattr(w, "master", None)
+        return False
+
+    def _nav_view_h(self):
+        """侧栏可用高度 = canvas 高 − 左下角悬浮操作条让位。
+
+        操作条贴在窗口左下角、压在侧栏之上，不扣掉这一段的话最下面那几项
+        （「其它设置」）会正好躲到条子后面 —— 看得见标题点不着。
+        """
+        try:
+            return max(120, int(self._nav_cv.winfo_height()) - self._fab_clear())
+        except Exception:
+            return 120
+
+    def _nav_need_scroll(self):
+        """侧栏装不下吗？用 inner 的请求高度比（scrollregion 在折叠/展开
+        之后要等下一次 Configure 才更新，不能拿它判）。"""
+        try:
+            return int(self._nav_in.winfo_reqheight()) > self._nav_view_h()
+        except Exception:
+            return False
+
+    def _sync_nav_scroll(self):
+        """重算侧栏滚动区；装得下时收成视口高度，滚轮就彻底动不了。
+
+        装不下时底部多留一段 `_fab_clear()`：滚到底后最后一项能整个爬到
+        悬浮操作条上方。
+        """
+        bb = self._nav_cv.bbox("all")
+        if not bb:
+            return
+        vh = self._nav_view_h()
+        top, bottom = int(bb[1]), int(bb[3])
+        if bottom - top <= vh:
+            self._nav_cv.configure(scrollregion=(bb[0], top, bb[2], top + vh))
+            self._nav_cv.yview_moveto(0)
+        else:
+            self._nav_cv.configure(scrollregion=(bb[0], top, bb[2],
+                                                 bottom + self._fab_clear()))
+
+    # ------------------------------------------------------------ 悬浮提示
+    def _bind_tip(self, widget, text):
+        """把一段说明挂到控件上：鼠标停 0.4 秒弹出，离开/点击即收起。
+
+        只挂**配置项名称**（不是整行）：名称是"这是什么"的唯一答案，滑块与
+        开关自己已经会用光标语言说话。整行都挂的话，鼠标只是路过就会弹一
+        堆框，反而看不清东西。
+        """
+        if not text:
+            return
+        widget.bind("<Enter>",
+                    lambda e: self._tip_schedule(widget, text), add="+")
+        widget.bind("<Leave>", lambda e: self._tip_hide(), add="+")
+        widget.bind("<ButtonPress-1>", lambda e: self._tip_hide(), add="+")
+
+    def _tip_schedule(self, widget, text):
+        self._tip_hide()
+        self._tip_after = self.root.after(
+            TIP_DELAY, lambda: self._tip_show(widget, text))
+
+    def _tip_hide(self):
+        if getattr(self, "_tip_after", None):
+            try:
+                self.root.after_cancel(self._tip_after)
+            except Exception:
+                pass
+            self._tip_after = None
+        w = getattr(self, "_tip_win", None)
+        if w is not None:
+            try:
+                w.withdraw()
+            except Exception:
+                pass
+
+    def _tip_show(self, widget, text):
+        self._tip_after = None
+        if getattr(self, "_quitting", False):
+            return
+        try:
+            if not widget.winfo_ismapped():
+                return          # 行被藏起来了（换来源/折分组），别弹
+        except Exception:
+            return
+        w = getattr(self, "_tip_win", None)
+        if w is None:
+            w = tk.Toplevel(self.root)
+            w.overrideredirect(True)
+            w.attributes("-topmost", True)
+            w.configure(bg=LINE, highlightthickness=1,
+                        highlightbackground=LINE, highlightcolor=LINE)
+            self._tip_lb = tk.Label(w, bg=CARD, fg=TEXT, font=FONT_SMALL,
+                                    anchor="w", justify="left",
+                                    wraplength=TIP_WRAP, padx=10, pady=6)
+            self._tip_lb.pack()
+            self._tip_win = w
+            w.withdraw()       # 先藏着，避免在 (0,0) 闪一下
+        self._tip_lb.config(text=text)
+        w.update_idletasks()
+        tw, th = int(w.winfo_reqwidth()), int(w.winfo_reqheight())
+        x = int(widget.winfo_rootx()) + 8
+        y = int(widget.winfo_rooty()) + int(widget.winfo_height()) + 4
+        # 夹回屏幕内：副屏/多屏下右上角可能没空间，别让提示飞出可见区域
+        sw = int(self.root.winfo_screenwidth())
+        sh = int(self.root.winfo_screenheight())
+        x = min(max(0, x), max(0, sw - tw))
+        y = min(max(0, y), max(0, sh - th))
+        w.geometry(f"+{x}+{y}")
+        w.deiconify()
+        self._tip_adopt()
+        w.lift()
+
+    def _tip_adopt(self):
+        """把提示浮层设成面板的**从属窗口**（GWLP_HWNDPARENT）。
+
+        为什么必须做：面板自己是置顶窗，而且每 1 秒抢一次置顶组顶部
+        （`_raise_top`）。一个"只是也置顶"的提示会被它挤到下面 —— 表现就是
+        提示一闪就没了、用户根本看不见。被拥有的窗口**永远画在拥有者之上**，
+        这条关系不受抢位影响，也不用去跟自己的抢位逻辑打配合。
+
+        时机很关键：要在 `deiconify()` **之后**设。overrideredirect 的 Toplevel
+        在 withdraw/deiconify 之间会换掉底层窗口，之前设的 owner 会随着旧
+        hwnd 一起作废（实测：创建时就设，回读拿到的是 0）。
+        """
+        w = getattr(self, "_tip_win", None)
+        if w is None:
+            return
+        try:
+            from _win32 import set_window_owner, top_hwnd
+            set_window_owner(top_hwnd(w), self._hwnd())
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------ 行重排
+    def _reg_row(self, card, widget, when=None, **opts):
+        """把卡片里的一行登记进可见性表（opts = 它原本的 pack 参数）。
+
+        为什么要登记：条件行（如「图案来源=自选图片」时才显示的素材行）
+        显示/隐藏时若直接 pack，会被排到卡片末尾 —— pack 顺序即视觉顺序。
+        重排时先全部 pack_forget 再按登记顺序 pack，行才会回到原位。
+        """
+        self._card_rows.setdefault(card, []).append(
+            {"w": widget, "when": when, "opts": opts})
+
+    def _repack(self, entries):
+        """按登记顺序重排一组控件：先全收起，再让 when() 为真的按原位回来。"""
+        for e in entries:
+            try:
+                e["w"].pack_forget()
+            except Exception:
+                pass
+        for e in entries:
+            if e["when"] is None or e["when"]():
+                try:
+                    e["w"].pack(**e["opts"])
+                except Exception:
+                    pass
+
+    def _refresh_rows(self):
+        """重排所有带条件行的卡片（目前只有「点击表情」页有）。"""
+        for rows in self._card_rows.values():
+            if any(r["when"] is not None for r in rows):
+                self._repack(rows)
+
+    def _src_is_builtin(self):
+        """点击表情的图案来源是不是内置图案。"""
+        return fx_effects.normalize_source(
+            self.app.cfg.get("click_emoji_source")) == \
+            fx_effects.CLICK_SOURCE_BUILTIN
+
+    def _src_has_images(self):
+        """来源是图片（自选/文件夹）—— 素材行与「单次选择」只在这种时候有意义。"""
+        return not self._src_is_builtin()
+
+    def _on_emoji_source(self, _src=None):
+        """图案来源变了：立刻重排该显哪几行，并让素材状态行跟上。"""
+        fx_effects.invalidate_media_cache()
+        self._refresh_rows()
+        rf = self._ctrls.get("click_emoji_files")
+        if rf is not None:
+            rf["refresh"]()
+
+    def _on_wheel_all(self, e):
+        """滚轮总入口：按事件来源分派给侧栏或内容区。
+
+        必须是**唯一**一个 bind_all 处理器 —— 每次 `bind_all` 都会整条替换掉
+        同名序列上的既有绑定（`add="+"` 才会追加），两个地方各绑一个时后绑的
+        会把先绑的悄悄顶掉（侧栏滚轮就是这么失效的：内容区那份在后面建的）。
+
+        两侧各自再做一次归属判断：来自别处（保存预设对话框等）的滚轮一律不管，
+        否则在对话框里滚动会把背后的页面一起滚走。
+        """
+        w = e.widget
+        if self._in_subtree(w, self._nav_cv):
+            self._on_nav_wheel(e)
+        elif self._in_subtree(w, self._canvas):
+            self._on_wheel(e)
 
     def _on_wheel(self, e):
-        """内容区滚轮。挂在 bind_all 上接收，但要判断事件来自哪 ——
-        否则"保存为预设"对话框里滚动会把背后的页面一起滚走。
+        """内容区滚轮。归属判断由 `_on_wheel_all` 做完了，这里只管滚。
 
         内容装得下时**直接不滚**：这时候滚起来只能把顶部拉走、露出下面一片空白。
         （用户报过："下雨界面这些要素较少的，不要把顶部往下拉"。）
         """
-        w = e.widget
-        while w is not None:
-            if w is self._canvas:
-                break
-            w = getattr(w, "master", None)
-        else:
-            return
         if not self._need_scroll():
             self._canvas.yview_moveto(0)
             return
@@ -1134,8 +1493,23 @@ class ControlPanel:
             return False
         return int(f.winfo_reqheight()) > self._view_h()
 
+    def _fab_clear(self):
+        """悬浮操作条占掉的窗口底部高度（条子本身 + 离底偏移 + 余量）。
+
+        窗口按内容自适应时要把这段算进去，否则条子会压在最后一行控件上
+        （预设按钮被盖住半个，点不着）；滚到底时也要留出让位。
+        """
+        try:
+            return int(self._fab.winfo_reqheight()) + 26
+        except Exception:
+            return 64
+
     def _sync_scroll(self):
-        """重算滚动区域。装得下时把区域收成**视口高度**，滚轮就彻底动不了。"""
+        """重算滚动区域。装得下时把区域收成**视口高度**，滚轮就彻底动不了。
+
+        装不下时底部多留一段 `_fab_clear()`：滚到底后最后一行能整个爬到
+        悬浮操作条上方，不会被它压住。
+        """
         bb = self._canvas.bbox("all")
         if not bb:
             return
@@ -1145,7 +1519,8 @@ class ControlPanel:
             self._canvas.configure(scrollregion=(bb[0], top, bb[2], top + vh))
             self._canvas.yview_moveto(0)
         else:
-            self._canvas.configure(scrollregion=(bb[0], top, bb[2], bottom))
+            self._canvas.configure(scrollregion=(bb[0], top, bb[2],
+                                                 bottom + self._fab_clear()))
 
     def _fit_height(self):
         """定下窗口尺寸：宽度用默认值或用户记忆值，高度**按内容自适应**。
@@ -1172,7 +1547,9 @@ class ControlPanel:
         if self._user_h:
             h = self._clamp_h(self._user_h)
         else:
-            h = self._clamp_h(max(self.H_MIN, content + self._chrome))
+            # +fab_clear：给右下角的悬浮操作条留位，别让它压住最后一行控件
+            h = self._clamp_h(max(self.H_MIN,
+                                  content + self._chrome + self._fab_clear()))
         w = self._clamp_w(self._user_w or self.W_DEF)
         # 不能只在 `w/h != self.W/self.H` 时才应用：窗口尺寸可能被外部改过
         # （测试里压矮造溢出、用户拖过了）而 W/H 没变 -> 就恢复不回来了。
@@ -1190,6 +1567,7 @@ class ControlPanel:
         self._sync_size_rows()
 
     def _show_page(self, name):
+        self._tip_hide()
         for n, f in self._pages.items():
             if n == name:
                 f.pack(fill="x")
@@ -1197,6 +1575,18 @@ class ControlPanel:
                 f.pack_forget()
         self._active = name
         self._save_last_page(name)
+        # 活动页所在的分组若是折叠的，侧栏里就看不到高亮在哪 —— 展开它
+        # （只能发生在"重启后恢复的上次页面"：折叠状态下那一次点击根本
+        #  点不到，所以不会和用户正在进行的折叠操作打架）。
+        g = self._nav_group_of.get(name)
+        if g is not None and g in self._nav_groups \
+                and not self._nav_groups[g]["open"]:
+            self._nav_groups[g]["open"] = True
+            self._nav_groups[g]["label"].config(text="▼  " + g)
+            self._nav_collapsed.discard(g)
+            self._ui["nav_collapsed"] = sorted(self._nav_collapsed)
+            self._save_ui_state()
+            self._repack(self._nav_entries)
         for n, info in self._nav.items():
             if n == name:
                 info["frame"].config(bg=NAV_ACTIVE)
@@ -1291,9 +1681,17 @@ class ControlPanel:
         return frame
 
     def _save_bar(self, card, page_key):
-        """“保存当前为预设”主操作：追加到配置属性卡片底部，与属性同块。"""
-        tk.Frame(card, height=1, bg=LINE).pack(fill="x", padx=16, pady=(12, 8))
-        btn = tk.Button(card, text="保存当前为预设", bg=ACCENT, fg=ON_ACCENT, bd=0,
+        """“保存当前为预设”主操作：追加到配置属性卡片底部，与属性同块。
+
+        整体包进一个容器 Frame 再登记进行可见性表：这个卡片里可能有条件行
+        （换来源时显隐），重排会把它连同其它行一起重新 pack —— 不包容器的
+        话，分隔线与按钮是两次独立 pack，重排后顺序就乱了。
+        """
+        box = tk.Frame(card, bg=CARD)
+        box.pack(fill="x")
+        self._reg_row(card, box, fill="x")
+        tk.Frame(box, height=1, bg=LINE).pack(fill="x", padx=16, pady=(12, 8))
+        btn = tk.Button(box, text="保存当前为预设", bg=ACCENT, fg=ON_ACCENT, bd=0,
                         relief="flat", font=FONT_LABEL, pady=7, cursor="hand2",
                         activebackground=ACCENT_HOVER,
                         command=lambda: self._save_preset_dialog(page_key))
@@ -1466,15 +1864,25 @@ class ControlPanel:
         self._page_head(p, "下雨")
         c = tk.Frame(p, bg=CARD)
         c.pack(fill="x", padx=16, pady=(0, 8))
-        self._toggle(c, "启用下雨", "rain_enabled")
-        self._slider(c, "雨量", "rain_amount", 0, 800, 5, "{:.0f} 滴")
-        self._slider(c, "下落速度", "rain_speed", 200, 2200, 10, "{:.0f} 像素/秒")
-        self._slider(c, "雨丝长度", "rain_length", 0.3, 2.6, 0.05, "{:.2f} 倍")
-        self._slider(c, "风力（左负右正）", "wind", -1.0, 1.0, 0.01, "{:+.2f}")
-        self._slider(c, "浓度", "rain_opacity", 0.05, 1.0, 0.01, "{:.0%}")
+        self._toggle(c, "启用下雨", "rain_enabled",
+                     tip="打开后全屏落雨；关掉时这一层什么都不画。")
+        self._slider(c, "雨量", "rain_amount", 0, 800, 5, "{:.0f} 滴",
+                     tip="同时在屏幕上的雨滴数。调大更密，开销也线性上升。")
+        self._slider(c, "下落速度", "rain_speed", 200, 2200, 10,
+                     "{:.0f} 像素/秒", tip="雨滴掉得多快。")
+        self._slider(c, "雨丝长度", "rain_length", 0.3, 2.6, 0.05,
+                     "{:.2f} 倍",
+                     tip="每滴雨拖出的尾线长度倍数：0.3 接近点状，"
+                         "2.6 是细长斜线。")
+        self._slider(c, "风力（左负右正）", "wind", -1.0, 1.0, 0.01, "{:+.2f}",
+                     tip="横向推力：负值向左、正值向右，雨丝会跟着倾斜。")
+        self._slider(c, "浓度", "rain_opacity", 0.05, 1.0, 0.01, "{:.0%}",
+                     tip="整层雨的不透明度，也就是桌面能透出多少。")
         # 溅水花属于下雨本身（它只在雨滴落到底边时触发），从"其它"页搬过来
-        self._toggle(c, "雨滴落地溅水花", "splash")
-        self._swatch(c, "雨丝颜色", "rain_color", RAIN_COLORS)
+        self._toggle(c, "雨滴落地溅水花", "splash",
+                     tip="雨滴落到底边时溅起一小圈水花。")
+        self._swatch(c, "雨丝颜色", "rain_color", RAIN_COLORS,
+                     tip="雨丝用哪一族颜色；每滴新雨从里面随机取一色。")
         self._save_bar(c, "下雨")
         self._preset_block(p, "下雨")
         return p
@@ -1484,16 +1892,27 @@ class ControlPanel:
         self._page_head(p, "下雪")
         c = tk.Frame(p, bg=CARD)
         c.pack(fill="x", padx=16, pady=(0, 8))
-        self._toggle(c, "启用下雪", "snow_enabled")
-        self._slider(c, "雪量", "snow_amount", 0, 800, 5, "{:.0f} 片")
-        self._slider(c, "飘落速度", "snow_speed", 20, 300, 5, "{:.0f} 像素/秒")
-        self._slider(c, "雪花大小", "snow_size", 0.4, 2.5, 0.1, "{:.1f} 倍")
-        self._slider(c, "横向漂移", "snow_drift", -0.6, 0.6, 0.01, "{:+.2f}")
-        self._slider(c, "风速(阵风)", "snow_wind", -180, 180, 5, "{:+.0f} 像素/秒")
-        self._slider(c, "闪烁", "snow_twinkle", 0.0, 0.7, 0.05, "{:.0%}")
-        self._slider(c, "辉光", "snow_glow", 0.0, 1.0, 0.05, "{:.0%}")
-        self._slider(c, "浓度", "snow_opacity", 0.05, 1.0, 0.01, "{:.0%}")
-        self._swatch(c, "雪花颜色", "snow_color", SNOW_COLORS)
+        self._toggle(c, "启用下雪", "snow_enabled",
+                     tip="打开后全屏飘雪。")
+        self._slider(c, "雪量", "snow_amount", 0, 800, 5, "{:.0f} 片",
+                     tip="同时在屏幕上的雪花数。")
+        self._slider(c, "飘落速度", "snow_speed", 20, 300, 5,
+                     "{:.0f} 像素/秒", tip="雪花掉得多快。")
+        self._slider(c, "雪花大小", "snow_size", 0.4, 2.5, 0.1, "{:.1f} 倍",
+                     tip="雪花直径的倍数。")
+        self._slider(c, "横向漂移", "snow_drift", -0.6, 0.6, 0.01, "{:+.2f}",
+                     tip="雪花左右摇摆的幅度（相对下落速度）。")
+        self._slider(c, "风速(阵风)", "snow_wind", -180, 180, 5,
+                     "{:+.0f} 像素/秒",
+                     tip="一阵一阵的风，把雪整体推向一边；数值是最大风速。")
+        self._slider(c, "闪烁", "snow_twinkle", 0.0, 0.7, 0.05, "{:.0%}",
+                     tip="雪花亮度随机起伏的幅度，0 就是不闪。")
+        self._slider(c, "辉光", "snow_glow", 0.0, 1.0, 0.05, "{:.0%}",
+                     tip="雪花边缘柔光的强度。")
+        self._slider(c, "浓度", "snow_opacity", 0.05, 1.0, 0.01, "{:.0%}",
+                     tip="整层雪的不透明度。")
+        self._swatch(c, "雪花颜色", "snow_color", SNOW_COLORS,
+                     tip="雪花用哪一族颜色。")
         self._save_bar(c, "下雪")
         self._preset_block(p, "下雪")
         return p
@@ -1503,17 +1922,29 @@ class ControlPanel:
         self._page_head(p, "落樱")
         c = tk.Frame(p, bg=CARD)
         c.pack(fill="x", padx=16, pady=(0, 8))
-        self._toggle(c, "启用落樱", "petal_enabled")
-        self._slider(c, "花瓣数量", "petal_amount", 0, 600, 5, "{:.0f} 片")
-        self._slider(c, "飘落速度", "petal_speed", 10, 260, 5, "{:.0f} 像素/秒")
-        self._slider(c, "花瓣大小", "petal_size", 0.4, 2.5, 0.1, "{:.1f} 倍")
-        self._slider(c, "横向漂移", "petal_drift", -0.6, 0.6, 0.01, "{:+.2f}")
-        self._slider(c, "风速(阵风)", "petal_wind", -180, 180, 5, "{:+.0f} 像素/秒")
-        self._slider(c, "自旋", "petal_spin", 0.0, 2.0, 0.05, "{:.2f} 倍")
-        self._slider(c, "翻面", "petal_flutter", 0.0, 1.0, 0.05, "{:.0%}")
-        self._slider(c, "浓度", "petal_opacity", 0.05, 1.0, 0.01, "{:.0%}")
-        self._swatch(c, "花瓣颜色", "petal_color", PETAL_COLORS)
-        self._swatch(c, "边缘颜色(翻面泛白)", "petal_edge_color", PETAL_EDGE_COLORS)
+        self._toggle(c, "启用落樱", "petal_enabled",
+                     tip="打开后全屏飘落花瓣。")
+        self._slider(c, "花瓣数量", "petal_amount", 0, 600, 5, "{:.0f} 片",
+                     tip="同时在屏幕上的花瓣数。")
+        self._slider(c, "飘落速度", "petal_speed", 10, 260, 5,
+                     "{:.0f} 像素/秒", tip="花瓣掉得多快。")
+        self._slider(c, "花瓣大小", "petal_size", 0.4, 2.5, 0.1, "{:.1f} 倍",
+                     tip="花瓣直径的倍数。")
+        self._slider(c, "横向漂移", "petal_drift", -0.6, 0.6, 0.01, "{:+.2f}",
+                     tip="花瓣左右摇摆的幅度。")
+        self._slider(c, "风速(阵风)", "petal_wind", -180, 180, 5,
+                     "{:+.0f} 像素/秒",
+                     tip="一阵一阵的风，把花瓣整体推向一边。")
+        self._slider(c, "自旋", "petal_spin", 0.0, 2.0, 0.05, "{:.2f} 倍",
+                     tip="花瓣自转的快慢。")
+        self._slider(c, "翻面", "petal_flutter", 0.0, 1.0, 0.05, "{:.0%}",
+                     tip="花瓣翻面（正反面颜色互换）的频率。")
+        self._slider(c, "浓度", "petal_opacity", 0.05, 1.0, 0.01, "{:.0%}",
+                     tip="整层花瓣的不透明度。")
+        self._swatch(c, "花瓣颜色", "petal_color", PETAL_COLORS,
+                     tip="花瓣正面的颜色。")
+        self._swatch(c, "边缘颜色(翻面泛白)", "petal_edge_color",
+                     PETAL_EDGE_COLORS, tip="花瓣边缘的颜色，翻面时会泛白。")
         self._save_bar(c, "落樱")
         self._preset_block(p, "落樱")
         return p
@@ -1523,17 +1954,28 @@ class ControlPanel:
         self._page_head(p, "流星雨")
         c = tk.Frame(p, bg=CARD)
         c.pack(fill="x", padx=16, pady=(0, 8))
-        self._toggle(c, "启用流星雨", "meteor_enabled")
-        self._slider(c, "流星数量", "meteor_amount", 0, 120, 1, "{:.0f} 颗")
-        self._slider(c, "飞行速度", "meteor_speed", 120, 2400, 20, "{:.0f} 像素/秒")
-        self._slider(c, "拖尾长度", "meteor_length", 40, 900, 10, "{:.0f} 像素")
-        self._slider(c, "飞行角度", "meteor_angle", -80, 80, 1, "{:+.0f} °")
-        self._slider(c, "流星粗细", "meteor_size", 0.4, 3.0, 0.1, "{:.1f} 倍")
-        self._slider(c, "头部辉光", "meteor_glow", 0.0, 1.0, 0.05, "{:.0%}")
-        self._slider(c, "星空密度", "meteor_stars", 0.0, 1.0, 0.05, "{:.0%}")
-        self._slider(c, "浓度", "meteor_opacity", 0.05, 1.0, 0.01, "{:.0%}")
-        self._swatch(c, "头部颜色", "meteor_color", METEOR_COLORS)
-        self._swatch(c, "拖尾颜色", "meteor_tail_color", METEOR_TAIL_COLORS)
+        self._toggle(c, "启用流星雨", "meteor_enabled",
+                     tip="打开后夜空中不时划过流星，可以配一片静态星空。")
+        self._slider(c, "流星数量", "meteor_amount", 0, 120, 1, "{:.0f} 颗",
+                     tip="同时在场的流星数。")
+        self._slider(c, "飞行速度", "meteor_speed", 120, 2400, 20,
+                     "{:.0f} 像素/秒", tip="流星划过天空的速度。")
+        self._slider(c, "拖尾长度", "meteor_length", 40, 900, 10,
+                     "{:.0f} 像素", tip="尾部拉出多长。")
+        self._slider(c, "飞行角度", "meteor_angle", -80, 80, 1, "{:+.0f} °",
+                     tip="相对水平面的夹角：负值向左下、正值向右下。")
+        self._slider(c, "流星粗细", "meteor_size", 0.4, 3.0, 0.1,
+                     "{:.1f} 倍", tip="流星本体的粗细倍数。")
+        self._slider(c, "头部辉光", "meteor_glow", 0.0, 1.0, 0.05, "{:.0%}",
+                     tip="流星头部光晕的强度。")
+        self._slider(c, "星空密度", "meteor_stars", 0.0, 1.0, 0.05, "{:.0%}",
+                     tip="背景星星的多少，0 就是一片黑。")
+        self._slider(c, "浓度", "meteor_opacity", 0.05, 1.0, 0.01, "{:.0%}",
+                     tip="整层的不透明度。")
+        self._swatch(c, "头部颜色", "meteor_color", METEOR_COLORS,
+                     tip="流星头（最亮那一端）的颜色。")
+        self._swatch(c, "拖尾颜色", "meteor_tail_color", METEOR_TAIL_COLORS,
+                     tip="尾部渐隐到的颜色。")
         self._save_bar(c, "流星雨")
         self._preset_block(p, "流星雨")
         return p
@@ -1543,18 +1985,30 @@ class ControlPanel:
         self._page_head(p, "颜料盘")
         c = tk.Frame(p, bg=CARD)
         c.pack(fill="x", padx=16, pady=(0, 8))
-        self._toggle(c, "启用颜料盘", "paint_enabled")
-        self._slider(c, "笔刷大小", "paint_brush", 0.3, 3.0, 0.1, "{:.1f} 倍")
-        self._slider(c, "落色量", "paint_flow", 0.0, 2.5, 0.05, "{:.2f} 倍")
-        self._slider(c, "搅动强度", "paint_swirl", 0.0, 2.5, 0.05, "{:.2f} 倍")
-        self._slider(c, "点击扩散", "paint_click", 0.0, 2.5, 0.05, "{:.2f} 倍")
-        self._slider(c, "晕染", "paint_diffusion", 0.0, 1.0, 0.05, "{:.0%}")
-        self._slider(c, "消隐速度", "paint_fade", 0.0, 1.0, 0.05, "{:.0%}")
-        self._slider(c, "辉光", "paint_glow", 0.0, 1.0, 0.05, "{:.0%}")
-        self._slider(c, "立体感", "paint_shading", 0.0, 1.0, 0.05, "{:.0%}")
-        self._slider(c, "色相铺开", "paint_hue_spread", 0.0, 1.0, 0.05, "{:.0%}")
-        self._slider(c, "浓度", "paint_opacity", 0.05, 1.0, 0.01, "{:.0%}")
-        self._swatch(c, "基准色", "paint_color", PAINT_COLORS)
+        self._toggle(c, "启用颜料盘", "paint_enabled",
+                     tip="鼠标拖过的地方留下颜料，像在桌面上画画。")
+        self._slider(c, "笔刷大小", "paint_brush", 0.3, 3.0, 0.1,
+                     "{:.1f} 倍", tip="笔刷的粗细倍数。")
+        self._slider(c, "落色量", "paint_flow", 0.0, 2.5, 0.05, "{:.2f} 倍",
+                     tip="笔刷每次落下多少颜料。")
+        self._slider(c, "搅动强度", "paint_swirl", 0.0, 2.5, 0.05,
+                     "{:.2f} 倍", tip="把已有的颜料搅出旋涡的力度。")
+        self._slider(c, "点击扩散", "paint_click", 0.0, 2.5, 0.05,
+                     "{:.2f} 倍", tip="点一下鼠标时颜料向外洇开的幅度。")
+        self._slider(c, "晕染", "paint_diffusion", 0.0, 1.0, 0.05, "{:.0%}",
+                     tip="颜料边缘向外模糊的程度。")
+        self._slider(c, "消隐速度", "paint_fade", 0.0, 1.0, 0.05, "{:.0%}",
+                     tip="颜料慢慢褪色消失的快慢。")
+        self._slider(c, "辉光", "paint_glow", 0.0, 1.0, 0.05, "{:.0%}",
+                     tip="颜料边缘柔光的强度。")
+        self._slider(c, "立体感", "paint_shading", 0.0, 1.0, 0.05, "{:.0%}",
+                     tip="颜料团的高光与阴影，让它有厚度。")
+        self._slider(c, "色相铺开", "paint_hue_spread", 0.0, 1.0, 0.05,
+                     "{:.0%}", tip="每团颜料在基准色附近色相抖动的范围。")
+        self._slider(c, "浓度", "paint_opacity", 0.05, 1.0, 0.01, "{:.0%}",
+                     tip="颜料整体的不透明度。")
+        self._swatch(c, "基准色", "paint_color", PAINT_COLORS,
+                     tip="颜料的基准色；实际每团会在这个色附近抖动。")
         self._save_bar(c, "颜料盘")
         self._preset_block(p, "颜料盘")
         return p
@@ -1564,10 +2018,14 @@ class ControlPanel:
         self._page_head(p, "聚光灯")
         c = tk.Frame(p, bg=CARD)
         c.pack(fill="x", padx=16, pady=(0, 8))
-        self._toggle(c, "启用聚光灯", "spotlight_enabled")
-        self._slider(c, "亮区半径", "spotlight_radius", 80, 600, 10, "{:.0f} 像素")
-        self._slider(c, "压暗强度", "spotlight_dim", 0.1, 0.95, 0.01, "{:.0%}")
-        self._swatch(c, "压暗颜色", "spotlight_color", SPOTLIGHT_COLORS)
+        self._toggle(c, "启用聚光灯", "spotlight_enabled",
+                     tip="鼠标变成一盏灯：光圈里是亮的，光圈外整屏压暗。")
+        self._slider(c, "亮区半径", "spotlight_radius", 80, 600, 10,
+                     "{:.0f} 像素", tip="光圈有多大。")
+        self._slider(c, "压暗强度", "spotlight_dim", 0.1, 0.95, 0.01,
+                     "{:.0%}", tip="光圈外被压暗的程度。")
+        self._swatch(c, "压暗颜色", "spotlight_color", SPOTLIGHT_COLORS,
+                     tip="压暗时叠上去的颜色，默认接近黑。")
         self._save_bar(c, "聚光灯")
         self._preset_block(p, "聚光灯")
         return p
@@ -1577,30 +2035,30 @@ class ControlPanel:
         self._page_head(p, "宠物跟随")
         c = tk.Frame(p, bg=CARD)
         c.pack(fill="x", padx=16, pady=(0, 8))
-        self._toggle(c, "启用宠物跟随", "pet_enabled")
-        self._choices(c, "种类", "pet_kind", PET_KINDS)
-        self._slider(c, "数量", "pet_count", 1, 10, 1, "{:.0f} 只")
-        self._slider(c, "大小", "pet_size", 24, 120, 2, "{:.0f} 像素")
-        self._slider(c, "跟随紧密度", "pet_follow", 0.05, 1.0, 0.01, "{:.0%}")
+        self._toggle(c, "启用宠物跟随", "pet_enabled",
+                     tip="小猫小狗沿着鼠标划过的路线跟上来：第一只追光标，"
+                         "其余排成一列跟在它身后。形象由代码绘制，"
+                         "不依赖任何图片文件。")
+        self._choices(c, "种类", "pet_kind", PET_KINDS,
+                      tip="跟在你身后的是小猫还是小狗。")
+        self._slider(c, "数量", "pet_count", 1, 10, 1, "{:.0f} 只",
+                     tip="最多 10 只：第一只追光标，其余一个追一个。")
+        self._slider(c, "大小", "pet_size", 24, 120, 2, "{:.0f} 像素",
+                     tip="体型，也决定队列间距。")
+        self._slider(c, "跟随紧密度", "pet_follow", 0.05, 1.0, 0.01, "{:.0%}",
+                     tip="追得有多紧：调低是慢悠悠地追，调高就紧咬着不放。")
         self._slider(c, "最小移动距离", "pet_min_travel", 0.0, 300.0, 10.0,
-                     "{:.0f} 像素")
+                     "{:.0f} 像素",
+                     tip="露面之前鼠标得先真的走多远（按净位移算，原地来回"
+                         "抖动不算）：轻轻碰一下不会惊动它们。填 0 表示"
+                         "一动就现身。")
         self._slider(c, "静止后消失", "pet_idle_fade", 0.0, 6.0, 0.1,
-                     "{:.1f} 秒")
-        self._swatch(c, "毛色", "pet_color", PET_COLORS)
-        self._slider(c, "不透明度", "pet_opacity", 0.2, 1.0, 0.01, "{:.0%}")
-        self._hint(c, "小猫小狗沿着鼠标划过的路线跟上来：第一只追光标，"
-                      "其余排成一列跟在它身后（间距跟着体型走），最多 10 只。"
-                      "它们会甩着尾巴走、偶尔眨眼，停下时也会轻轻晃。")
-        self._hint(c, "「最小移动距离」是让它们露面之前，鼠标得先真的走多远"
-                      "（按净位移算，原地来回抖动不算）：轻轻碰一下不会惊动它们。"
-                      "露面时它们已经散在你刚走过的那段路线上，一出现就追上来，"
-                      "而不是在原地列队等你。")
-        self._hint(c, "「静止后消失」是光标停住多久后它们淡出（填 0 表示一直"
-                      "跟着不消失）；再次出现同样要先把鼠标移动一段距离。")
-        self._hint(c, "转身带一点迟滞，所以鼠标原地画圈时它们不会左右乱跳；"
-                      "「跟随紧密度」调低会更像慢悠悠地追，调高就紧咬着不放。")
-        self._hint(c, "形象是用代码画出来的，不依赖任何图片文件。"
-                      "换「毛色」会把描边、耳内与眼睛一起配色。")
+                     "{:.1f} 秒",
+                     tip="光标停住多久后它们淡出；填 0 表示一直跟着。")
+        self._swatch(c, "毛色", "pet_color", PET_COLORS,
+                     tip="毛色会连带耳朵内侧、描边和眼睛一起配色。")
+        self._slider(c, "不透明度", "pet_opacity", 0.2, 1.0, 0.01, "{:.0%}",
+                     tip="整体的不透明度。")
         self._save_bar(c, "宠物跟随")
         self._preset_block(p, "宠物跟随")
         return p
@@ -1620,67 +2078,96 @@ class ControlPanel:
         self._page_head(p, "点击表情")
         c = tk.Frame(p, bg=CARD)
         c.pack(fill="x", padx=16, pady=(0, 8))
-        self._toggle(c, "启用点击表情", "click_emoji_enabled")
+        self._toggle(c, "启用点击表情", "click_emoji_enabled",
+                     tip="打开后点一下鼠标，就在光标处炸开一簇图案。")
+        # 图案来源排在最前面：它决定下面露出来的是"挑图案"还是"挑素材"——
+        # 放到最后面时，用户改完来源还得滚回去找对应的控件。
+        self._choices(c, "图案来源", "click_emoji_source",
+                      fx_effects.CLICK_SOURCES, norm=fx_effects.normalize_source,
+                      on_change=self._on_emoji_source,
+                      tip="内置图案＝从自带形状里挑；自选图片＝选一张或多张"
+                          "（GIF 会动）；图片文件夹＝整摞里随机取。")
+        # 内置图案才谈得上挑形状与配色：用图片当图案时这两行不参与绘制，
+        # 所以整行藏掉（when 条件见 _src_is_builtin）。
         # 8 个图案排单行会把页面撑破最小宽度（内容区只有 400px），折成 4 列
         self._choices(c, "图案", "click_emoji_shape", CLICK_SHAPES, columns=4,
-                      on_change=self._on_shape_change)
-        self._slider(c, "数量", "click_emoji_count", 2, 40, 1, "{:.0f} 个")
-        self._slider(c, "大小", "click_emoji_size", 8, 64, 1, "{:.0f} 像素")
-        self._slider(c, "扩散", "click_emoji_spread", 100, 600, 10, "{:.0f}")
-        self._slider(c, "重力", "click_emoji_gravity", -2.0, 2.0, 0.1, "{:+.1f}")
+                      on_change=self._on_shape_change, when=self._src_is_builtin,
+                      tip="炸开的图案形状；选好形状会自动换上它的惯用色。")
+        self._asset_row(c, when=self._src_has_images,
+                        tip="自选图片可以选一张或多张；图片文件夹则每次从整摞"
+                            "里随机取。GIF 会按原来的速度循环播放。")
+        self._choices(c, "单次选择", "click_emoji_pick", fx_effects.CLICK_PICKS,
+                      when=self._src_has_images,
+                      tip="整簇同图＝一次点击全用同一张；随机多图＝每颗粒子"
+                          "各抽各的。")
+        self._choices(c, "图片方向", "click_emoji_align", IMG_ALIGNS,
+                      when=self._src_has_images,
+                      tip="竖直＝图片保持原朝向（像贴纸撒开）；"
+                          "随扩散方向＝图片跟着自己飞出去的方向转，"
+                          "甩出一条条轨迹，动感更强。")
+        self._slider(c, "数量", "click_emoji_count", 2, 40, 1, "{:.0f} 个",
+                     tip="一次点击炸出多少颗。")
+        self._slider(c, "大小", "click_emoji_size", 8, 64, 1, "{:.0f} 像素",
+                     tip="单颗图案的基准大小。")
+        self._slider(c, "扩散", "click_emoji_spread", 100, 600, 10, "{:.0f}",
+                     tip="炸开的空间范围。")
+        self._slider(c, "重力", "click_emoji_gravity", -2.0, 2.0, 0.1, "{:+.1f}",
+                     tip="图案炸开后往上飘还是往下掉：正数下坠、负数上浮。")
         self._slider(c, "持续时间", "click_emoji_life", 0.2, 1.5, 0.05,
-                     "{:.2f} 秒")
-        self._toggle(c, "粒子自旋", "click_emoji_rotate")
-        self._swatch(c, "颜色", "click_emoji_color", CLICK_EMOJI_COLORS)
+                     "{:.2f} 秒", tip="一簇图案从炸开到散尽的时间。")
+        self._toggle(c, "粒子自旋", "click_emoji_rotate",
+                     tip="飞行过程中图案自个儿旋转。")
+        self._swatch(c, "颜色", "click_emoji_color", CLICK_EMOJI_COLORS,
+                     when=self._src_is_builtin,
+                     tip="内置图案的颜色（用图片当图案时不参与绘制）；"
+                         "「彩色」＝每颗随机取一色。")
         self._slider(c, "不透明度", "click_emoji_opacity", 0.2, 1.0, 0.01,
-                     "{:.0%}")
-        self._hint(c, "点一下就在光标处炸开一簇图案。")
+                     "{:.0%}", tip="整簇图案的不透明度。")
+        self._toggle(c, "点击时播放语音", "click_voice_enabled",
+                     tip="每次点击随机播一段语音；上一段没播完时新的点击"
+                         "不响应（不排队，也就不会重叠）。")
+        self._folder(c, "语音文件夹", "click_voice_dir",
+                     status=self._voice_status,
+                     tip="放着音频文件的文件夹（wav/mp3/wma/m4a），每次点击"
+                         "随机挑一个播。")
         self._save_bar(c, "点击表情")
-
-        # 自定义素材单独一张卡：这些都不吃上面那几个旋钮 —— 用图片当图案时
-        # 「图案 / 颜色」根本不参与绘制，语音连画都不画。单独放一块，用户一眼
-        # 就知道是另一条路。
-        # 这里的每个控件行都用 `pady=6`（默认 8）：本页是全程序最长的一页，
-        # 页面自然高有硬上限（见「面板高度是有限预算」），五行省下的 20px 正是
-        # 加素材选择所必需的。2px 的差别肉眼看不出来，不会显得突兀。
-        c2 = tk.Frame(p, bg=CARD)
-        c2.pack(fill="x", padx=16, pady=(0, 8))
-        self._choices(c2, "图案来源", "click_emoji_source",
-                      fx_effects.CLICK_SOURCES, norm=fx_effects.normalize_source,
-                      pady=6)
-        self._asset_row(c2)
-        self._choices(c2, "单次选择", "click_emoji_pick", fx_effects.CLICK_PICKS,
-                      pady=6)
-        self._toggle(c2, "点击时播放语音", "click_voice_enabled", pady=6)
-        self._folder(c2, "语音文件夹", "click_voice_dir",
-                     status=self._voice_status, pady=6)
-        self._hint(c2, "「自选图片」可选一张或多张；GIF 会动起来。语音上一段"
-                       "没播完时，新的点击不响应。")
-
         self._preset_block(p, "点击表情")
         return p
 
-    def _asset_row(self, parent):
-        """图片素材行：一排按钮 + 一行状态，内容跟着「图案来源」走。
+    def _asset_row(self, parent, label="图片素材", kind="img", status=None,
+                   when=None, tip=None):
+        """素材行：一排按钮 + 一行状态，内容跟着「来源」走。
 
-        「选图片」「选文件夹」两个按钮**都常驻**，点哪个就把来源切到那一种 ——
-        比"先去上面改来源、再回来点按钮"少一步，也排除了"来源是文件夹却点了
-        选图片"这种自相矛盾的状态。当前来源对应的那个按钮会点亮。
+        「图案来源」与「音效来源」共用这一行（`kind` 区分）—— 两者是同一件事
+        的两个实例：来源有三档，后两档各自要"选文件 / 选文件夹 / 清除"。
 
-        状态行注册进 `_hints`（跟随窗口宽度折行）：文件夹路径可以很长，而 Tk
+        「选图片」「选文件夹」两个按钮**按来源只显示对应那一个**：来源是
+        自选图片时只留「选图片」，是图片文件夹时只留「选文件夹」，是内置
+        那一档时整行藏起来（见 `_reg_row` 的 when）。点按钮会把来源切到那一种，
+        比"先去上面改来源、再回来点按钮"少一步，也排除了"来源是文件夹却
+        点了选图片"这种自相矛盾的状态。当前来源对应的那个按钮会点亮。
+
+        两个按钮**互斥**（同时只显示一个），所以显隐变化时直接 pack_forget /
+        pack 就能保持视觉顺序 —— 创建顺序即视觉顺序，重新 pack 的按钮仍会
+        回到它原来的位置（side="right" 从右往左按创建顺序排）。
+
+        状态行注册进 `_hints`（跟随窗口宽度折行）：路径可以很长，而 Tk
         的 Label 既不换行也不缩。
         """
         app = self.app
+        sfx = (kind == "sfx")
         f = tk.Frame(parent, bg=CARD)
         f.pack(fill="x", padx=16, pady=6)
+        self._reg_row(parent, f, when=when, fill="x", padx=16, pady=6)
         top = tk.Frame(f, bg=CARD)
         top.pack(fill="x")
-        tk.Label(top, text="图片素材", bg=CARD, fg=TEXT,
-                 font=FONT_LABEL).pack(side="left")
+        lb = tk.Label(top, text=label, bg=CARD, fg=TEXT, font=FONT_LABEL)
+        lb.pack(side="left")
+        self._bind_tip(lb, tip)
 
         btns = {}
         # 倒着 pack 到右侧，视觉顺序才是「选图片 | 选文件夹 | 清除」
-        for txt in ("清除", "选文件夹", "选图片"):
+        for txt in ("清除", "选文件夹", "选文件" if sfx else "选图片"):
             b = tk.Button(top, text=txt, bd=0, relief="flat", bg=BTN, fg=SUB,
                           font=FONT_SMALL, padx=8, cursor="hand2",
                           activebackground=BTN_H, activeforeground=TEXT)
@@ -1690,42 +2177,78 @@ class ControlPanel:
             b.bind("<Leave>", lambda e: refresh())
             btns[txt] = b
 
-        status = tk.Label(f, text="", bg=CARD, fg=SUB, font=FONT_SMALL,
-                          anchor="w", justify="left",
-                          wraplength=max(160, self.W - 192))
-        status.pack(fill="x", pady=(2, 0))
-        self._hints.append(status)
+        status_lb = tk.Label(f, text="", bg=CARD, fg=SUB, font=FONT_SMALL,
+                             anchor="w", justify="left",
+                             wraplength=max(160, self.W - 192))
+        status_lb.pack(fill="x", pady=(2, 0))
+        self._hints.append(status_lb)
+
+        def _clear_target():
+            """当前来源对应的是哪两个配置键（清哪个、按钮是哪两个）。"""
+            if sfx:
+                return ("click_sfx_file", "click_sfx_dir",
+                        fx_effects.SFX_SOURCE_FILE, "选文件",
+                        fx_effects.SFX_SOURCE_FOLDER, "选文件夹")
+            return ("click_emoji_files", "click_emoji_custom_dir",
+                    fx_effects.CLICK_SOURCE_FILES, "选图片",
+                    fx_effects.CLICK_SOURCE_FOLDER, "选文件夹")
 
         def _set_source(v):
-            app.set("click_emoji_source", v)
-            fx_effects.invalidate_media_cache()
-            c = self._ctrls.get("click_emoji_source")
-            if c is not None and c.get("kind") == "choices":
-                c["refresh"]()      # 让上面那排来源按钮立刻跟上
+            app.set("click_sfx_source" if sfx else "click_emoji_source", v)
+            if sfx:
+                self._on_sfx_source(v)
+            else:
+                self._on_emoji_source(v)
 
         def refresh():
-            src_now = app.cfg.get("click_emoji_source")
-            kind, src = fx_effects.click_source_target(app.cfg)
-            if not kind:
-                txt = "当前用内置图案，不需要素材"
-            elif kind == "files":
-                n = len(fx_effects.list_image_files(src))
-                txt = ("已选 %d 张图片" % n) if n else "还没选图片"
+            if status is not None:
+                # 音效那一档的状态交给页面自己算（"还没选"、"文件不在了"、
+                # "找到 N 个音频"三种说法都在 _sfx_status 里）
+                txt = status() or ""
             else:
-                st = fx_effects.CLICK_IMAGE_POOL.state(
-                    kind, src, float(app.cfg.get("click_emoji_size", 22)))
-                txt = "%s   ·   %s" % (_short_path(src), st or "")
-            if status.cget("text") != txt:
-                status.config(text=txt)
-            for txt2, key in (("选图片", fx_effects.CLICK_SOURCE_FILES),
-                              ("选文件夹", fx_effects.CLICK_SOURCE_FOLDER)):
-                # 归一化后比较：旧配置里的「自定义图片」等价于文件夹
-                on = (fx_effects.normalize_source(src_now) == key)
-                if str(btns[txt2].cget("fg")) != (ACCENT if on else SUB):
-                    btns[txt2].config(fg=ACCENT if on else SUB)
+                src_now = app.cfg.get("click_emoji_source")
+                k, src = fx_effects.click_source_target(app.cfg)
+                if not k:
+                    txt = "当前用内置图案，不需要素材"
+                elif k == "files":
+                    n = len(fx_effects.list_image_files(src))
+                    txt = ("已选 %d 张图片" % n) if n else "还没选图片"
+                else:
+                    st = fx_effects.CLICK_IMAGE_POOL.state(
+                        k, src, float(app.cfg.get("click_emoji_size", 22)))
+                    txt = "%s   ·   %s" % (_short_path(src), st or "")
+            if status_lb.cget("text") != txt:
+                status_lb.config(text=txt)
+            # 只留当前来源那一组按钮；互斥保证了重排后顺序不会乱
+            _fk, _dk, k_file, b_file, k_dir, b_dir = _clear_target()
+            cur = (fx_effects.normalize_sfx_source if sfx
+                   else fx_effects.normalize_source)(
+                       app.cfg.get("click_sfx_source" if sfx
+                                   else "click_emoji_source"))
+            for b, key in ((btns[b_file], k_file), (btns[b_dir], k_dir)):
+                on = (cur == key)
+                if on and b.winfo_manager() == "":
+                    b.pack(side="right", padx=(6, 0))
+                elif not on and b.winfo_manager() != "":
+                    b.pack_forget()
+                if str(b.cget("fg")) != (ACCENT if on else SUB):
+                    b.config(fg=ACCENT if on else SUB)
 
         def choose_files():
             from tkinter import filedialog
+            if sfx:
+                kw = {"parent": self.root, "title": "选择音效文件",
+                      "filetypes": [("音频", "*.wav *.mp3 *.wma *.m4a"),
+                                    ("所有文件", "*.*")]}
+                cur = str(app.cfg.get("click_sfx_file", "") or "")
+                if cur and os.path.isfile(cur):
+                    kw["initialdir"] = os.path.dirname(cur)
+                p1 = filedialog.askopenfilename(**kw)
+                if p1:
+                    app.set("click_sfx_file", os.path.normpath(p1))
+                    _set_source(fx_effects.SFX_SOURCE_FILE)
+                refresh()
+                return
             kw = {"parent": self.root, "title": "选择图片",
                   "filetypes": [("图片",
                                  "*.png *.jpg *.jpeg *.bmp *.gif *.webp"),
@@ -1742,37 +2265,45 @@ class ControlPanel:
 
         def choose_folder():
             from tkinter import filedialog
-            kw = {"parent": self.root, "title": "选择图片文件夹"}
-            cur = str(app.cfg.get("click_emoji_custom_dir", "") or "")
+            kw = {"parent": self.root,
+                  "title": "选择音效文件夹" if sfx else "选择图片文件夹"}
+            key_dir = "click_sfx_dir" if sfx else "click_emoji_custom_dir"
+            cur = str(app.cfg.get(key_dir, "") or "")
             if cur and os.path.isdir(cur):
                 kw["initialdir"] = cur
             d = filedialog.askdirectory(**kw)
             if d:
                 # normpath：对话框给的是正斜杠，存下来会与用户手输的路径
                 # 长得不一样（同一个目录两种写法）
-                app.set("click_emoji_custom_dir", os.path.normpath(d))
-                _set_source(fx_effects.CLICK_SOURCE_FOLDER)
+                app.set(key_dir, os.path.normpath(d))
+                _set_source(fx_effects.SFX_SOURCE_FOLDER if sfx
+                            else fx_effects.CLICK_SOURCE_FOLDER)
             refresh()
 
         def clear():
-            kind, _ = fx_effects.click_source_target(app.cfg)
-            if kind == "files":
-                app.set("click_emoji_files", "")
-            elif kind == "folder":
-                app.set("click_emoji_custom_dir", "")
+            key_file, key_dir, k_file, _bf, k_dir, _bd = _clear_target()
+            cur = (fx_effects.normalize_sfx_source if sfx
+                   else fx_effects.normalize_source)(
+                       app.cfg.get("click_sfx_source" if sfx
+                                   else "click_emoji_source"))
+            if cur == k_file:
+                app.set(key_file, "")
+            elif cur == k_dir:
+                app.set(key_dir, "")
             # 清掉列表缓存：否则"清除"之后状态栏还会显示 2 秒的旧张数，
             # 看着就像按钮没生效
             fx_effects.invalidate_media_cache()
             refresh()
 
-        btns["选图片"].config(command=choose_files)
-        btns["选文件夹"].config(command=choose_folder)
+        _fk, _dk, _kf, b_file, _kd, b_dir = _clear_target()
+        btns[b_file].config(command=choose_files)
+        btns[b_dir].config(command=choose_folder)
         btns["清除"].config(command=clear)
         # 两个键共用这一行（来源决定它服务哪一个），都登记成 path 让
         # `_sync_from_cfg` 能刷到它
-        for k in ("click_emoji_files", "click_emoji_custom_dir"):
+        for k in (_fk, _dk):
             self._ctrls[k] = {"kind": "path", "refresh": refresh,
-                              "label": status}
+                              "label": status_lb}
         self._folders.append(refresh)
         refresh()
 
@@ -1788,43 +2319,47 @@ class ControlPanel:
         self._page_head(p, "点击文字")
         c = tk.Frame(p, bg=CARD)
         c.pack(fill="x", padx=16, pady=(0, 8))
-        self._toggle(c, "启用点击文字", "click_text_enabled")
+        self._toggle(c, "启用点击文字", "click_text_enabled",
+                     tip="打开后点一下鼠标，在光标处弹出一行字并向上飘走。")
+        # 语音包两项排在最前面：「语音与文字统一」管着下面文字框的内容
+        # （开着时它由音频名自动填入并锁定），放在文字框后面等于让用户
+        # 先看到一块"待会儿会变只读"的输入框，顺序别扭。
+        self._folder(c, "语音包文件夹", "click_text_voice_dir",
+                     status=self._voice_pack_status,
+                     tip="放着音频文件的文件夹（wav/mp3/wma/m4a）。开启下面"
+                         "「语音与文字统一」后，每一行文字对应这里的一条音频。")
+        self._toggle(c, "语音与文字统一", "click_text_voice_match",
+                     tip="开启后文字栏自动填入每条音频的名字并变为只读，点击"
+                         "时弹出的字与播出的声永远是同一条；关闭则可自己写"
+                         "文字，声音仍然随机播。")
         # 这块文字框会被「语音与文字统一」接管：闸门一开就变成只读、内容由
         # 语音包的文件名派生（见 _sync_text）。
         self._textbox(c, "文字（一行一个，点击时轮换取下一个）",
                       "click_text_list", height=2,
                       gate="click_text_voice_match",
-                      fill=self._voice_text_preview)
+                      fill=self._voice_text_preview,
+                      tip="一行一句，点一次换下一句。开启「语音与文字统一」"
+                          "后这里由音频名自动填入、不能改；文件名的序号"
+                          "（如「01 你好」）会自动去掉。")
         # 9 款字体排 5 列 = 2 行（3 列要 3 行，多 34px）。名字最长 4 个字，
         # 5 列在最小窗口宽度下也放得下（内容区 400px / 5 ≈ 80px）。
-        self._choices(c, "字体", "click_text_font", CLICK_FONTS, columns=5)
-        self._slider(c, "字号", "click_text_size", 14, 90, 1, "{:.0f} 像素")
-        self._swatch(c, "颜色", "click_text_color", CLICK_TEXT_COLORS)
-        self._choices(c, "装饰", "click_text_deco", CLICK_DECOS)
-        self._slider(c, "上飘高度", "click_text_rise", 0, 260, 5, "{:.0f} 像素")
-        self._slider(c, "倾斜幅度", "click_text_spin", 0.0, 1.0, 0.05, "{:.0%}")
-        self._slider(c, "持续时间", "click_text_life", 0.4, 3.0, 0.1, "{:.1f} 秒")
+        self._choices(c, "字体", "click_text_font", CLICK_FONTS, columns=5,
+                      tip="只列系统自带的字体；没装的自动回退微软雅黑。")
+        self._slider(c, "字号", "click_text_size", 14, 90, 1, "{:.0f} 像素",
+                     tip="弹出文字的大小。")
+        self._swatch(c, "颜色", "click_text_color", CLICK_TEXT_COLORS,
+                     tip="文字的颜色。")
+        self._choices(c, "装饰", "click_text_deco", CLICK_DECOS,
+                      tip="文字背后的点缀。")
+        self._slider(c, "上飘高度", "click_text_rise", 0, 260, 5,
+                     "{:.0f} 像素", tip="文字向上飘多远后消失。")
+        self._slider(c, "倾斜幅度", "click_text_spin", 0.0, 1.0, 0.05, "{:.0%}",
+                     tip="每次点击随机歪斜的角度范围。")
+        self._slider(c, "持续时间", "click_text_life", 0.4, 3.0, 0.1,
+                     "{:.1f} 秒", tip="一行字从弹出到消失的时间。")
         self._slider(c, "不透明度", "click_text_opacity", 0.2, 1.0, 0.01,
-                     "{:.0%}")
-        self._hint(c, "点一下鼠标，在光标处弹出一行字并向上飘走。文字框可以写"
-                      "多行，点一次换下一个；「倾斜幅度」是每次点击的随机歪斜"
-                      "角度，字体取系统已装的花样款（没装的自动回退雅黑）。")
+                     "{:.0%}", tip="文字的不透明度。")
         self._save_bar(c, "点击文字")
-
-        # 语音包单独一张卡：它不只是"加个声音"，开着「统一」时**上面那个文字
-        # 框会被接管**（只读、内容来自音频文件名），所以必须和文字框分开说。
-        # 两条说明**合并成一条**：页面自然高已经贴着上限（1062），提示是按
-        # 行数占高的，多条短文比一条长文贵。
-        c2 = tk.Frame(p, bg=CARD)
-        c2.pack(fill="x", padx=16, pady=(0, 8))
-        self._folder(c2, "语音包文件夹", "click_text_voice_dir",
-                     status=self._voice_pack_status)
-        self._toggle(c2, "语音与文字统一", "click_text_voice_match")
-        self._hint(c2, "统一开启后文字栏自动填入语音包里每条音频的名字并变为"
-                       "只读，点击时随机挑一条 —— 弹出的字与声音永远是同一条；"
-                       "关闭则文字自己写。文件名的序号（如「01 你好」）会自动"
-                       "去掉。")
-
         self._preset_block(p, "点击文字")
         return p
 
@@ -1841,21 +2376,127 @@ class ControlPanel:
         folder = str(self.app.cfg.get("click_text_voice_dir", "") or "")
         return "\n".join(fx_effects.audio_labels(folder))
 
+    # ------------------------------------------------------------ 点击音效
+    def _sfx_is_builtin(self):
+        return fx_effects.normalize_sfx_source(
+            self.app.cfg.get("click_sfx_source")) == \
+            fx_effects.SFX_SOURCE_BUILTIN
+
+    def _sfx_is_file(self):
+        return fx_effects.normalize_sfx_source(
+            self.app.cfg.get("click_sfx_source")) == fx_effects.SFX_SOURCE_FILE
+
+    def _sfx_is_folder(self):
+        return fx_effects.normalize_sfx_source(
+            self.app.cfg.get("click_sfx_source")) == fx_effects.SFX_SOURCE_FOLDER
+
+    def _sfx_has_file(self):
+        """音效素材行只在「单个音效 / 音效文件夹」两档下出现。"""
+        return self._sfx_is_file() or self._sfx_is_folder()
+
+    def _sfx_builtin_options(self):
+        """内置音效的选项：`随机` + 每一个内置音效的名字。
+
+        选项表是**动态**的（从 assets/sfx 扫出来），所以"内置里挑哪一个"
+        不能写成常量表 —— 用户往那个目录里丢一个文件，重启就能选上。
+        """
+        return [SFX_BUILTIN_RANDOM] + fx_effects.builtin_sfx_names()
+
+    def _sfx_builtin_norm(self, value):
+        """把配置里的文件名归一化成界面上的显示名。
+
+        配置存的是**文件名**（`青轴.wav`），界面显示的是**去扩展名的名字**
+        （`青轴`）—— 不归一化的话一个选项都不会高亮（与图案来源从旧值迁移
+        踩的是同一个坑）。
+        """
+        v = str(value or "")
+        if not v:
+            return SFX_BUILTIN_RANDOM
+        return fx_effects.audio_label(v)
+
+    def _on_sfx_source(self, _src=None):
+        fx_effects.invalidate_media_cache()
+        self._refresh_rows()
+
+    def _sfx_status(self):
+        """音效素材行右侧的状态文案。"""
+        cfg = self.app.cfg
+        src = fx_effects.normalize_sfx_source(cfg.get("click_sfx_source"))
+        if src == fx_effects.SFX_SOURCE_FILE:
+            p = str(cfg.get("click_sfx_file", "") or "")
+            if not p:
+                return "还没选音效文件"
+            return ("已选 %s" % fx_effects.sfx_label(p)) if os.path.isfile(p) \
+                else "文件不在了，请重选"
+        if src == fx_effects.SFX_SOURCE_FOLDER:
+            folder = str(cfg.get("click_sfx_dir", "") or "")
+            if not folder:
+                return "还没选文件夹"
+            n = fx_effects.count_audio(folder)
+            return ("找到 %d 个音频" % n) if n else "没找到音频"
+        items = fx_effects.list_builtin_sfx()
+        return ("内置 %d 个音效" % len(items)) if items else "内置音效缺失"
+
+    def _pick_sfx_builtin(self, name):
+        """内置音效里挑了一个 —— 存回**文件名**。
+
+        存名字而不是下标：往目录里加/删一个文件不会让已选的项错位。
+        """
+        if name == SFX_BUILTIN_RANDOM:
+            self.app.set("click_sfx_builtin", "")
+            return
+        for p in fx_effects.list_builtin_sfx():
+            if fx_effects.audio_label(p) == name:
+                self.app.set("click_sfx_builtin", os.path.basename(p))
+                return
+
+    def _page_click_sfx(self, parent):
+        p = tk.Frame(parent, bg=BG)
+        self._page_head(p, "点击音效")
+        c = tk.Frame(p, bg=CARD)
+        c.pack(fill="x", padx=16, pady=(0, 8))
+        self._toggle(c, "启用点击音效", "click_sfx_enabled",
+                     tip="点一下鼠标就响一声。它不画任何图案 —— 只想要声音、"
+                         "不要视觉特效时用这一页。")
+        self._choices(c, "音效来源", "click_sfx_source", fx_effects.SFX_SOURCES,
+                      norm=fx_effects.normalize_sfx_source,
+                      on_change=self._on_sfx_source,
+                      tip="内置音效＝随程序带的那几个（开箱就能响）；"
+                          "单个音效＝一直响你挑的那一个；"
+                          "音效文件夹＝每次点击随机挑一条。")
+        # 内置那一档再让用户挑具体用哪个（或随机）
+        self._choices(c, "内置音效", "click_sfx_builtin",
+                      self._sfx_builtin_options(),
+                      norm=self._sfx_builtin_norm, columns=4,
+                      on_change=self._pick_sfx_builtin,
+                      when=self._sfx_is_builtin,
+                      tip="挑一个固定用它，或者选「随机」每次换一个。")
+        self._asset_row(c, label="音效素材", kind="sfx",
+                        status=self._sfx_status, when=self._sfx_has_file,
+                        tip="「单个音效」一直响这一个；「音效文件夹」每次"
+                            "点击从里面随机挑。支持 wav / mp3 / wma / m4a。")
+        self._toggle(c, "键盘点击也触发", "click_sfx_keyboard",
+                     tip="开着时打字每按一次键也响一声（只认能出字符的键，"
+                         "Ctrl / Shift 这类修饰键不算）。青轴那类打字音效"
+                         "配这一项最合适。")
+        self._save_bar(c, "点击音效")
+        self._preset_block(p, "点击音效")
+        return p
+
     def _page_win(self, parent):
         p = tk.Frame(parent, bg=BG)
         self._page_head(p, "窗口水波")
         c = tk.Frame(p, bg=CARD)
         c.pack(fill="x", padx=16, pady=(0, 8))
-        self._toggle(c, "启用窗口水波", "win_ripple_enabled")
-        self._slider(c, "扰动强度", "win_ripple_strength", 0.05, 1.0, 0.01, "{:.0%}")
-        self._slider(c, "扰动范围", "win_ripple_size", 0.4, 3.0, 0.1, "{:.1f} 倍")
-        self._hint(c, "把窗口当成浮在水面上的东西：移动或缩放时它推开水——"
-                      "朝哪边走，哪边的前缘就涌起、后缘就塌陷，拖过去的是一道浪；"
-                      "最小化时水从四周合拢填掉它，恢复时再把水压开。")
-        self._hint(c, "只有速度才会起波，而且水只往窗外涌 —— 窗口静静放着时水面是平的，"
-                      "波纹也不会灌进窗口里。")
-        self._hint(c, "它和「真实水波」共用同一片水面，"
-                      "水面的波速、余波时长、光照与浓度都在那一页设置。")
+        self._toggle(c, "启用窗口水波", "win_ripple_enabled",
+                     tip="把窗口当成浮在水面上的东西：移动或缩放时它推开水——"
+                         "朝哪边走，哪边的前缘就涌起、后缘就塌陷；最小化时水"
+                         "从四周合拢填掉它，恢复时再把水压开。只有速度才会起波，"
+                         "而且水只往窗外涌。")
+        self._slider(c, "扰动强度", "win_ripple_strength", 0.05, 1.0, 0.01,
+                     "{:.0%}", tip="窗口运动推水的力气。")
+        self._slider(c, "扰动范围", "win_ripple_size", 0.4, 3.0, 0.1,
+                     "{:.1f} 倍", tip="涟漪铺到窗外的宽度倍数。")
         self._save_bar(c, "窗口水波")
         self._preset_block(p, "窗口水波")
         return p
@@ -1865,14 +2506,22 @@ class ControlPanel:
         self._page_head(p, "鼠标涟漪")
         c = tk.Frame(p, bg=CARD)
         c.pack(fill="x", padx=16, pady=(0, 8))
-        self._toggle(c, "启用鼠标涟漪", "ripple_enabled")
-        self._toggle(c, "跟随鼠标移动", "ripple_move")
-        self._toggle(c, "点击时扩散", "ripple_click")
-        self._slider(c, "触发灵敏度", "ripple_step", 6, 90, 1, "{:.0f} 像素")
-        self._slider(c, "涟漪大小", "ripple_size", 40, 420, 5, "{:.0f} 像素")
-        self._slider(c, "存续时间", "ripple_life", 0.3, 2.5, 0.05, "{:.2f} 秒")
-        self._slider(c, "浓度", "ripple_opacity", 0.05, 1.0, 0.01, "{:.0%}")
-        self._swatch(c, "涟漪颜色", "ripple_color", RIPPLE_COLORS)
+        self._toggle(c, "启用鼠标涟漪", "ripple_enabled",
+                     tip="打开后鼠标划过的水面上会荡开一圈圈涟漪。")
+        self._toggle(c, "跟随鼠标移动", "ripple_move",
+                     tip="光标滑动时间歇落下一圈圈涟漪。")
+        self._toggle(c, "点击时扩散", "ripple_click",
+                     tip="点一下鼠标，以点击点为中心扩散一圈。")
+        self._slider(c, "触发灵敏度", "ripple_step", 6, 90, 1, "{:.0f} 像素",
+                     tip="移动多远才落下一圈：数值越大越稀疏。")
+        self._slider(c, "涟漪大小", "ripple_size", 40, 420, 5, "{:.0f} 像素",
+                     tip="单圈涟漪的最大直径。")
+        self._slider(c, "存续时间", "ripple_life", 0.3, 2.5, 0.05,
+                     "{:.2f} 秒", tip="一圈涟漪从出现到消失的时间。")
+        self._slider(c, "浓度", "ripple_opacity", 0.05, 1.0, 0.01, "{:.0%}",
+                     tip="涟漪圈的不透明度。")
+        self._swatch(c, "涟漪颜色", "ripple_color", RIPPLE_COLORS,
+                     tip="涟漪用哪一族颜色。")
         self._save_bar(c, "涟漪")
         self._preset_block(p, "涟漪")
         return p
@@ -1882,23 +2531,41 @@ class ControlPanel:
         self._page_head(p, "真实水波")
         c = tk.Frame(p, bg=CARD)
         c.pack(fill="x", padx=16, pady=(0, 8))
-        self._toggle(c, "启用真实水波", "wave_enabled")
-        self._toggle(c, "跟随鼠标移动", "wave_move")
-        self._toggle(c, "点击时落一大滴", "wave_click")
-        self._slider(c, "波速", "wave_speed", 60, 300, 10, "{:.0f} 像素/秒")
-        self._slider(c, "余波时长", "wave_persist", 0.0, 1.0, 0.05, "{:.0%}")
-        self._slider(c, "落点大小", "wave_size", 8, 60, 2, "{:.0f} 像素")
-        self._slider(c, "落点强度", "wave_strength", 0.02, 0.30, 0.01, "{:.2f}")
-        self._slider(c, "触发间距", "wave_step", 8, 80, 2, "{:.0f} 像素")
-        self._slider(c, "自动落点间隔", "wave_ambient", 0.0, 8.0, 0.2, "{:.1f} 秒")
-        self._slider(c, "光照方向", "wave_light", 0, 350, 10, "{:.0f} 度")
-        self._slider(c, "迎光提亮", "wave_contrast", 0.0, 1.2, 0.05, "{:.0%}")
-        self._slider(c, "背光压暗", "wave_shading", 0.0, 1.0, 0.05, "{:.0%}")
-        self._slider(c, "浪尖高光", "wave_highlight", 0.0, 1.2, 0.05, "{:.0%}")
+        self._toggle(c, "启用真实水波", "wave_enabled",
+                     tip="把桌面当成一片水：落点会荡开、有折射和高光。它和"
+                         "「窗口水波」共用同一片水面。")
+        self._toggle(c, "跟随鼠标移动", "wave_move",
+                     tip="光标划过时在水面上留下尾迹。")
+        self._toggle(c, "点击时落一大滴", "wave_click",
+                     tip="点一下鼠标砸下一大滴水。")
+        self._slider(c, "波速", "wave_speed", 60, 300, 10, "{:.0f} 像素/秒",
+                     tip="波纹向外传播的速度。")
+        self._slider(c, "余波时长", "wave_persist", 0.0, 1.0, 0.05, "{:.0%}",
+                     tip="波纹能回荡多久：0＝一荡就散，1＝久久不消。")
+        self._slider(c, "落点大小", "wave_size", 8, 60, 2, "{:.0f} 像素",
+                     tip="每一滴在水面上砸出的初始大小。")
+        self._slider(c, "落点强度", "wave_strength", 0.02, 0.30, 0.01,
+                     "{:.2f}", tip="每一滴把水面压下去多深。")
+        self._slider(c, "触发间距", "wave_step", 8, 80, 2, "{:.0f} 像素",
+                     tip="连续移动时隔多远落一滴。")
+        self._slider(c, "自动落点间隔", "wave_ambient", 0.0, 8.0, 0.2,
+                     "{:.1f} 秒",
+                     tip="没人操作时也自己滴水的时间间隔；0 表示不自动落。")
+        self._slider(c, "光照方向", "wave_light", 0, 350, 10, "{:.0f} 度",
+                     tip="高光从哪个角度来，决定波峰哪一侧发亮。")
+        self._slider(c, "迎光提亮", "wave_contrast", 0.0, 1.2, 0.05, "{:.0%}",
+                     tip="迎着光的波峰提亮多少。")
+        self._slider(c, "背光压暗", "wave_shading", 0.0, 1.0, 0.05, "{:.0%}",
+                     tip="背光的波谷压暗多少。")
+        self._slider(c, "浪尖高光", "wave_highlight", 0.0, 1.2, 0.05,
+                     "{:.0%}", tip="浪尖上那一道细亮边。")
         # 上限 20%：用户要求"浓度限制在 20 以内"。它是一层叠在桌面上的半透明条纹，
         # 浓度 = "桌面被盖住多少"，超过 20% 就开始影响看桌面了。
-        self._slider(c, "浓度", "wave_opacity", 0.02, 0.20, 0.01, "{:.0%}")
-        self._swatch(c, "高光颜色", "wave_color", WAVE_COLORS)
+        self._slider(c, "浓度", "wave_opacity", 0.02, 0.20, 0.01, "{:.0%}",
+                     tip="水面条纹整体的不透明度，上限 20% —— 再高就开始"
+                         "盖住桌面了。")
+        self._swatch(c, "高光颜色", "wave_color", WAVE_COLORS,
+                     tip="浪尖高光用哪一族颜色。")
         self._save_bar(c, "真实水波")
         self._preset_block(p, "真实水波")
         return p
@@ -1908,12 +2575,16 @@ class ControlPanel:
         self._page_head(p, "其他设置")
         c = tk.Frame(p, bg=CARD)
         c.pack(fill="x", padx=16, pady=(0, 8))
-        self._slider(c, "帧率上限", "fps", 24, 144, 1, "{:.0f} 帧/秒")
+        self._slider(c, "帧率上限", "fps", 24, 144, 1, "{:.0f} 帧/秒",
+                     tip="特效每秒重绘多少帧。调低省电，调高更顺滑。")
         # 开机自启用与其它开关同款的胶囊控件，避免老式 Checkbutton 破坏统一
         row = tk.Frame(c, bg=CARD)
         row.pack(fill="x", padx=16, pady=8)
-        tk.Label(row, text="开机时自动启动", bg=CARD, fg=TEXT,
-                 font=FONT_LABEL).pack(side="left")
+        self._reg_row(c, row, fill="x", padx=16, pady=8)
+        lb = tk.Label(row, text="开机时自动启动", bg=CARD, fg=TEXT,
+                      font=FONT_LABEL)
+        lb.pack(side="left")
+        self._bind_tip(lb, "登录 Windows 后自动把特效跑起来。")
         self._autostart_var = tk.BooleanVar(value=self.app.get_autostart())
         _Toggle(row, self._autostart_var,
                 command=lambda v: self._toggle_autostart()).pack(side="right")
@@ -1922,21 +2593,24 @@ class ControlPanel:
         c2 = tk.Frame(p, bg=CARD)
         c2.pack(fill="x", padx=16, pady=(0, 8))
         self._card_title(c2, "特效层级")
-        self._hint(c2, "最上层＝始终浮在窗口之上（默认）；"
-                       "仅桌面图层＝被窗口盖住、只在桌面可见。")
-        self._layer_row(c2, "全屏特效", "layer_fullscreen")
-        self._layer_row(c2, "鼠标特效（拖动 / 点击）", "layer_mouse")
+        self._layer_row(c2, "全屏特效", "layer_fullscreen",
+                        tip="最上层＝始终浮在窗口之上（默认）；仅桌面图层＝被"
+                            "窗口盖住、只在桌面可见。")
+        self._layer_row(c2, "鼠标特效（拖动 / 点击）", "layer_mouse",
+                        tip="这一层普遍依赖浮在最上层（聚光灯压暗全屏、水波"
+                            "抓屏折射）：选「仅桌面图层」后会被窗口遮住，那是"
+                            "该档位的语义，不是故障。")
 
         # ---- 特效多开 ----
         c3 = tk.Frame(p, bg=CARD)
         c3.pack(fill="x", padx=16, pady=(0, 8))
         self._card_title(c3, "特效多开")
-        self._hint(c3, "关闭时同一分类只能开一个特效，开启新的会自动关掉旧的。")
-        self._toggle(c3, "全屏特效允许多开", "multi_fullscreen")
-        self._toggle(c3, "鼠标特效允许多开", "multi_mouse")
-        self._hint(c3, "「鼠标特效」这一项同时管**拖动**与**点击**两组"
-                      "（它们本来就在同一条鼠标层上）：打开后聚光灯可以和"
-                      "水波同屏，点击表情也可以和点击文字一起弹。")
+        self._toggle(c3, "全屏特效允许多开", "multi_fullscreen",
+                     tip="关闭时同一层只能开一个特效，开启新的会自动关掉旧的。")
+        self._toggle(c3, "鼠标特效允许多开", "multi_mouse",
+                     tip="这一项同时管「拖动」与「点击」两组（它们本来就在同一"
+                         "条鼠标层上）：打开后聚光灯可以和水波同屏，点击表情也"
+                         "可以和点击文字一起弹。")
 
         # ---- 任务栏 ----
         # 覆盖窗是置顶窗、任务栏不是，所以特效默认会被画在任务栏上 ——
@@ -1944,18 +2618,20 @@ class ControlPanel:
         c4 = tk.Frame(p, bg=CARD)
         c4.pack(fill="x", padx=16, pady=(0, 8))
         self._card_title(c4, "任务栏")
-        self._hint(c4, "任务栏永远浮在特效之前（含副屏任务栏）；"
-                       "关掉后特效会盖在任务栏上。")
-        self._toggle(c4, "不在任务栏上绘制", "avoid_taskbar")
+        self._toggle(c4, "不在任务栏上绘制", "avoid_taskbar",
+                     tip="任务栏永远浮在特效之前（含副屏任务栏）；关掉后特效"
+                         "会盖在任务栏上。")
 
         # ---- 窗口尺寸 ----
         # 尺寸是界面偏好，存 ui_state.json（不是特效配置）。
         c5 = tk.Frame(p, bg=CARD)
         c5.pack(fill="x", padx=16, pady=(0, 8))
         self._card_title(c5, "窗口尺寸")
-        self._hint(c5, "拖拽窗口的任意一条边或角也能改；调整后会记住。")
-        self._size_slider(c5, "窗口宽度", "win_w", self.W_MIN, self._cap_w())
-        self._size_slider(c5, "窗口高度", "win_h", self.H_MIN, self._cap_h())
+        self._size_slider(c5, "窗口宽度", "win_w", self.W_MIN, self._cap_w(),
+                          tip="拖动窗口的任意一条边或角也能改；调整后会记住。")
+        self._size_slider(c5, "窗口高度", "win_h", self.H_MIN, self._cap_h(),
+                          tip="「按内容自适应高度」会把高度交回给当前页面："
+                              "内容放得下就不出现滚动条。")
         srow = tk.Frame(c5, bg=CARD)
         srow.pack(fill="x", padx=16, pady=(0, 12))
         self._mini_btn(srow, "按内容自适应高度", self._size_auto_h)
@@ -1971,7 +2647,7 @@ class ControlPanel:
         self._key_row(c6, "Ctrl+Alt+R", "快速暂停")
         return p
 
-    def _size_slider(self, parent, label, key, lo, hi):
+    def _size_slider(self, parent, label, key, lo, hi, tip=None):
         """窗口宽/高的数值调节行。
 
         写的是 ui_state（界面偏好）而不是 app.cfg —— 特效配置会被预设批量
@@ -1979,9 +2655,11 @@ class ControlPanel:
         """
         f = tk.Frame(parent, bg=CARD)
         f.pack(fill="x", padx=16, pady=8)
+        self._reg_row(parent, f, fill="x", padx=16, pady=8)
         f.grid_columnconfigure(1, weight=1)
-        tk.Label(f, text=label, bg=CARD, fg=TEXT,
-                 font=FONT_LABEL).grid(row=0, column=0, sticky="w")
+        lb = tk.Label(f, text=label, bg=CARD, fg=TEXT, font=FONT_LABEL)
+        lb.grid(row=0, column=0, sticky="w")
+        self._bind_tip(lb, tip)
         var = tk.DoubleVar(value=float(self.W if key == "win_w" else self.H))
         val = tk.Label(f, text="", bg=CARD, fg=ACCENT, font=FONT_NUM)
 
@@ -2013,6 +2691,7 @@ class ControlPanel:
         """「按键 …… 说明」行：按键用等宽字 + 强调色，说明用次级灰。"""
         row = tk.Frame(card, bg=CARD)
         row.pack(fill="x", padx=16, pady=4)
+        self._reg_row(card, row, fill="x", padx=16, pady=4)
         tk.Label(row, text=keys, bg=CARD, fg=ACCENT, font=FONT_NUM,
                  anchor="w").pack(side="left")
         tk.Label(row, text=desc, bg=CARD, fg=SUB, font=FONT_SMALL,
@@ -2024,19 +2703,7 @@ class ControlPanel:
                  font=(FONT_LABEL[0], FONT_LABEL[1], "bold")).pack(
             anchor="w", padx=12, pady=(10, 4))
 
-    def _hint(self, card, text):
-        """设置项下方的说明文字：用次级灰，避免和主标签抢注意力。"""
-        # wraplength 必须 ≤ 卡片内可用宽度（窗口 564 时：卡片 412 − 两侧
-        # padx 32 = 380）：给大了会让最后一个字单独折到下一行，出现"）。"这种
-        # 孤字。窗口现在可缩放，所以注册进 _hints，宽度一变由
-        # _apply_wraplength 统一重算 —— 否则窗口缩小后说明文字会溢出被裁。
-        lb = tk.Label(card, text=text, bg=CARD, fg=SUB, font=FONT_SMALL,
-                      anchor="w", justify="left",
-                      wraplength=max(160, self.W - 192))
-        lb.pack(fill="x", padx=16, pady=(0, 4))
-        self._hints.append(lb)
-
-    def _layer_row(self, parent, label, key):
+    def _layer_row(self, parent, label, key, tip=None):
         """层级行：名称 …… 最上层 (开关) 仅桌面图层。
 
         层级是两选一，但只有一边是"非默认"的，所以沿用项目统一的胶囊开关：
@@ -2051,8 +2718,10 @@ class ControlPanel:
         app = self.app
         row = tk.Frame(parent, bg=CARD)
         row.pack(fill="x", padx=16, pady=8)
-        tk.Label(row, text=label, bg=CARD, fg=TEXT,
-                 font=FONT_LABEL).pack(side="left")
+        self._reg_row(parent, row, fill="x", padx=16, pady=8)
+        lb = tk.Label(row, text=label, bg=CARD, fg=TEXT, font=FONT_LABEL)
+        lb.pack(side="left")
+        self._bind_tip(lb, tip)
         right = tk.Frame(row, bg=CARD)
         right.pack(side="right")
         lbl_desk = tk.Label(right, text="仅桌面图层", bg=CARD, fg=SUB,
@@ -2079,7 +2748,7 @@ class ControlPanel:
                             "on": _on}
 
     # ------------------------------------------------------------ 控件原语
-    def _toggle(self, parent, label, key, pady=8):
+    def _toggle(self, parent, label, key, pady=8, tip=None, when=None):
         """通用开关行：名称 …… 开关（开/关）。
 
         `pady` 可收紧：控件多的页面靠它挤出十几像素（页面高度是有限预算，
@@ -2089,8 +2758,10 @@ class ControlPanel:
         var = tk.BooleanVar(value=bool(app.cfg[key]))
         row = tk.Frame(parent, bg=CARD)
         row.pack(fill="x", padx=16, pady=pady)
-        tk.Label(row, text=label, bg=CARD, fg=TEXT,
-                 font=FONT_LABEL).pack(side="left")
+        self._reg_row(parent, row, when=when, fill="x", padx=16, pady=pady)
+        lb = tk.Label(row, text=label, bg=CARD, fg=TEXT, font=FONT_LABEL)
+        lb.pack(side="left")
+        self._bind_tip(lb, tip)
 
         def _on(v):
             app.set(key, bool(v))
@@ -2101,14 +2772,16 @@ class ControlPanel:
         # 不再挂 var.trace：_sync_from_cfg 回写变量时不该反过来再 set 一次
         self._ctrls[key] = {"kind": "toggle", "var": var, "on": _on}
 
-    def _slider(self, parent, label, key, lo, hi, res, fmt):
+    def _slider(self, parent, label, key, lo, hi, res, fmt, tip=None, when=None):
         app = self.app
         f = tk.Frame(parent, bg=CARD)
         f.pack(fill="x", padx=16, pady=8)
+        self._reg_row(parent, f, when=when, fill="x", padx=16, pady=8)
         # 单行布局：名称 | 滑块（弹性） | 数值
         f.grid_columnconfigure(1, weight=1)
-        tk.Label(f, text=label, bg=CARD, fg=TEXT,
-                 font=FONT_LABEL).grid(row=0, column=0, sticky="w")
+        lb = tk.Label(f, text=label, bg=CARD, fg=TEXT, font=FONT_LABEL)
+        lb.grid(row=0, column=0, sticky="w")
+        self._bind_tip(lb, tip)
         var = tk.DoubleVar(value=float(app.cfg[key]))
 
         def on(*_):
@@ -2123,12 +2796,14 @@ class ControlPanel:
         on()
         self._ctrls[key] = {"kind": "slider", "var": var, "label": val, "fmt": fmt}
 
-    def _swatch(self, parent, label, key, colors):
+    def _swatch(self, parent, label, key, colors, tip=None, when=None):
         app = self.app
         f = tk.Frame(parent, bg=CARD)
         f.pack(fill="x", padx=16, pady=8)
-        tk.Label(f, text=label, bg=CARD, fg=TEXT,
-                 font=FONT_LABEL).pack(side="left")
+        self._reg_row(parent, f, when=when, fill="x", padx=16, pady=8)
+        lb = tk.Label(f, text=label, bg=CARD, fg=TEXT, font=FONT_LABEL)
+        lb.pack(side="left")
+        self._bind_tip(lb, tip)
         btns = []
 
         def refresh():
@@ -2174,7 +2849,7 @@ class ControlPanel:
         self._swatches[key] = refresh
 
     def _choices(self, parent, label, key, options, columns=None, on_change=None,
-                 norm=None, pady=8):
+                 norm=None, pady=8, tip=None, when=None):
         """分段选择行：名称 …… 一排文字按钮（选中项用强调色描边 2px）。
 
         视觉语言与 `_swatch` 保持一致，只是把色块换成文字 —— "小猫 / 小狗"
@@ -2186,7 +2861,7 @@ class ControlPanel:
         选项直接裁掉。
 
         `on_change(选项)` 在写入配置**之后**再调，供"选 A 顺带把 B 也设好"
-        这种联动用（点击表情的图案 → 惯用色）。
+        这种联动用（点击表情的图案 → 惯用色；图案来源 → 露哪几行）。
 
         `norm` 给定时用 `norm(值)` 比较选中态。旧配置里存着已被改名的取值
         （如图源从「自定义图片」改成「图片文件夹」）时，不归一化就会**一个
@@ -2195,6 +2870,7 @@ class ControlPanel:
         app = self.app
         f = tk.Frame(parent, bg=CARD)
         f.pack(fill="x", padx=16, pady=pady)
+        self._reg_row(parent, f, when=when, fill="x", padx=16, pady=pady)
         btns = []
 
         def refresh():
@@ -2213,9 +2889,11 @@ class ControlPanel:
             refresh()
 
         if columns:
-            tk.Label(f, text=label, bg=CARD, fg=TEXT, font=FONT_LABEL,
-                     anchor="w").grid(row=0, column=0, columnspan=columns,
-                                      sticky="w", pady=(0, 4))
+            lb = tk.Label(f, text=label, bg=CARD, fg=TEXT, font=FONT_LABEL,
+                          anchor="w")
+            lb.grid(row=0, column=0, columnspan=columns,
+                    sticky="w", pady=(0, 4))
+            self._bind_tip(lb, tip)
             for c in range(columns):
                 f.grid_columnconfigure(c, weight=1, uniform="choice")
             for i, opt in enumerate(options):
@@ -2229,8 +2907,9 @@ class ControlPanel:
                 b.bind("<Leave>", lambda e, w=b: w.config(bg=BTN))
                 btns.append(b)
         else:
-            tk.Label(f, text=label, bg=CARD, fg=TEXT,
-                     font=FONT_LABEL).pack(side="left")
+            lb = tk.Label(f, text=label, bg=CARD, fg=TEXT, font=FONT_LABEL)
+            lb.pack(side="left")
+            self._bind_tip(lb, tip)
             # 倒着 pack 到右侧，视觉顺序才与 options 一致（btns[i] 对应 options[i]）
             for opt in reversed(options):
                 b = tk.Button(f, text=opt, bd=0, relief="flat", bg=BTN, fg=TEXT,
@@ -2244,7 +2923,8 @@ class ControlPanel:
         refresh()
         self._ctrls[key] = {"kind": "choices", "refresh": refresh}
 
-    def _textbox(self, parent, label, key, height=3, gate=None, fill=None):
+    def _textbox(self, parent, label, key, height=3, gate=None, fill=None,
+                 tip=None, when=None):
         """多行文本输入行：名称在上、输入框在下（横排会太窄）。
 
         `tk.Text` 而不是 `Entry`：要配多个文字就得能换行。写入走 `<KeyRelease>`
@@ -2258,8 +2938,10 @@ class ControlPanel:
         app = self.app
         f = tk.Frame(parent, bg=CARD)
         f.pack(fill="x", padx=16, pady=8)
-        tk.Label(f, text=label, bg=CARD, fg=TEXT,
-                 font=FONT_LABEL).pack(anchor="w", pady=(0, 4))
+        self._reg_row(parent, f, when=when, fill="x", padx=16, pady=8)
+        lb = tk.Label(f, text=label, bg=CARD, fg=TEXT, font=FONT_LABEL)
+        lb.pack(anchor="w", pady=(0, 4))
+        self._bind_tip(lb, tip)
         box = tk.Frame(f, bg=LINE)                       # 1px 描边靠外框露边实现
         box.pack(fill="x")
         txt = tk.Text(box, height=height, width=1, bg=CARD2, fg=TEXT, bd=0,
@@ -2283,7 +2965,8 @@ class ControlPanel:
         if gate is not None:
             self._sync_text(self._ctrls[key], app.cfg.get(key, ""))
 
-    def _folder(self, parent, label, key, status=None, on_change=None, pady=8):
+    def _folder(self, parent, label, key, status=None, on_change=None, pady=8,
+                tip=None, when=None):
         """文件夹选择行：名称 | 路径（从尾部截断） | 选择 / 清除。
 
         路径一律**截尾显示** —— 用户认的是最后一级目录名，前面被省略号吃掉
@@ -2296,10 +2979,12 @@ class ControlPanel:
         app = self.app
         f = tk.Frame(parent, bg=CARD)
         f.pack(fill="x", padx=16, pady=pady)
+        self._reg_row(parent, f, when=when, fill="x", padx=16, pady=pady)
         top = tk.Frame(f, bg=CARD)
         top.pack(fill="x")
-        tk.Label(top, text=label, bg=CARD, fg=TEXT,
-                 font=FONT_LABEL).pack(side="left")
+        lb = tk.Label(top, text=label, bg=CARD, fg=TEXT, font=FONT_LABEL)
+        lb.pack(side="left")
+        self._bind_tip(lb, tip)
 
         pick_btn = clear_btn = None
         for txt in ("清除", "选择"):
@@ -2467,6 +3152,9 @@ class ControlPanel:
                 self._sync_text(c, v)
         for refresh in self._swatches.values():
             refresh()
+        # 预设/外部改动可能换掉「图案来源」：条件行（图案选择、素材行、
+        # 单次选择）要跟着显隐，不然面板会和实际配置对不上。
+        self._refresh_rows()
 
     def _pause(self):
         p = self.app.toggle_pause()

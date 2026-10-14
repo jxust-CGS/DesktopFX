@@ -258,6 +258,15 @@ def patch_libs():
     user32.SetWindowLongW.argtypes = [HWND, INT, LONG]
     user32.EnumWindows.restype = BOOL
     user32.EnumWindows.argtypes = [ctypes.c_void_p, LPARAM]
+    # 置父/置主（owner）：`SetWindowLongPtrW` 才是 64 位下改写 GWLP_HWNDPARENT
+    # 的正确入口 —— `SetWindowLongW` 只截 32 位，句柄高位会被丢掉。
+    # 从 user32 里取 SetWindowLongPtrW，取不到（老系统）就退回 SetWindowLongW。
+    _swlp = getattr(user32, "SetWindowLongPtrW", None)
+    if _swlp is not None:
+        _swlp.restype = ctypes.c_ssize_t
+        _swlp.argtypes = [HWND, INT, ctypes.c_ssize_t]
+    user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+    user32.GetWindowLongPtrW.argtypes = [HWND, INT]
     # ---------- SHELL32
     shell32.Shell_NotifyIconW.restype = BOOL
     shell32.Shell_NotifyIconW.argtypes = [DWORD, ctypes.c_void_p]
@@ -272,6 +281,49 @@ def patch_libs():
 
 
 user32, gdi32, shell32, kernel32 = patch_libs()
+
+GWL_STYLE = -16
+GWLP_HWNDPARENT = -8
+
+
+def top_hwnd(widget):
+    """Tk 控件所属**顶层窗口**的 hwnd（拿不到返回 0）。
+
+    与 `fx_ui.ControlPanel._hwnd` 同一套逻辑：`winfo_id()` 给的是内层子窗口，
+    无边框窗口的真实 hwnd 是它的 parent。统一走 `hwnd_int`，避免 ctypes 里
+    "手动构造的 HWND 没有 __int__" 那颗地雷。
+    """
+    if user32 is None:
+        return 0
+    try:
+        hw = hwnd_int(widget.winfo_id())
+        if not hw:
+            return 0
+        return hwnd_int(user32.GetParent(HWND(hw))) or hw
+    except Exception:
+        return 0
+
+
+def set_window_owner(hwnd, owner_hwnd):
+    """把 hwnd 设为 owner_hwnd 的**从属窗口**（GWLP_HWNDPARENT）。
+
+    为什么要从属：Windows 里"被拥有的窗口永远画在拥有者之上"，且随拥有者
+    一起最小化/销毁。面板自己是置顶窗、还每 1 秒抢一次置顶组顶部
+    （`ControlPanel._raise_top`），一个只是"也置顶"的提示浮层会被它挤到下面
+    —— 表现为提示一闪就不见了。改成从属之后，面板再怎么抢位都压不住它。
+
+    回读校验：`SetWindowLongPtrW` 成功时**不保证清零 last error**（和
+    `SetWindowLongW` 同一套老规矩），所以判成败必须读回来看。
+    """
+    if user32 is None or not hwnd:
+        return False
+    fn = getattr(user32, "SetWindowLongPtrW", None) or user32.SetWindowLongW
+    try:
+        fn(HWND(hwnd), GWLP_HWNDPARENT, ctypes.c_ssize_t(int(owner_hwnd or 0)))
+        back = user32.GetWindowLongPtrW(HWND(hwnd), GWLP_HWNDPARENT)
+    except Exception:
+        return False
+    return hwnd_int(back) == int(owner_hwnd or 0)
 
 
 def screen_pixel(x, y):
