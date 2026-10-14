@@ -10,6 +10,10 @@ import colorsys
 import ctypes
 import ctypes.wintypes as wt
 import math
+import os
+import random
+import threading
+import time
 
 import numpy as np
 
@@ -4015,6 +4019,360 @@ def _font(name, px):
     return f
 
 
+# ------------------------------------------------------------ 点击特效的素材
+# 「点击表情」的两种图案来源：内置图案（代码画）与自定义图片（用户文件夹）。
+CLICK_SOURCE_BUILTIN = "内置图案"
+CLICK_SOURCE_CUSTOM = "自定义图片"
+CLICK_SOURCES = (CLICK_SOURCE_BUILTIN, CLICK_SOURCE_CUSTOM)
+
+_IMG_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp")
+# 音频只认 MCI 自带设备能放的那几种。flac / ogg / opus 在多数机器上装不上
+# 解码器，列进来只会得到"选了文件夹却一声不响"。
+_AUDIO_EXTS = (".wav", ".mp3", ".wma", ".m4a")
+
+
+def _scan_files(folder, exts):
+    """列出文件夹里指定扩展名的文件（完整路径 + 文件名排序）。扫不动给空表。
+
+    **不要用 `listdir` + `isfile`**：那是对每个条目再补一次 stat。`scandir`
+    的 `is_file()` 读的是目录项自带的属性，整目录一趟扫完 —— 这个函数会被
+    面板每 200ms 跟一次，差别是能感觉到的。
+    """
+    folder = str(folder or "")
+    if not folder:
+        return []
+    out = []
+    try:
+        with os.scandir(folder) as it:
+            for e in it:
+                try:
+                    if e.is_file() and e.name.lower().endswith(exts):
+                        out.append(os.path.join(folder, e.name))
+                except OSError:
+                    continue        # 单个条目读不了就跳过，不废掉整个文件夹
+    except Exception:
+        return []
+    out.sort()
+    return out
+
+
+def _load_click_image(path, px):
+    """读一张图 -> 预乘 RGBA float32（与 `_build_shape` 同格式）。
+
+    长边缩到 `px` 且**保持比例** —— 表情包里的图多是矩形，硬拉成正方形会
+    变形。任何一步失败都返回 None：文件夹里混进一个 0 字节文件、一个改了
+    后缀的网页图都是常事，不该让整池子作废。
+    """
+    if _PImage is None:
+        return None
+    try:
+        im = _PImage.open(path)
+        im.seek(0)                  # GIF / 动图只取第一帧
+        im = im.convert("RGBA")
+        w, h = im.size
+        if w < 1 or h < 1:
+            return None
+        sc = float(max(8, int(px))) / float(max(w, h))
+        im = im.resize((max(1, int(round(w * sc))), max(1, int(round(h * sc)))),
+                       _LANCZOS)
+    except Exception:
+        return None
+    arr = np.asarray(im).astype(np.float32) * (1.0 / 255.0)
+    arr[..., :3] *= arr[..., 3:4]           # 直通 alpha -> 预乘
+    return np.ascontiguousarray(arr)
+
+
+class ClickImagePool:
+    """自定义表情包的图库：扫文件夹 -> 解码 -> 存成能直接上屏的精灵。
+
+    两条硬约束决定了它的形状：
+
+    * **解码绝不能进渲染线程。** 一张 2000×2000 的 JPG 解码 + 缩放要几十
+      毫秒，放在 `update()` 里就是"每次点击掉一帧"。所以扫描与解码跑在一条
+      后台线程上，渲染端只读**已经就绪**的那一份精灵表。
+    * **文件夹可能有几千张。** 先按文件名排序、再**随机打乱**取前
+      `MAX_FILES` 张：不洗牌的话用户永远只见到文件名靠前的那几十张。
+
+    每张图存 `SIZE_STEPS` 档尺寸，粒子直接从池里随机取条目 —— "图随机"与
+    "大小随机"于是统一成一件事（不需要再给粒子单独做位图缩放）。
+
+    线程协议：`configure()` 只登记需求并唤醒 worker；worker 解码完成后
+    **整体替换**精灵表（从不就地改）。读取方拿到的永远是完整快照，这正是
+    它能不加锁地面对渲染线程的原因。
+    """
+
+    MAX_FILES = 64
+    SIZE_STEPS = (0.74, 1.0)
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._want = None           # 待处理的 (folder, px)
+        self._dir = ""              # 已完成的 (folder, px)
+        self._px = 0
+        self._sprites = []          # 只整体替换，从不就地改
+        self._files = 0             # 上次扫到的可用文件数
+        self._failed = 0            # 解码失败个数（面板会显示，别静默）
+        self._rng = random.Random(0x5F3C14)
+        self._thread = None
+        self._wake = threading.Event()
+
+    # ---------------------------------------------------------- 渲染线程侧
+    def configure(self, folder, px):
+        """登记"我要用这个文件夹、这个尺寸"。重复登记是**零成本**的。
+
+        每次 `update` 都会调它（拖动"大小"滑块时每帧都在变），所以这里
+        只做一次比较、一次赋值 —— 真正的重建由 worker 去合并执行。
+        """
+        job = (str(folder or ""), max(8, int(px)))
+        with self._lock:
+            if job == self._want:
+                return
+            self._want = job
+        self._start()
+        self._wake.set()
+
+    def sprites(self):
+        """当前可用的精灵快照（list，元素是预乘 RGBA 数组）。空 = 还没就绪。"""
+        with self._lock:
+            return self._sprites
+
+    def stats(self):
+        """(精灵条目数, 扫到的文件数, 解码失败数)。"""
+        with self._lock:
+            return len(self._sprites), self._files, self._failed
+
+    def state(self, folder):
+        """给面板的一句话状态。
+
+        `done` 必须比较**整个 job**（文件夹 + 尺寸）而不是只看文件夹：用户
+        拖「大小」滑块时尺寸每帧都在变，"文件对了"并不代表这一批就是用当前
+        尺寸做的。
+        """
+        with self._lock:
+            n, files, failed = len(self._sprites), self._files, self._failed
+            done = (self._want is not None and self._want == (self._dir, self._px))
+        if not folder:
+            return ""
+        if not done:
+            return "读取中…"
+        if files == 0:
+            return "没找到图片"
+        out = "已载入 %d 张" % n
+        if failed:
+            out += "（%d 张读不了）" % failed
+        return out
+
+    def clear(self):
+        """丢掉现有素材并停止装载（换文件夹时由 configure 直接覆盖，这是
+        给"清空"和测试用的）。"""
+        with self._lock:
+            self._want = None
+            self._dir, self._px = "", 0
+            self._sprites = []
+            self._files = 0
+            self._failed = 0
+        self._wake.set()
+
+    # ---------------------------------------------------------- 后台线程
+    def _start(self):
+        t = self._thread
+        if t is not None and t.is_alive():
+            return
+        t = threading.Thread(target=self._loop, name="ClickImagePool",
+                             daemon=True)
+        self._thread = t
+        t.start()
+
+    def _loop(self):
+        while True:
+            self._wake.wait(0.5)
+            self._wake.clear()
+            with self._lock:
+                job = self._want
+                done = (self._dir, self._px)
+            if job is None or job == done:
+                continue
+            # **绝不能把异常漏出去**：pythonw 下后台线程死掉连 traceback 都
+            # 没有（没有 stderr），池子会永远停在"正在读取"。宁可这次放弃，
+            # 下一次点击或下一次 configure 再来一遍。
+            try:
+                self._load(job)
+            except Exception:
+                pass
+
+    def _load(self, job):
+        folder, px = job
+        paths = _scan_files(folder, _IMG_EXTS)
+        self._rng.shuffle(paths)
+        out = []
+        for p in paths[:self.MAX_FILES]:
+            if not self._wanted(job):
+                return              # 用户改过文件夹/尺寸，这一批作废
+            ok = False
+            for sc in self.SIZE_STEPS:
+                spr = _load_click_image(p, int(round(px * sc)))
+                if spr is not None:
+                    ok = True
+                    out.append(spr)
+            if not ok:
+                # 按**文件**计数而不是按档位：同一个坏文件会在两档上各失败
+                # 一次，显示成"2 张读不了"会让用户去找并不存在的第二张。
+                with self._lock:
+                    self._failed += 1
+        with self._lock:
+            self._dir, self._px = job
+            self._sprites = out
+            self._files = len(paths)
+
+    def _wanted(self, job):
+        with self._lock:
+            return self._want == job
+
+
+# 模块级单例：同一个文件夹只解码一次，两个点击特效实例（或反复重建的实例）
+# 共用同一份素材。
+CLICK_IMAGE_POOL = ClickImagePool()
+
+# ---------------------------------------------------------------- 点击语音
+_VOICE_ALIAS = "fxclickvoice"
+_AUDIO_COUNT_TTL = 2.0          # 面板状态显示的扫描缓存（秒）
+_AUDIO_COUNT_CACHE = {}
+
+try:
+    _winmm = ctypes.WinDLL("winmm")
+except Exception:                       # pragma: no cover - 非 Windows
+    _winmm = None
+
+
+def _mci_send(cmd):
+    """发一条 MCI 命令，返回 (错误码, 返回串)。错误码 0 = 成功。
+
+    独立成函数是为了**能被测试替换** —— 真去开声卡放一遍，在自动化里既
+    听不见也没法判定，而"上一段没放完不响应下一次点击"这条规则必须验。
+    """
+    if _winmm is None:
+        return 1, ""
+    buf = ctypes.create_unicode_buffer(128)
+    try:
+        r = _winmm.mciSendStringW(ctypes.c_wchar_p(cmd), buf, 128, None)
+    except Exception:
+        return 1, ""
+    return int(r), buf.value
+
+
+def count_audio(folder):
+    """文件夹里有多少个可播放的音频（面板状态显示用，2 秒内复用结果）。
+
+    不缓存的话面板每 200ms 扫一次盘 —— 音频文件夹动辄几百首，白扫。
+    """
+    folder = str(folder or "")
+    if not folder:
+        return 0
+    now = time.monotonic()
+    hit = _AUDIO_COUNT_CACHE.get(folder)
+    if hit is not None and now - hit[0] < _AUDIO_COUNT_TTL:
+        return hit[1]
+    n = len(_scan_files(folder, _AUDIO_EXTS))
+    if len(_AUDIO_COUNT_CACHE) > 32:
+        _AUDIO_COUNT_CACHE.clear()
+    _AUDIO_COUNT_CACHE[folder] = (now, n)
+    return n
+
+
+class VoicePlayer:
+    """点击语音：随机播一段音频，**同一时刻只响一个**。
+
+    播放走 Windows 自带的 MCI（`winmm`）—— wav / mp3 / wma 都能放，不引
+    第三方库。整段播放跑在一条后台线程里，渲染线程只负责"占坑"：
+
+    * 上一段还没放完时 `play_random()` **立刻返回 False**，一秒都不等。
+      排队等着放会让连点变成"越来越滞后的一串拖音"，听感像卡带，所以规则
+      是"忙就丢弃这一次点击"。这也是用户要的"上一段没放完不响应下一个"。
+    * 结束判定用 `status ... mode` 轮询，**不用 `play ... wait`**：后者在
+      某些设备上会直接挂住不返回，那条线程就永远消失在等待里。
+    * 600 秒硬上限兜底 —— 设备抽风时 `status` 可能永远回 "playing"。
+    """
+
+    MAX_SECONDS = 600.0
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._busy = False
+        self._folder = ""
+        self._cache = []
+        self._stamp = 0.0
+        self._rng = random.Random(0x51CE07)
+        self._played = 0
+        self._failed = 0
+
+    # ---------------------------------------------------------- 渲染线程侧
+    def playing(self):
+        return self._busy
+
+    def play_random(self, folder):
+        """随机播一个；正在播 -> 放弃这次（返回 False）。"""
+        if self._busy:
+            return False
+        path = self._pick(folder)
+        if path is None:
+            return False
+        with self._lock:
+            if self._busy:              # 同帧两次点击抢跑，让先到的那个播
+                return False
+            self._busy = True
+            self._played += 1
+        threading.Thread(target=self._worker, args=(path,),
+                         name="VoicePlayer", daemon=True).start()
+        return True
+
+    def stats(self):
+        with self._lock:
+            return self._played, self._failed
+
+    def _pick(self, folder):
+        folder = str(folder or "")
+        now = time.monotonic()
+        if folder != self._folder or now - self._stamp > _AUDIO_COUNT_TTL:
+            # 2 秒缓存：点击本来就稀疏，但连点时没必要每次都重扫目录。
+            self._folder = folder
+            self._stamp = now
+            self._cache = _scan_files(folder, _AUDIO_EXTS)
+        if not self._cache:
+            return None
+        return self._rng.choice(self._cache)
+
+    # ---------------------------------------------------------- 播放线程
+    def _worker(self, path):
+        try:
+            # 上一条如果因为异常没关干净，别名会占着媒体设备 -> 先清一次
+            _mci_send("close %s" % _VOICE_ALIAS)
+            ext = os.path.splitext(path)[1].lower()
+            kind = "waveaudio" if ext == ".wav" else "mpegvideo"
+            r, _ = _mci_send('open "%s" type %s alias %s'
+                             % (path, kind, _VOICE_ALIAS))
+            if r:
+                with self._lock:
+                    self._failed += 1
+                return
+            _mci_send("play %s" % _VOICE_ALIAS)
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < self.MAX_SECONDS:
+                time.sleep(0.1)
+                r, mode = _mci_send("status %s mode" % _VOICE_ALIAS)
+                if r or mode.strip().lower() != "playing":
+                    break
+        except Exception:
+            pass
+        finally:
+            try:
+                _mci_send("close %s" % _VOICE_ALIAS)
+            except Exception:
+                pass
+            # 无论怎么结束都要放行 —— 少了这一步就"只响一次，之后永远是忙"
+            with self._lock:
+                self._busy = False
+
+
 class _BurstEngine:
     """点击粒子爆发的物理与上屏（不含配置解析）。
 
@@ -4043,6 +4401,8 @@ class _BurstEngine:
         self.rot = np.zeros(n, np.float32)
         self.spin = np.zeros(n, np.float32)
         self.rgb = np.zeros((n, 3), np.float32)
+        # 自定义表情包模式下每颗粒子指向外部精灵表的下标（内置图案模式恒 0）
+        self.spr_id = np.zeros(n, np.int32)
         self.count = 0              # 已用槽位数（紧凑存放，死掉的会被换到前面）
 
     def active(self):
@@ -4052,12 +4412,15 @@ class _BurstEngine:
         self.count = 0
 
     def spawn(self, x, y, shape, colors, count, size, spread, gravity,
-              rotate, life, up_bias=0.0, size_jitter=0.45):
+              rotate, life, up_bias=0.0, size_jitter=0.45, spr_ids=None):
         """在 (x, y) 炸开一簇粒子。
 
         `colors` 是 RGB 三元组列表（0~255）：单色图案传一个，彩带传一整盘，
         每个粒子随机取一个。`up_bias` > 0 时整体偏向上方 —— 「点击文字」的
         装饰要往文字那边飘，而不是均匀四散。
+
+        `spr_ids` 给定（长度 = count）时这簇改用**外部精灵表**上屏（自定义
+        表情包），`shape` / `colors` 都不再参与绘制，只为保持调用形状一致。
         """
         count = max(0, min(int(count), self.MAX))
         if count == 0 or size <= 0:
@@ -4087,6 +4450,13 @@ class _BurstEngine:
         pal = np.asarray(colors, np.float32).reshape(-1, 3)
         pick = rng.integers(0, len(pal), k)
         self.rgb[idx] = pal[pick]
+        if spr_ids is None:
+            self.spr_id[idx] = 0
+        else:
+            sid = np.asarray(spr_ids, np.int32).reshape(-1)
+            # 长度不足时用 `resize` 循环填满而不是让它抛错：这条路径在渲染
+            # 线程上，宁可画得难看一点也不能把一帧打断。
+            self.spr_id[idx] = np.resize(sid, k) if sid.size else 0
         self._gravity = float(gravity)
         self.count += count
 
@@ -4098,7 +4468,7 @@ class _BurstEngine:
         keep = self.count - need
         src = slice(need, self.count)
         for arr in (self.px, self.py, self.vx, self.vy, self.t, self.life,
-                    self.size, self.rot, self.spin):
+                    self.size, self.rot, self.spin, self.spr_id):
             arr[:keep] = arr[src]
         self.rgb[:keep] = self.rgb[src]
         self.count = keep
@@ -4125,15 +4495,22 @@ class _BurstEngine:
             alive = np.nonzero(self.t[sl] < self.life[sl])[0]
             m = alive.size
             for arr in (self.px, self.py, self.vx, self.vy, self.t, self.life,
-                        self.size, self.rot, self.spin):
+                        self.size, self.rot, self.spin, self.spr_id):
                 arr[:m] = arr[alive]
             self.rgb[:m] = self.rgb[alive]
             self.count = m
 
-    def draw(self, u32, w, h, opacity=1.0, tint=None):
-        """上屏。`tint` 非空时整簇用同一个颜色（点击表情的"主色"模式）。"""
+    def draw(self, u32, w, h, opacity=1.0, tint=None, imgs=None):
+        """上屏。
+
+        `tint` 非空时整簇用同一个颜色（点击表情的"主色"模式）。
+        `imgs` 非空时改用**外部精灵表**（自定义表情包）：每颗粒子按
+        `spr_id` 取自己那一张，图案与颜色都不再参与 —— 这条路径下精灵是
+        矩形（用户图片保持原比例），所以裁剪必须**分别**取宽与高。
+        """
         if self.count == 0 or opacity <= 0.004:
             return
+        n_img = len(imgs) if imgs is not None else 0
         for i in range(self.count):
             t = float(self.t[i])
             life = float(self.life[i])
@@ -4146,19 +4523,28 @@ class _BurstEngine:
             a = opacity * max(0.0, env)
             if a <= 0.01:
                 continue
-            r, g, b = (self.rgb[i] if tint is None else tint)
-            hexc = "#%02X%02X%02X" % (int(r), int(g), int(b))
-            shape = getattr(self, "_shape", "爱心")
-            step = int(round(float(self.rot[i]) / (2.0 * math.pi)
-                             * self.ROT_STEPS)) % self.ROT_STEPS
-            size = int(max(8, round(float(self.size[i]))))
-            # 颜色进缓存键：彩带逐粒子不同色，单色图案则整簇共用一条缓存
-            spr = _shape_sprite(shape, hexc, size, step, self.ROT_STEPS)
-            S = spr.shape[0]
-            x0 = int(round(float(self.px[i]) - S * 0.5))
-            y0 = int(round(float(self.py[i]) - S * 0.5))
+            if n_img:
+                j = int(self.spr_id[i])
+                if j < 0 or j >= n_img:
+                    continue
+                spr = imgs[j]
+            else:
+                r, g, b = (self.rgb[i] if tint is None else tint)
+                hexc = "#%02X%02X%02X" % (int(r), int(g), int(b))
+                shape = getattr(self, "_shape", "爱心")
+                step = int(round(float(self.rot[i]) / (2.0 * math.pi)
+                                 * self.ROT_STEPS)) % self.ROT_STEPS
+                size = int(max(8, round(float(self.size[i]))))
+                # 颜色进缓存键：彩带逐粒子不同色，单色图案则整簇共用一条缓存
+                spr = _shape_sprite(shape, hexc, size, step, self.ROT_STEPS)
+            # 高与宽**分开取**。内置图案是正方形（两者永远相等），但自定义
+            # 表情包的图是矩形 —— 拿高当边长会让墨迹只落进左上角一块，
+            # 也就是"图被切掉大半"（与 ClickTextField._blit 同一个坑）。
+            sh, sw = spr.shape[0], spr.shape[1]
+            x0 = int(round(float(self.px[i]) - sw * 0.5))
+            y0 = int(round(float(self.py[i]) - sh * 0.5))
             gx0, gy0 = max(0, x0), max(0, y0)
-            gx1, gy1 = min(int(w), x0 + S), min(int(h), y0 + S)
+            gx1, gy1 = min(int(w), x0 + sw), min(int(h), y0 + sh)
             if gx1 <= gx0 or gy1 <= gy0:
                 continue
             sub = spr[gy0 - y0:gy1 - y0, gx0 - x0:gx1 - x0]
@@ -4221,7 +4607,12 @@ class ClickEmojiField:
 
     与「鼠标拖动特效」的区别在于触发方式 —— 它不是跟着光标连续铺开，而是
     **一次点击一个瞬时爆发**。参数模型参考 pizzazz 那个点击特效库
-    （数量 / 尺寸 / 扩散 / 重力 / 自旋），但图案全部由代码绘制。
+    （数量 / 尺寸 / 扩散 / 重力 / 自旋）。
+
+    图案有两个来源：内置图案（`_build_shape` 用代码画，不依赖任何文件）
+    与自定义表情包（`ClickImagePool` 从用户给的文件夹里随机取图，**在后台
+    线程**解码）。后者的素材还没就绪时自动回退到内置图案 —— 点击永远
+    有反馈，不会出现"点了没动静"。
 
     粒子物理与上屏在 `_BurstEngine` 里（「点击文字」的装饰也用它）。
     """
@@ -4232,6 +4623,9 @@ class ClickEmojiField:
         self._mx = w * 0.5
         self._my = h * 0.5
         self._clicked = 0
+        # 自定义表情包时的精灵快照（None = 这一簇走内置图案）。持有的是
+        # 池子交出来的**不可变快照**，后台换素材不会影响正在飞的那一簇。
+        self._imgs = None
         self.engine = _BurstEngine(seed=seed)
 
     def set_pointer(self, x, y, clicked=0):
@@ -4245,43 +4639,83 @@ class ClickEmojiField:
 
     def reset(self):
         self.engine.reset()
+        self._imgs = None
         self._clicked = 0
 
     def active(self):
         return self.engine.active()
 
+    def _spawn_builtin(self, cfg):
+        """内置图案：颜色 / 图案 / 自旋全都听配置的。"""
+        shape = str(cfg.get("click_emoji_shape", _SHAPE_NAMES[0]))
+        if shape not in _SHAPE_NAMES:
+            shape = _SHAPE_NAMES[0]
+        # 颜色缺键时按**该图案的惯用色**兜底（爱心红、星星黄……），
+        # 而不是所有图案都退回同一个粉。
+        color = str(cfg.get("click_emoji_color",
+                            _SHAPE_DEFAULT_COLORS[shape]))
+        if color == COLOR_RAINBOW:
+            # 逐粒子从调色板取色。哨兵值必须在 hex_to_bgr 之前拦住 ——
+            # 它对非法串是"静默回退浅蓝"，不拦就成了"选了彩色却全蓝"。
+            colors = [_hex_rgb(c) for c in _CONFETTI_COLORS]
+        else:
+            colors = [_hex_rgb(color)]
+        self.engine._shape = shape
+        self.engine.spawn(
+            self._mx, self._my, shape, colors,
+            count=int(cfg.get("click_emoji_count", 12)),
+            size=float(cfg.get("click_emoji_size", 22)),
+            spread=float(cfg.get("click_emoji_spread", 90)),
+            gravity=float(cfg.get("click_emoji_gravity", 1.0)),
+            rotate=bool(cfg.get("click_emoji_rotate", True)),
+            life=float(cfg.get("click_emoji_life", 1.1)))
+
+    def _spawn_custom(self, cfg, sprites):
+        """自定义表情包：每颗粒子随机挑一张图。
+
+        不自旋、不做尺寸抖动 —— 图片精灵不是矢量，两者都要重采样；而"图
+        随机 × 池子里两档尺寸"本来就提供了同样的视觉变化，白付那笔账不划算。
+        """
+        count = max(0, min(int(cfg.get("click_emoji_count", 12)),
+                           self.engine.MAX))
+        if count <= 0:
+            return
+        self.engine.spawn(
+            self._mx, self._my, "", [(255, 255, 255)],
+            count=count,
+            size=float(cfg.get("click_emoji_size", 22)),
+            spread=float(cfg.get("click_emoji_spread", 90)),
+            gravity=float(cfg.get("click_emoji_gravity", 1.0)),
+            rotate=False,
+            life=float(cfg.get("click_emoji_life", 1.1)),
+            size_jitter=0.0,
+            spr_ids=self.rng.integers(0, len(sprites), count))
+        self._imgs = sprites
+
     def update(self, dt, cfg):
         dt = min(max(float(dt), 0.0), 0.05)
         clicked = self._clicked
         self._clicked = 0
+        custom = (str(cfg.get("click_emoji_source", CLICK_SOURCE_BUILTIN))
+                  == CLICK_SOURCE_CUSTOM)
+        if custom:
+            # 只登记需求：解码在后台线程做，这里是一次比较的代价。
+            CLICK_IMAGE_POOL.configure(cfg.get("click_emoji_custom_dir", ""),
+                                       float(cfg.get("click_emoji_size", 22)))
         if clicked:
-            shape = str(cfg.get("click_emoji_shape", _SHAPE_NAMES[0]))
-            if shape not in _SHAPE_NAMES:
-                shape = _SHAPE_NAMES[0]
-            # 颜色缺键时按**该图案的惯用色**兜底（爱心红、星星黄……），
-            # 而不是所有图案都退回同一个粉。
-            color = str(cfg.get("click_emoji_color",
-                                _SHAPE_DEFAULT_COLORS[shape]))
-            if color == COLOR_RAINBOW:
-                # 逐粒子从调色板取色。哨兵值必须在 hex_to_bgr 之前拦住 ——
-                # 它对非法串是"静默回退浅蓝"，不拦就成了"选了彩色却全蓝"。
-                colors = [_hex_rgb(c) for c in _CONFETTI_COLORS]
+            sprites = CLICK_IMAGE_POOL.sprites() if custom else None
+            if sprites:
+                self._spawn_custom(cfg, sprites)
             else:
-                colors = [_hex_rgb(color)]
-            self.engine._shape = shape
-            self.engine.spawn(
-                self._mx, self._my, shape, colors,
-                count=int(cfg.get("click_emoji_count", 12)),
-                size=float(cfg.get("click_emoji_size", 22)),
-                spread=float(cfg.get("click_emoji_spread", 90)),
-                gravity=float(cfg.get("click_emoji_gravity", 1.0)),
-                rotate=bool(cfg.get("click_emoji_rotate", True)),
-                life=float(cfg.get("click_emoji_life", 1.1)))
+                # 素材还没就绪（首次配置后要解码几十张图）或文件夹是空的：
+                # 回退内置图案，让**点击始终有反馈**。
+                self._imgs = None
+                self._spawn_builtin(cfg)
         self.engine.update(dt)
 
     def draw(self, u32, w, h, cfg):
         op = float(np.clip(float(cfg.get("click_emoji_opacity", 1.0)), 0.0, 1.0))
-        self.engine.draw(u32, w, h, op)
+        self.engine.draw(u32, w, h, op, imgs=self._imgs)
 
 
 class ClickTextField:

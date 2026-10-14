@@ -19,7 +19,11 @@
 不建窗口、不构造 App，只碰内存缓冲。
 """
 import os
+import shutil
 import sys
+import tempfile
+import time
+import wave
 
 import numpy as np
 
@@ -40,7 +44,9 @@ def _ecfg(**over):
                click_emoji_count=12.0, click_emoji_size=22.0,
                click_emoji_spread=90.0, click_emoji_life=1.1,
                click_emoji_color="#FF6B8E", click_emoji_gravity=1.0,
-               click_emoji_rotate=True, click_emoji_opacity=1.0)
+               click_emoji_rotate=True, click_emoji_opacity=1.0,
+               click_emoji_source=F.CLICK_SOURCE_BUILTIN,
+               click_emoji_custom_dir="")
     cfg.update(over)
     return cfg
 
@@ -891,6 +897,355 @@ def test_text_tilt_random():
                   f"幅度 0 时全水平，且同一次点击内角度固定")
 
 
+# ------------------------------------------------- 6. 自定义表情包（图片文件夹）
+def _mk_img_folder(wide=(300, 30), tall=(30, 300)):
+    """造一个小图库：一张宽图、一张高图、外加一个坏文件。
+
+    坏文件是刻意的 —— 真实的表情包文件夹里就有 0 字节文件、改了后缀的
+    网页图，池子必须跳过它们而不是整体作废。
+    """
+    from PIL import Image
+    folder = tempfile.mkdtemp(prefix="fx_click_img_")
+    if wide:
+        Image.new("RGBA", wide, (255, 0, 0, 255)).save(
+            os.path.join(folder, "wide.png"))
+    if tall:
+        Image.new("RGB", tall, (0, 0, 255)).save(
+            os.path.join(folder, "tall.jpg"))
+    with open(os.path.join(folder, "broken.png"), "wb") as fh:
+        fh.write(b"not an image at all")
+    return folder
+
+
+def _wait_pool(folder, timeout=20.0):
+    """等后台解码完成（真的完成，不是"有个数"而已）。"""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        st = F.CLICK_IMAGE_POOL.state(folder)
+        if st and st != "读取中…":
+            return st
+        time.sleep(0.05)
+    return F.CLICK_IMAGE_POOL.state(folder)
+
+
+def test_custom_image_pool():
+    """扫描 / 解码 / 两个尺寸档 / 坏文件按**文件**计数。"""
+    folder = _mk_img_folder()
+    pool = F.CLICK_IMAGE_POOL
+    pool.clear()
+    pool.configure(folder, 40)
+    st = _wait_pool(folder)
+    n, files, failed = pool.stats()
+    pool.clear()
+    shutil.rmtree(folder, ignore_errors=True)
+    if files != 3:
+        return False, f"扫到的文件数 {files}（期望 3：两张图 + 一个坏文件）"
+    if failed != 1:
+        return False, (f"解码失败计数 {failed}（期望 1 —— 按文件算，"
+                       f"同一个坏文件在 2 个尺寸档上各失败一次只算 1）")
+    if n != 4:
+        return False, f"精灵条目 {n}（期望 4 = 2 张图 × 2 档尺寸）"
+    if "已载入 4 张" not in st or "1 张读不了" not in st:
+        return False, f"状态文案不对：{st!r}"
+    return True, f"3 个文件 -> 4 个精灵条目，坏文件单独计数，状态 {st!r}"
+
+
+def test_custom_image_sprite_format():
+    """精灵格式必须与内置图案那条路径一致（预乘 float32 RGBA）。"""
+    folder = _mk_img_folder()
+    pool = F.CLICK_IMAGE_POOL
+    pool.clear()
+    pool.configure(folder, 40)
+    _wait_pool(folder)
+    sprites = pool.sprites()
+    shapes = sorted({s.shape for s in sprites})
+    bad = []
+    for s in sprites:
+        if s.dtype != np.float32 or s.ndim != 3 or s.shape[2] != 4:
+            bad.append(s.shape)
+        elif not bool((s[..., :3] <= s[..., 3:4] + 1e-6).all()):
+            bad.append("not premultiplied")
+        elif float(s.max()) > 1.0 + 1e-6:
+            bad.append("range > 1")
+    pool.clear()
+    shutil.rmtree(folder, ignore_errors=True)
+    if bad:
+        return False, f"精灵格式不对：{bad[:3]}"
+    # 长边必须落在「目标尺寸 × 尺寸档」上，且矩形保持原比例
+    longs = sorted({max(s.shape[0], s.shape[1]) for s in sprites})
+    ratios = sorted({round(max(s.shape[0], s.shape[1])
+                           / max(1, min(s.shape[0], s.shape[1])), 1)
+                     for s in sprites})
+    if longs != [30, 40]:
+        return False, f"长边档位 {longs}（期望 [30, 40] = 40×0.74 / 40×1.0）"
+    if max(ratios) < 5.0:
+        return False, f"矩形没保住比例：长宽比 {ratios}"
+    return True, (f"预乘 float32 RGBA；形状 {shapes}；长边 {longs}；"
+                  f"长宽比 {ratios}（矩形保持原比例）")
+
+
+def test_custom_image_rect_not_clipped():
+    """矩形图片落屏时**必须按原比例**铺开。
+
+    这是 `ClickTextField._blit` 那个坑的图片版：拿 `shape[0]`（高）当正方形
+    边长，会让 300×30 的图只落进 30×30 的方块 —— 左右各切掉 90%。
+    内置图案恰好是正方形，所以这条路径一直没暴露过。
+
+    判据用"落屏跨度更接近图宽还是图高"：正确实现的 x 跨度 ≈ 图宽，
+    错误实现 ≈ 图高（两者相差 10 倍，不存在误判空间）。
+    """
+    folder = _mk_img_folder(wide=(300, 30), tall=None)
+    pool = F.CLICK_IMAGE_POOL
+    pool.clear()
+    pool.configure(folder, 60)
+    _wait_pool(folder)
+    sprites = pool.sprites()
+    if not sprites:
+        pool.clear()
+        shutil.rmtree(folder, ignore_errors=True)
+        return False, "图库没载进来，无法判断"
+    # 每张图有两个尺寸档，粒子取哪一档是随机的 —— 参照系取**整张表**，
+    # 别拿 `sprites[0]`：那是洗过牌的顺序，与这一簇实际用到的那张未必同一档。
+    sizes = sorted({(int(s.shape[1]), int(s.shape[0])) for s in sprites})
+
+    cfg = _ecfg(click_emoji_source=F.CLICK_SOURCE_CUSTOM,
+                click_emoji_custom_dir=folder, click_emoji_count=8.0,
+                click_emoji_size=60.0, click_emoji_spread=0.0,
+                click_emoji_gravity=0.0, click_emoji_life=2.0)
+    f = ClickEmojiField(W, H)
+    f.set_pointer(W * 0.5, H * 0.5, 1)
+    buf = np.zeros(W * H, np.uint32)
+    for _ in range(4):
+        f.update(1.0 / 60.0, cfg)
+    f.draw(buf, W, H, cfg)
+    used = f._imgs is not None
+    alpha = ((buf >> np.uint32(24)) & np.uint32(0xFF)).reshape(H, W)
+    ys, xs = np.nonzero(alpha)
+    pool.clear()
+    shutil.rmtree(folder, ignore_errors=True)
+    if not used or xs.size == 0:
+        return False, f"自定义图片模式没上屏（用了图片={used}）"
+    span_x = int(xs.max() - xs.min()) + 1
+    span_y = int(ys.max() - ys.min()) + 1
+    if not sizes or min(w for w, _ in sizes) <= max(h for _, h in sizes) * 3:
+        return False, f"测试材料本身不是宽图（{sizes}），断言会空转"
+    # 一簇粒子都在同一点，墨迹 = 其中最大那张；它必须与表里某个尺寸对得上
+    best = min(sizes, key=lambda e: abs(e[0] - span_x) + abs(e[1] - span_y))
+    if abs(best[0] - span_x) > 2 or abs(best[1] - span_y) > 2:
+        return False, (f"墨迹 {span_x}×{span_y} 与图库里的 {sizes} 对不上 —— "
+                       f"落屏时被当正方形裁了")
+    return True, (f"墨迹 {span_y}×{span_x} 与图库 {sizes} 相符（宽扁比例保住）；"
+                  f"若拿高当边长，x 跨度只会有 {best[1]}")
+
+
+def test_custom_image_fallback():
+    """素材没就绪 / 文件夹空 -> 回退内置图案，点击**始终有反馈**。"""
+    empty = tempfile.mkdtemp(prefix="fx_click_empty_")
+    pool = F.CLICK_IMAGE_POOL
+    pool.clear()
+    pool.configure(empty, 40)
+    st = _wait_pool(empty)
+    cfg = _ecfg(click_emoji_source=F.CLICK_SOURCE_CUSTOM,
+                click_emoji_custom_dir=empty, click_emoji_count=12.0,
+                click_emoji_spread=200.0)
+    f = ClickEmojiField(W, H)
+    f.set_pointer(W * 0.5, H * 0.5, 1)
+    buf = np.zeros(W * H, np.uint32)
+    f.update(1.0 / 60.0, cfg)
+    for _ in range(4):
+        f.update(1.0 / 60.0, cfg)
+    f.draw(buf, W, H, cfg)
+    # 未就绪的那一刻（还没扫完）也必须能画
+    f2 = ClickEmojiField(W, H)
+    f2.set_pointer(W * 0.5, H * 0.5, 1)
+    buf2 = np.zeros(W * H, np.uint32)
+    f2.update(1.0 / 60.0, _ecfg(click_emoji_source=F.CLICK_SOURCE_CUSTOM,
+                                click_emoji_custom_dir="/no/such/dir",
+                                click_emoji_spread=200.0))
+    for _ in range(4):
+        f2.update(1.0 / 60.0, _ecfg(click_emoji_source=F.CLICK_SOURCE_CUSTOM,
+                                    click_emoji_custom_dir="/no/such/dir",
+                                    click_emoji_spread=200.0))
+    f2.draw(buf2, W, H, _ecfg(click_emoji_spread=200.0))
+    pool.clear()
+    shutil.rmtree(empty, ignore_errors=True)
+    if f._imgs is not None:
+        return False, "空文件夹却用了自定义精灵"
+    if not buf.any() or not buf2.any():
+        return False, (f"回退后没画出东西（空文件夹 {bool(buf.any())} / "
+                       f"路径不存在 {bool(buf2.any())}）")
+    if "没找到图片" not in st:
+        return False, f"空文件夹的状态文案不对：{st!r}"
+    return True, f"空文件夹（{st!r}）与不存在的路径都回退内置图案且画得出"
+
+
+# ------------------------------------------------- 7. 点击语音
+def _mk_audio_folder():
+    folder = tempfile.mkdtemp(prefix="fx_click_voice_")
+    for nm in ("a.wav", "b.wav"):
+        with wave.open(os.path.join(folder, nm), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(8000)
+            w.writeframes(b"\x00\x00" * 800)
+    with open(os.path.join(folder, "readme.txt"), "w", encoding="utf-8") as fh:
+        fh.write("这不是音频，不该被扫进来")
+    return folder
+
+
+def _wait_busy(vp, want, timeout=5.0):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if vp.playing() == want:
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def test_voice_no_overlap():
+    """上一段没播完时，新的点击必须**被丢弃**（返回 False，不排队）。"""
+    folder = _mk_audio_folder()
+    playing = [True]
+    cmds = []
+    orig = F._mci_send
+
+    def fake(cmd):
+        cmds.append(cmd)
+        if cmd.startswith("status"):
+            return 0, "playing" if playing[0] else "stopped"
+        return 0, ""
+
+    F._mci_send = fake
+    try:
+        vp = F.VoicePlayer()
+        first = vp.play_random(folder)
+        second = vp.play_random(folder)      # 还在"播放中"
+        third = vp.play_random(folder)
+        still_busy = vp.playing()
+        playing[0] = False
+        released = _wait_busy(vp, False)
+        fourth = vp.play_random(folder)
+        scanned = list(vp._cache)
+    finally:
+        F._mci_send = orig
+        shutil.rmtree(folder, ignore_errors=True)
+
+    if not first or not fourth:
+        return False, "空闲时没能起播（first=%s fourth=%s）" % (first, fourth)
+    if second or third:
+        return False, "播放中又接受了一次点击 —— 两段语音会叠在一起"
+    if not still_busy or not released:
+        return False, f"busy 标志不对（播放中 {still_busy} / 播完释放 {released}）"
+    if len(scanned) != 2:
+        return False, f"目录扫描把非音频也算进去了：{scanned}"
+    if not any(c.startswith("play ") for c in cmds):
+        return False, f"没发出播放命令：{cmds}"
+    if not any(c.startswith("open ") and "type waveaudio" in c for c in cmds):
+        return False, f"wav 没用 waveaudio 设备打开：{cmds}"
+    return True, (f"播放中连点 2 次都被丢弃；播完立即放行；只扫到 2 个音频"
+                  f"（readme.txt 被排除）")
+
+
+def test_voice_releases_on_failure():
+    """播放线程**出错也必须放行** —— 否则语音这辈子只响一次（永远"忙"）。"""
+    folder = _mk_audio_folder()
+
+    def boom(cmd):
+        raise RuntimeError("device gone")
+
+    orig = F._mci_send
+    F._mci_send = boom
+    try:
+        vp = F.VoicePlayer()
+        started = vp.play_random(folder)
+        released = _wait_busy(vp, False)
+        again = vp.play_random(folder)
+    finally:
+        F._mci_send = orig
+        shutil.rmtree(folder, ignore_errors=True)
+    if not started:
+        return False, "起播就失败了（应当先占坑、之后才去碰设备）"
+    if not released:
+        return False, "设备异常后 busy 没释放 -> 语音只响一次"
+    if not again:
+        return False, "异常之后再也起不来了"
+    return True, "设备抛异常时 busy 仍在 finally 里释放，后续点击照常"
+
+
+def test_click_asset_defaults():
+    """四个新配置键存在、类型正确，坏值被钳制。"""
+    want = (("click_emoji_source", str), ("click_emoji_custom_dir", str),
+            ("click_voice_enabled", bool), ("click_voice_dir", str))
+    for k, t in want:
+        if k not in d.DEFAULTS:
+            return False, f"DEFAULTS 缺 {k}"
+        if not isinstance(d.DEFAULTS[k], t):
+            return False, f"{k} 的默认值类型是 {type(d.DEFAULTS[k])}，期望 {t}"
+    bad = []
+    for k, v in (("click_voice_dir", 123), ("click_voice_dir", ["C:/x"]),
+                 ("click_emoji_custom_dir", 3.5),
+                 ("click_emoji_source", True)):
+        ok, _ = d._coerce_cfg_value(k, v)
+        if ok:
+            bad.append((k, v))
+    if bad:
+        return False, f"坏值被收下了：{bad}"
+    for k, v, exp in (("click_voice_enabled", "是", True),
+                      ("click_voice_enabled", "关", False)):
+        ok, got = d._coerce_cfg_value(k, v)
+        if not ok or got is not exp:
+            return False, f"{k}={v!r} 应转成 {exp}，实得 {got!r}"
+    src = F.CLICK_SOURCES
+    if d.DEFAULTS["click_emoji_source"] not in src:
+        return False, f"默认来源 {d.DEFAULTS['click_emoji_source']!r} 不在 {src}"
+    return True, f"4 个键齐备、类型正确；坏路径/坏来源被拒；默认来源在 {src} 内"
+
+
+def test_scene_voice_wiring():
+    """语音挂在**点击事件**上，与两个点击特效的开关无关；只在点击那一帧触发。"""
+    from _verify_kinds import _base_cfg
+    from fx_scene import Scene
+
+    folder = _mk_audio_folder()
+    calls = []
+
+    class _Spy:
+        def play_random(self, f):
+            calls.append(f)
+            return True
+
+    sc = Scene(W, H)
+    sc.voice = _Spy()
+    box = {"fired": True}
+
+    def fake_update(dt, ox, oy):
+        sc.mouse.mx, sc.mouse.my = W * 0.5, H * 0.5
+        sc.mouse.clicked = 0 if box["fired"] else 1
+        return 0.0
+
+    sc.mouse.update = fake_update
+    buf = np.zeros(W * H, np.uint32)
+    # 语音开着、两个点击特效都关着
+    sc.cfg = _base_cfg(click_voice_enabled=True, click_voice_dir=folder)
+    for k in range(6):
+        box["fired"] = k >= 1
+        sc.step(1.0 / 60.0, buf, W, H, buf)
+    on_count = len(calls)
+    off_calls = len(calls)
+    sc.cfg = _base_cfg(click_voice_enabled=False, click_voice_dir=folder)
+    for k in range(6):
+        box["fired"] = k >= 1
+        sc.step(1.0 / 60.0, buf, W, H, buf)
+    shutil.rmtree(folder, ignore_errors=True)
+    if on_count != 1:
+        return False, f"开着时触发了 {on_count} 次（期望 1：只在点击那一帧）"
+    if len(calls) != off_calls:
+        return False, "关掉之后仍在触发"
+    if calls and calls[0] != folder:
+        return False, f"传下去的文件夹不对：{calls[0]!r}"
+    return True, "只在点击那一帧触发一次、传对文件夹，与点击特效开关无关"
+
+
 # ------------------------------------------------------------------ 驱动
 def main():
     tests = [
@@ -924,6 +1279,14 @@ def main():
         test_rainbow_is_per_particle,
         test_confetti_is_curved,
         test_text_tilt_random,
+        test_custom_image_pool,
+        test_custom_image_sprite_format,
+        test_custom_image_rect_not_clipped,
+        test_custom_image_fallback,
+        test_voice_no_overlap,
+        test_voice_releases_on_failure,
+        test_click_asset_defaults,
+        test_scene_voice_wiring,
     ]
     print("== 点击特效 + 分组 ==")
     bad = 0

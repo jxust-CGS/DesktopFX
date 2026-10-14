@@ -164,6 +164,12 @@ DEFAULTS = {
     # 图案由 fx_effects 用 PIL 现画（与宠物同一套做法），所以换图案/颜色只需
     # 重建精灵缓存，不依赖任何图片资源或系统字体。
     "click_emoji_enabled": False,
+    # 图案来源：内置图案 = 上面那套代码画出来的形状；自定义图片 = 从
+    # `click_emoji_custom_dir` 里**随机取图**当粒子（png/jpg/gif/bmp/webp）。
+    # 自定义图片模式下「图案 / 颜色」两个旋钮不参与绘制，但仍留着 —— 素材
+    # 还没解码完（或文件夹是空的）时会回退到内置图案，那时它们说了算。
+    "click_emoji_source": "内置图案",
+    "click_emoji_custom_dir": "",
     "click_emoji_shape": "爱心",
     "click_emoji_count": 12.0,      # 一次点击炸开几个
     "click_emoji_size": 22.0,       # 单个图案的像素尺寸
@@ -186,6 +192,14 @@ DEFAULTS = {
     "click_text_spin": 0.75,
     "click_text_life": 1.4,         # 从弹出到消失的秒数
     "click_text_opacity": 1.0,
+    # ---- 点击语音（点一下随机播一段音频）----
+    # **独立于两个点击特效的开关**：只要它开着，任何一次鼠标左键点击都会
+    # 随机播 `click_voice_dir` 里的一段（wav / mp3 / wma），不需要图案或
+    # 文字也开着 —— 用户完全可能只想要声音。
+    # 播放同一时刻只响一个：上一段没放完时新的点击**直接丢弃**（不排队），
+    # 排队会让连点变成一串越来越滞后的拖音。
+    "click_voice_enabled": False,
+    "click_voice_dir": "",
     # ---- 窗口水波（窗口移动 / 缩放 / 最小化 / 恢复时扰动水面）----
     # 它**不自己画**：窗口只是水面的一个扰动源 —— 和鼠标共用同一片水（见
     # WaterRippleField.push_rect / dome_rect），所以这里只剩"扰动多大、多宽"

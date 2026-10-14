@@ -115,6 +115,41 @@ def main():
         p._ctrls[key]["on"](False)
         assert app.cfg[key] is False, f"{key} 未写回 cfg"
 
+    # 2d2) 「点击表情」页的自定义素材块：来源 / 两个文件夹行 / 语音开关都注册
+    #      了，文件夹行的状态文案跟着**后台**加载走（不跟就会像"选了没反应"）。
+    for k in ("click_emoji_source", "click_emoji_custom_dir",
+              "click_voice_enabled", "click_voice_dir"):
+        assert k in p._ctrls, f"点击表情页缺少控件 {k}"
+    assert p._ctrls["click_emoji_source"]["kind"] == "choices", \
+        p._ctrls["click_emoji_source"]["kind"]
+    assert p._ctrls["click_voice_enabled"]["kind"] == "toggle"
+    for k in ("click_emoji_custom_dir", "click_voice_dir"):
+        assert p._ctrls[k]["kind"] == "path", (k, p._ctrls[k]["kind"])
+        # 路径行必须跟着窗口宽度折行 —— 否则长路径会把页面顶到最小宽度之外
+        assert p._ctrls[k]["label"] in p._hints, f"{k} 的路径行没注册折行宽度"
+    p._ctrls["click_voice_enabled"]["on"](True)
+    assert app.cfg["click_voice_enabled"] is True
+    p._ctrls["click_voice_enabled"]["on"](False)
+
+    # 2d3) 文件夹行的回填：非音频文件不算数，长目录名从**尾部**保留
+    _aud = _tf.mkdtemp(prefix="fx_ui_voice_")
+    for _nm in ("a.wav", "b.wav", "note.txt"):
+        with open(_os2.path.join(_aud, _nm), "wb") as _fh:
+            _fh.write(b"\x00")
+    app.cfg["click_voice_dir"] = _aud
+    p._sync_from_cfg()
+    _lb = p._ctrls["click_voice_dir"]["label"].cget("text")
+    assert "找到 2 个音频" in _lb, _lb
+    assert "note.txt" not in _lb, _lb
+    _deep = _os2.path.join(_aud, "一二三四五六七八九十" * 3)
+    _os2.makedirs(_deep, exist_ok=True)
+    app.cfg["click_voice_dir"] = _deep
+    p._ctrls["click_voice_dir"]["refresh"]()
+    _lb2 = p._ctrls["click_voice_dir"]["label"].cget("text")
+    assert _lb2.startswith("…"), _lb2
+    assert _deep[-10:] in _lb2, (_lb2, _deep[-10:])
+    app.cfg["click_voice_dir"] = ""
+
     # 2e) 「其他设置」页：层级 / 多开开关已注册，且写的是字符串档位
     for k in ("layer_fullscreen", "layer_mouse", "multi_fullscreen", "multi_mouse"):
         assert k in p._ctrls, f"其他设置页缺少控件 {k}"

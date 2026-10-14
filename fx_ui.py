@@ -12,6 +12,7 @@ import tkinter as tk
 
 from _win32 import user32, HANDLE, HWND, INT, UINT, hwnd_int, screen_pixel
 from _paths import app_root, atomic_write_json
+import fx_effects
 import fx_kinds
 
 # ------------------------------------------------------------------ 设计系统
@@ -130,6 +131,17 @@ _AA_SS = 4  # 超采样倍数（4x 足够平滑，体积仍小）
 def _rgb(hex_color):
     h = str(hex_color).lstrip("#")
     return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _short_path(path, n=30):
+    """路径从**尾部**截断：`…\\表情\\猫猫`。
+
+    用户认的永远是最后一级目录名 —— 从头部截会把它切掉，等于没显示。
+    """
+    p = str(path or "")
+    if len(p) <= n:
+        return p
+    return "…" + p[-(n - 1):]
 
 
 def _render_aa(bg, w, h, paint, ss=_AA_SS):
@@ -563,6 +575,7 @@ class ControlPanel:
         self._drag = (0, 0)
         self._rz = None         # 正在拖拽的缩放手柄方向（None = 没在缩放）
         self._hints = []        # 说明文字 Label：窗口宽度变了要重算折行宽度
+        self._folders = []      # 文件夹选择行的 refresh()：状态是后台加载的，要跟
         self._size_rows = {}    # "win_w"/"win_h" -> {"var","label"}（窗口尺寸数值行）
         self._grip = {}         # 边缘/角落缩放手柄
         self._chrome = self._CHROME
@@ -1621,19 +1634,42 @@ class ControlPanel:
         self._swatch(c, "颜色", "click_emoji_color", CLICK_EMOJI_COLORS)
         self._slider(c, "不透明度", "click_emoji_opacity", 0.2, 1.0, 0.01,
                      "{:.0%}")
-        self._hint(c, "点一下鼠标，就在光标位置炸开一簇图案。"
-                      "「扩散」是它们飞出去的速度，「重力」调大像彩纸往下飘、"
-                      "调成负数则向上浮（泡泡那类），"
-                      "「持续时间」最长 1.5 秒。")
-        self._hint(c, "「数量」最多 40 个，连点几下会自然叠起来。"
-                      "选图案时会自动配上它的惯用色（爱心红、星星黄、雪花白"
-                      "……），选完再自己调也行。")
-        self._hint(c, "颜色里的「彩色」是逐颗从一整套调色板取色 —— "
-                      "任何图案都能用，彩带的默认就是它。")
-        self._hint(c, "图案全部由代码绘制，不依赖图片文件或系统字体。")
+        self._hint(c, "点一下鼠标就在光标处炸开一簇：「扩散」是飞出去的速度，"
+                      "「重力」调大往下飘、负数向上浮，最长 1.5 秒。"
+                      "选图案会自动配上它的惯用色。")
         self._save_bar(c, "点击表情")
+
+        # 自定义素材单独一张卡：这两样都**不吃**上面那几个旋钮 —— 用文件夹
+        # 里的图当图案时「图案 / 颜色」根本不参与绘制，语音连画都不画。单独
+        # 放一块，用户一眼就知道是另一条路。
+        c2 = tk.Frame(p, bg=CARD)
+        c2.pack(fill="x", padx=16, pady=(0, 8))
+        self._choices(c2, "图案来源", "click_emoji_source",
+                      fx_effects.CLICK_SOURCES)
+        self._folder(c2, "图片文件夹", "click_emoji_custom_dir",
+                     status=self._img_status)
+        self._toggle(c2, "点击时播放语音", "click_voice_enabled")
+        self._folder(c2, "语音文件夹", "click_voice_dir",
+                     status=self._voice_status)
+        self._hint(c2, "「自定义图片」从文件夹随机取图当粒子，读图在后台、"
+                       "读完前先用内置图案；语音上一段没播完时不响应新的点击。")
+
         self._preset_block(p, "点击表情")
         return p
+
+    def _img_status(self):
+        """图片文件夹的附加状态（每 200ms 由 _poll 刷一次）。"""
+        folder = str(self.app.cfg.get("click_emoji_custom_dir", "") or "")
+        if not folder:
+            return ""
+        return fx_effects.CLICK_IMAGE_POOL.state(folder)
+
+    def _voice_status(self):
+        folder = str(self.app.cfg.get("click_voice_dir", "") or "")
+        if not folder:
+            return ""
+        n = fx_effects.count_audio(folder)
+        return "找到 %d 个音频" % n if n else "没找到音频"
 
     def _page_click_text(self, parent):
         p = tk.Frame(parent, bg=BG)
@@ -2090,6 +2126,84 @@ class ControlPanel:
         txt.bind("<FocusOut>", on_key)
         self._ctrls[key] = {"kind": "text", "widget": txt}
 
+    def _folder(self, parent, label, key, status=None, on_change=None):
+        """文件夹选择行：名称 | 路径（从尾部截断） | 选择 / 清除。
+
+        路径一律**截尾显示** —— 用户认的是最后一级目录名，前面被省略号吃掉
+        不影响判断；不截的话一个长路径就能把最小窗口撑破。
+
+        `status()` 由页面给，返回一句附加状态（"已载入 12 张"）。它由 `_poll`
+        每 200ms 刷一次：自定义素材是**后台**解码的，界面不跟着动，用户就会
+        以为"选了文件夹没反应"。
+        """
+        app = self.app
+        f = tk.Frame(parent, bg=CARD)
+        f.pack(fill="x", padx=16, pady=8)
+        top = tk.Frame(f, bg=CARD)
+        top.pack(fill="x")
+        tk.Label(top, text=label, bg=CARD, fg=TEXT,
+                 font=FONT_LABEL).pack(side="left")
+
+        pick_btn = clear_btn = None
+        for txt in ("清除", "选择"):
+            b = tk.Button(top, text=txt, bd=0, relief="flat", bg=BTN, fg=SUB,
+                          font=FONT_SMALL, padx=8, cursor="hand2",
+                          activebackground=BTN_H, activeforeground=TEXT)
+            b.pack(side="right", padx=(6, 0))
+            b.bind("<Enter>", lambda e, w=b: w.config(bg=BTN_H, fg=TEXT))
+            b.bind("<Leave>", lambda e, w=b: w.config(bg=BTN, fg=SUB))
+            if txt == "清除":
+                clear_btn = b
+            else:
+                pick_btn = b
+
+        # 路径**独占第二行**而不是挤在名称与按钮之间：单行版的行宽由
+        # "名称 + 路径自然宽 + 两个按钮"决定，而 Tk 的 Label 既不换行也不缩
+        # ——一个长路径就能把页面顶到最小宽度之外（右侧被裁）。第二行能跟随
+        # 窗口宽度折行（注册进 `_hints`），多花 24px 换掉这个隐患很划算。
+        path = tk.Label(f, text="", bg=CARD, fg=SUB, font=FONT_SMALL,
+                        anchor="w", justify="left",
+                        wraplength=max(160, self.W - 192))
+        path.pack(fill="x", pady=(3, 0))
+        self._hints.append(path)
+
+        def refresh():
+            cur = str(app.cfg.get(key, "") or "")
+            txt = _short_path(cur) if cur else "（未选择）"
+            if status is not None:
+                try:
+                    extra = status() or ""
+                except Exception:
+                    extra = ""
+                if extra:
+                    txt = "%s   · %s" % (txt, extra)
+            if path.cget("text") != txt:
+                path.config(text=txt)
+
+        def _set(v):
+            app.set(key, v)
+            refresh()
+            if on_change is not None:
+                on_change(v)
+
+        def _choose():
+            from tkinter import filedialog
+            kw = {"parent": self.root, "title": label}
+            cur = str(app.cfg.get(key, "") or "")
+            if cur and os.path.isdir(cur):
+                kw["initialdir"] = cur
+            d = filedialog.askdirectory(**kw)
+            if d:
+                # normpath：系统对话框给的是正斜杠，存下来再显示会与用户
+                # 手输的路径长得不一样（同一个目录两种写法）
+                _set(os.path.normpath(d))
+
+        pick_btn.config(command=_choose)
+        clear_btn.config(command=lambda: _set(""))
+        self._ctrls[key] = {"kind": "path", "refresh": refresh, "label": path}
+        self._folders.append(refresh)
+        refresh()
+
     def _choose_color(self, key):
         """系统调色板：任意 RGB 都能选（预设色块只有 6 个，覆盖不到）。"""
         from tkinter import colorchooser
@@ -2156,6 +2270,8 @@ class ControlPanel:
                 c["var"].set(str(v) == "desktop")
                 c["repaint"]()
             elif c["kind"] == "choices":  # 分段选择（如宠物种类），重画描边
+                c["refresh"]()
+            elif c["kind"] == "path":     # 文件夹选择行：只有文字要重画
                 c["refresh"]()
             elif c["kind"] == "text":     # 多行文本（如点击文字列表）
                 w = c["widget"]
@@ -2238,6 +2354,14 @@ class ControlPanel:
 
         self.status.config(text=f"{app.fps:5.1f} 帧/秒   {app.cost_ms:4.1f} 毫秒/帧"
                                 + ("   [已暂停]" if app.paused else ""))
+
+        # 文件夹行的状态（"已载入 N 张"）：素材是后台解码的，这里跟着刷新 ——
+        # 只在文字真的变了时才写 Label，免得每 200ms 触发一次重绘。
+        for rf in self._folders:
+            try:
+                rf()
+            except Exception:
+                pass
 
         err = getattr(app, "last_error", None)
         if err != self._err_shown:

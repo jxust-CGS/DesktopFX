@@ -15,7 +15,7 @@ import numpy as np
 from fx_effects import (RainField, RippleField, MeteorField, MouseProbe,
                         PaintField, PetalField, SnowField, SpotlightField,
                         PetField, ClickEmojiField, ClickTextField,
-                        WaterRippleField, WindowProbe, hex_to_bgr)
+                        WaterRippleField, WindowProbe, VoicePlayer, hex_to_bgr)
 
 
 class Scene:
@@ -35,6 +35,9 @@ class Scene:
         self.pets = PetField(w, h, seed=53)             # 宠物跟随
         self.click_emoji = ClickEmojiField(w, h, seed=73)   # 点击表情
         self.click_text = ClickTextField(w, h, seed=79)     # 点击文字
+        # 点击语音：不画任何东西，只是"点一下随机播一段"。整段播放跑在它
+        # 自己的后台线程里，渲染循环只负责在点击那一帧登记一次。
+        self.voice = VoicePlayer()
         self.win = WindowProbe()                        # 窗口枚举（窗口交互地基）
 
         # 覆盖层在虚拟屏幕里的左上角偏移（鼠标坐标要折算进来）
@@ -352,6 +355,13 @@ class Scene:
             self.click_text.draw(buf_ms, w, h, cfg)
         else:
             self.click_text.reset()
+
+        # ---------------- 点击语音（点一下随机播一段）
+        # 挂在**点击事件本身**，与两个点击特效的开关无关：只想要声音、不想
+        # 要图案和文字是完全合理的用法。播放全程在后台线程里，这里只是登记
+        # —— 上一段没播完时 `play_random` 立刻返回，不会排队也不会卡帧。
+        if self.mouse.clicked and cfg.get("click_voice_enabled", False):
+            self.voice.play_random(str(cfg.get("click_voice_dir", "")))
 
     # ------------------------------------------------------------ 真实水波
     def _wave_trigger(self, cfg, dist, w, h, dt):
