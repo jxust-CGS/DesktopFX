@@ -4761,6 +4761,27 @@ def sfx_label(path):
     return audio_label(path)
 
 
+def voice_pack_dir(cfg):
+    """「语音与文字统一」用的音频目录 —— 只认**音效文件夹**那一档。
+
+    统一模式需要"一个装着多条音频的目录"才能把文件名一行行变成弹出文字：
+    内置音效（数量固定、且是程序自带的那几个）与单个音效都给不出多行文字，
+    所以这里对那两档直接返回空串（调用方据此退回自定义文字）。
+
+    这条也决定界面：**统一开关只在来源＝音效文件夹时可用**，开着时来源那一组
+    控件被锁住 —— 用户没法一边开着统一、一边把来源换成内置音效。
+    """
+    if normalize_sfx_source(cfg.get("click_sfx_source")) != SFX_SOURCE_FOLDER:
+        return ""
+    return str(cfg.get("click_sfx_dir", "") or "")
+
+
+def voice_match_on(cfg):
+    """「语音与文字统一」当前是否真的生效（开着**且**有目录）。"""
+    return bool(cfg.get("click_text_voice_match", False)) \
+        and bool(voice_pack_dir(cfg))
+
+
 def builtin_sfx_names():
     """内置音效的显示名列表（界面上那排按钮用）。"""
     return [audio_label(p) for p in list_builtin_sfx()]
@@ -4807,6 +4828,16 @@ class ClickSfx:
 # 就不会被回收，id 也就不会被别的对象占用）。
 _ROT_CACHE = {}
 _ROT_CACHE_MAX = 512
+
+
+def _rot_step(ang, steps=CLICK_ALIGN_ROT_STEPS):
+    """弧度 -> 旋转档下标（四舍五入并取模）。
+
+    与内置图案那条路径（`round(rot / 2π * ROT_STEPS)`）**必须是同一个式子**：
+    两条路径各算一次、算得不一样的话，同一个「图片方向」选项在换素材来源时会
+    悄悄差一档。
+    """
+    return int(round(float(ang) / (2.0 * math.pi) * int(steps))) % int(steps)
 
 
 def _rotate_premul(spr, step, steps=CLICK_ALIGN_ROT_STEPS):
@@ -4929,11 +4960,12 @@ class _BurstEngine:
         self.size[idx] = (size * rng.uniform(1.0 - size_jitter,
                                              1.0 + size_jitter, k)).astype(np.float32)
         if align:
-            # 屏幕坐标 y 朝下：精灵原本"朝上"对应角度 -90°，要让图头指向
-            # 飞行方向 ang，顺时针得转 ang + 90°，量化成 12 档。
-            step = np.floor((ang + math.pi * 0.5) / (2.0 * math.pi)
-                            * CLICK_ALIGN_ROT_STEPS + 0.5)
-            self.rot[idx] = (step % CLICK_ALIGN_ROT_STEPS).astype(np.float32)
+            # 直接存**弧度**（角度 + 90°），而不是量化档下标 —— 两条上屏路径
+            # 读 `rot` 的方式不同：内置图案那边本来就是
+            # `round(rot / 2π * ROT_STEPS)`，图片那边要的是档下标。让存的值
+            # 保持"角度"这个物理量，两边各自换算，才不会一边转对一边差一档。
+            self.rot[idx] = ((ang + math.pi * 0.5)
+                             % (2.0 * math.pi)).astype(np.float32)
         else:
             self.rot[idx] = rng.uniform(0.0, 2.0 * math.pi, k)
         self.spin[idx] = ((rng.uniform(-1.0, 1.0, k) * 7.5) if rotate
@@ -5028,15 +5060,17 @@ class _BurstEngine:
                 spr = anim.frame_at(j, self._anim_t) if anim is not None \
                     else imgs[j]
                 # 「图片方向随扩散方向」：按粒子飞出去的方向把图转过去。
-                # 档位在 spawn 时就算好了（写在 rot 里），这里只是一次缓存查表。
+                # `rot` 存的是**弧度**（spawn 时算好的），这里换成旋转档下标
+                # 去查缓存 —— 与内置图案那条 `round(rot / 2π * STEPS)` 同一个式子。
                 if self._img_align:
-                    spr = _rotate_premul(spr, self.rot[i])
+                    spr = _rotate_premul(
+                        spr, _rot_step(float(self.rot[i])),
+                        CLICK_ALIGN_ROT_STEPS)
             else:
                 r, g, b = (self.rgb[i] if tint is None else tint)
                 hexc = "#%02X%02X%02X" % (int(r), int(g), int(b))
                 shape = getattr(self, "_shape", "爱心")
-                step = int(round(float(self.rot[i]) / (2.0 * math.pi)
-                                 * self.ROT_STEPS)) % self.ROT_STEPS
+                step = _rot_step(self.rot[i], self.ROT_STEPS)
                 size = int(max(8, round(float(self.size[i]))))
                 # 颜色进缓存键：彩带逐粒子不同色，单色图案则整簇共用一条缓存
                 spr = _shape_sprite(shape, hexc, size, step, self.ROT_STEPS)
@@ -5149,7 +5183,12 @@ class ClickEmojiField:
         return self.engine.active()
 
     def _spawn_builtin(self, cfg):
-        """内置图案：颜色 / 图案 / 自旋全都听配置的。"""
+        """内置图案：颜色 / 图案 / 自旋全都听配置的。
+
+        「图片方向」对内置图案同样有效 —— 爱心、彩带这类图形本身就有朝向，
+        让它跟着飞行方向转，甩出来的是一条条轨迹而不是一堆随机朝向的贴纸。
+        所以这里**不区分来源**：`align` 只看那一个配置键。
+        """
         shape = str(cfg.get("click_emoji_shape", _SHAPE_NAMES[0]))
         if shape not in _SHAPE_NAMES:
             shape = _SHAPE_NAMES[0]
@@ -5163,10 +5202,11 @@ class ClickEmojiField:
             colors = [_hex_rgb(c) for c in _CONFETTI_COLORS]
         else:
             colors = [_hex_rgb(color)]
+        align = (str(cfg.get("click_emoji_align", CLICK_ALIGN_VERTICAL))
+                 == CLICK_ALIGN_SPREAD)
         self.engine._shape = shape
-        # 内置图案各向同性（爱心/星星怎么转都一样），而且它自带 12 档旋转
-        # 缓存 —— 这里必须显式关掉图片那条旋转路径，否则上一次"随扩散方向"
-        # 留下的开关会让内置图案也去吃一次位图旋转。
+        # 内置图案自带 12 档旋转精灵缓存（`_shape_sprite` 自己按档取），
+        # 所以走的是 draw 里那条"角度 → 档位"的换算，**不是**图片那条位图旋转。
         self.engine._img_align = False
         self.engine.spawn(
             self._mx, self._my, shape, colors,
@@ -5174,8 +5214,11 @@ class ClickEmojiField:
             size=float(cfg.get("click_emoji_size", 22)),
             spread=float(cfg.get("click_emoji_spread", 90)),
             gravity=float(cfg.get("click_emoji_gravity", 1.0)),
-            rotate=bool(cfg.get("click_emoji_rotate", True)),
-            life=float(cfg.get("click_emoji_life", 1.1)))
+            # 勾了"随扩散方向"就必须关掉自旋：spin 会把 rot 逐帧累加，
+            # 方向定下来的那一瞬间就散了，等于这个选项不起作用。
+            rotate=bool(cfg.get("click_emoji_rotate", True)) and not align,
+            life=float(cfg.get("click_emoji_life", 1.1)),
+            align=align)
 
     def _spawn_custom(self, cfg, sprites):
         """自定义表情包：按「单次选择」决定这一簇怎么取图。
@@ -5198,8 +5241,8 @@ class ClickEmojiField:
             ids = np.full(count, int(self.rng.integers(0, n)), np.int32)
         else:
             ids = self.rng.integers(0, n, count)
-        align = str(cfg.get("click_emoji_align", CLICK_ALIGN_VERTICAL)) \
-            == CLICK_ALIGN_SPREAD
+        align = (str(cfg.get("click_emoji_align", CLICK_ALIGN_VERTICAL))
+                 == CLICK_ALIGN_SPREAD)
         self.engine._img_align = align
         self.engine.spawn(
             self._mx, self._my, "", [(255, 255, 255)],
@@ -5305,12 +5348,13 @@ class ClickTextField:
 
         返回 `(文字 或 None, 音频路径 或 None, 轮换下标)`。
 
-        统一模式下**没选语音包 / 文件夹里没有音频时不报错、也不吞掉这次点击**，
+        统一模式下**没选目录 / 文件夹里没有音频时不报错、也不吞掉这次点击**，
         而是退回自定义文字 —— 换文件夹的间隙、空目录都算常见状态，让点击
-        变成"什么都不发生"比显示一句自己写的字难懂得多。
+        变成"什么都不发生"比显示一句自己写的字难懂得多。目录来自
+        `voice_pack_dir()`（即「点击音效」的音效文件夹），不再单开一个键。
         """
-        if bool(cfg.get("click_text_voice_match", False)):
-            path = pick_audio(str(cfg.get("click_text_voice_dir", "") or ""))
+        if voice_match_on(cfg):
+            path = pick_audio(voice_pack_dir(cfg))
             if path is not None:
                 return audio_label(path), path, 0
         texts = self.texts_of(cfg)

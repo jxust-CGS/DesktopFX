@@ -364,29 +364,19 @@ class Scene:
         else:
             self.click_text.reset()
 
-        # ---------------- 点击语音（点一下随机播一段）
-        # 两个来源，**一次点击只响一个**（同一个播放器、同一个 MCI 别名）：
-        #   1. 「点击文字」语音包在"文字与音频统一"模式下挑中的那条 —— 它同时
-        #      决定了弹出的文字，所以优先级最高，播的必须就是那一条；
-        #   2. 「点击表情」页的随机语音（与图案/文字开关无关，只想要声音也行）。
-        # 取路径要**无条件**调用 `take_voice()`：文字特效关掉时也得把队列清掉，
-        # 否则下次开起来会播一条上一轮遗留的音频。
+        # ---------------- 播哪一段音频
+        # 优先级：「点击文字」在"语音与文字统一"模式下挑中的那条**最高** ——
+        # 它同时决定了弹出的文字，播的必须就是同一条。取路径要**无条件**调
+        # `take_voice()`：文字特效关掉时也得把队列清掉，否则下次开起来会播一条
+        # 上一轮遗留的音频。它没挑到才轮到「点击音效」那一档（鼠标点击 / 键盘）。
+        # 两者**共用同一个播放器**：上一个还响着时后者直接丢弃 —— 一次点击只响
+        # 一声是自然结果，不用额外判重。
         path = self.click_text.take_voice()
         if path:
             self.voice.play_path(path)
-        elif self.mouse.clicked and cfg.get("click_voice_enabled", False):
-            self.voice.play_random(str(cfg.get("click_voice_dir", "")))
-
-        # ---------------- 点击音效（独立分类：只发声、不上屏）
-        # 排在最后：上面那两个来源若已经占了播放器，这一次点击就静默丢弃 ——
-        # "一次点击只响一声"是共用一个播放器自然得到的结果，不用额外判重。
-        # 键盘也走这里（用户勾了才触发），与鼠标点击同等对待。
-        if cfg.get("click_sfx_enabled", False):
-            hit = bool(self.mouse.clicked) or bool(self.mouse.key_clicked)
-            if hit:
-                self.click_sfx.trigger(cfg)
-        else:
-            self.click_sfx.reset()
+        elif cfg.get("click_sfx_enabled", False) \
+                and (self.mouse.clicked or self.mouse.key_clicked):
+            self.click_sfx.trigger(cfg)
 
     # ------------------------------------------------------------ 真实水波
     def _wave_trigger(self, cfg, dist, w, h, dt):

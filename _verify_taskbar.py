@@ -41,8 +41,13 @@ def test_bar_rects_look_sane():
         seen.add((l, t, r, b))
         if r <= l or b <= t:
             return False, f"任务栏矩形面积非正：{(l, t, r, b)}"
-        if (b - t) > h // 2 or (r - l) > w // 2:
-            return False, f"任务栏矩形尺寸离谱（差了单位？）：{(l, t, r, b)}"
+        # 任务栏永远是一条**贴在某个边上的薄条**，所以判据是"短边够薄"。
+        # ⚠️ 早先这里写的是"宽 ≤ 虚拟屏宽的一半"，在**单显示器**机器上会误判：
+        # 主屏底边任务栏本来就占满整个宽度（虚拟屏 1920 → 1920 > 960 判成
+        # "尺寸离谱"）。双屏时虚拟屏宽 3840，判据恰好蒙混过关，所以这毛病
+        # 一直没暴露 —— 本机副屏关掉之后才现形。判"薄条"与显示器数量无关。
+        if min(r - l, b - t) > max(w, h) // 4:
+            return False, f"任务栏不像是贴在一条边上的薄条：{(l, t, r, b)}"
         if r <= ox or b <= oy or l >= ox + w or t >= oy + h:
             return False, f"任务栏完全在虚拟屏之外却没被跳过：{(l, t, r, b)}"
         if t < oy or b > oy + h or l < ox or r > ox + w:

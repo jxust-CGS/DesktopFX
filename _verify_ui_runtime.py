@@ -120,22 +120,23 @@ def main():
         p._ctrls[key]["on"](False)
         assert app.cfg[key] is False, f"{key} 未写回 cfg"
 
-    # 2d2) 「点击表情」页的自定义素材块：来源 / 两个文件夹行 / 语音开关都注册
-    #      了，文件夹行的状态文案跟着**后台**加载走（不跟就会像"选了没反应"）。
+    # 2d2) 「点击表情」页：来源 / 两个路径行 / 单次选择 / 图片方向都注册了，
+    #      路径行的状态文案跟着**后台**加载走（不跟就会像"选了没反应"）。
+    #      语音相关已经全部搬到「点击音效」页，这里**不该**再有它们。
     for k in ("click_emoji_source", "click_emoji_custom_dir", "click_emoji_files",
-              "click_emoji_pick", "click_voice_enabled", "click_voice_dir"):
+              "click_emoji_pick", "click_emoji_align"):
         assert k in p._ctrls, f"点击表情页缺少控件 {k}"
+    for k in ("click_voice_enabled", "click_voice_dir", "click_text_voice_dir"):
+        assert k not in p._ctrls, f"{k} 已并入「点击音效」，不该还留在点击表情页"
+        assert k not in d.DEFAULTS, f"{k} 已并入 click_sfx_*，不该还在 DEFAULTS"
     assert p._ctrls["click_emoji_source"]["kind"] == "choices", \
         p._ctrls["click_emoji_source"]["kind"]
     assert p._ctrls["click_emoji_pick"]["kind"] == "choices"
-    assert p._ctrls["click_voice_enabled"]["kind"] == "toggle"
-    for k in ("click_emoji_custom_dir", "click_emoji_files", "click_voice_dir"):
+    assert p._ctrls["click_emoji_align"]["kind"] == "choices"
+    for k in ("click_emoji_custom_dir", "click_emoji_files"):
         assert p._ctrls[k]["kind"] == "path", (k, p._ctrls[k]["kind"])
         # 路径行必须跟着窗口宽度折行 —— 否则长路径会把页面顶到最小宽度之外
         assert p._ctrls[k]["label"] in p._hints, f"{k} 的路径行没注册折行宽度"
-    p._ctrls["click_voice_enabled"]["on"](True)
-    assert app.cfg["click_voice_enabled"] is True
-    p._ctrls["click_voice_enabled"]["on"](False)
 
     # 2d2b) 图片素材行：一行服务两种来源，文案跟着来源走
     _st = p._ctrls["click_emoji_files"]["label"]
@@ -184,33 +185,34 @@ def main():
     app.cfg["click_emoji_source"] = "内置图案"
     app.cfg["click_emoji_files"] = ""
 
-    # 2d3) 文件夹行的回填：非音频文件不算数，长目录名从**尾部**保留
+    # 2d3) 音效文件夹行的回填：非音频文件不算数，长目录名从**尾部**保留
     _aud = _tf.mkdtemp(prefix="fx_ui_voice_")
     for _nm in ("a.wav", "b.wav", "note.txt"):
         with open(_os2.path.join(_aud, _nm), "wb") as _fh:
             _fh.write(b"\x00")
-    app.cfg["click_voice_dir"] = _aud
+    app.cfg["click_sfx_source"] = "音效文件夹"
+    app.cfg["click_sfx_dir"] = _aud
     p._sync_from_cfg()
-    _lb = p._ctrls["click_voice_dir"]["label"].cget("text")
+    _lb = p._ctrls["click_sfx_dir"]["label"].cget("text")
     assert "找到 2 个音频" in _lb, _lb
     assert "note.txt" not in _lb, _lb
     _deep = _os2.path.join(_aud, "一二三四五六七八九十" * 3)
     _os2.makedirs(_deep, exist_ok=True)
-    app.cfg["click_voice_dir"] = _deep
-    p._ctrls["click_voice_dir"]["refresh"]()
-    _lb2 = p._ctrls["click_voice_dir"]["label"].cget("text")
+    app.cfg["click_sfx_dir"] = _deep
+    p._ctrls["click_sfx_dir"]["refresh"]()
+    _lb2 = p._ctrls["click_sfx_dir"]["label"].cget("text")
     assert _lb2.startswith("…"), _lb2
     assert _deep[-10:] in _lb2, (_lb2, _deep[-10:])
-    app.cfg["click_voice_dir"] = ""
+    app.cfg["click_sfx_dir"] = _aud
 
-    # 2d4) 「点击文字」页的语音包 + 只读文字栏。
-    #      开着「语音与文字统一」时，文字框必须**自动填入语音包里的音频名并
-    #      禁止编辑**，且**不能顺手把用户自己写的文字从 cfg 里抹掉**（关掉
-    #      统一之后得原样回来）—— 这条最容易实现成"直接覆盖配置"。
-    for k in ("click_text_voice_dir", "click_text_voice_match"):
-        assert k in p._ctrls, f"点击文字页缺少控件 {k}"
+    # 2d4) 「语音与文字统一」：目录来自音效来源、开着时自动启用「点击文字」、
+    #      文字框**自动填入音频名并禁止编辑**，且**不能顺手把用户自己写的
+    #      文字从 cfg 里抹掉**（关掉统一之后得原样回来）—— 这条最容易
+    #      实现成"直接覆盖配置"。
+    assert "click_text_voice_dir" not in p._ctrls, \
+        "语音包目录已并入 click_sfx_dir，点击文字页不该再有一份"
+    assert "click_text_voice_dir" not in d.DEFAULTS
     assert p._ctrls["click_text_voice_match"]["kind"] == "toggle"
-    assert p._ctrls["click_text_voice_dir"]["kind"] == "path"
     _pack = _tf.mkdtemp(prefix="fx_ui_pack_")
     for _nm in ("01-你好.wav", "02_再见.mp3", "note.txt"):
         with open(_os2.path.join(_pack, _nm), "wb") as _fh:
@@ -218,31 +220,56 @@ def main():
     _box = p._ctrls["click_text_list"]["widget"]
     _custom = str(app.cfg["click_text_list"])
     assert str(_box.cget("state")) == "normal", "默认应当可编辑"
-    app.cfg["click_text_voice_dir"] = _pack
-    p._ctrls["click_text_voice_match"]["on"](True)
+    app.cfg["click_sfx_source"] = "音效文件夹"
+    app.cfg["click_sfx_dir"] = _pack
+    app.cfg["click_text_enabled"] = False
+    app.cfg["click_emoji_enabled"] = True
+    p._sync_from_cfg()
+    p._ctrls["click_text_voice_match"]["on"](True)   # 走真实开关路径
     p.root.update_idletasks()
+    assert app.cfg["click_text_enabled"] is True, \
+        "开启统一后没有自动启用「点击文字」"
+    # 「点击文字 / 点击表情」同类互斥会顺带关掉点击表情 —— 那是 App.set 的
+    # 职责（这个桩不实现互斥），由 _verify_click 的互斥用例守着，这里不重复。
     _shown = _box.get("1.0", "end-1c")
     assert str(_box.cget("state")) == "disabled", \
         f"统一开启后文字框仍可编辑（state={_box.cget('state')}）"
     assert _shown == "你好\n再见", f"文字框没自动填入音频名：{_shown!r}"
     assert app.cfg["click_text_list"] == _custom, \
         f"统一模式改写了用户的文字配置：{app.cfg['click_text_list']!r}"
-    assert "找到 2 个音频" in p._ctrls["click_text_voice_dir"]["label"].cget("text"), \
-        p._ctrls["click_text_voice_dir"]["label"].cget("text")
-    # 关掉统一：恢复可编辑、内容回到用户自己写的那份
+    assert "找到 2 个音频" in p._ctrls["click_sfx_dir"]["label"].cget("text"), \
+        p._ctrls["click_sfx_dir"]["label"].cget("text")
+    # 开着统一时，音效来源那一组按钮必须是**禁用**的（锁住）
+    for _k in ("click_sfx_source", "click_sfx_builtin", "click_sfx_dir"):
+        for _b in p._ctrls[_k].get("btns", ()):
+            assert str(_b.cget("state")) == "disabled", \
+                f"统一开启后 {_k} 的按钮仍可点（应锁住）"
+    # 关掉统一：恢复可编辑、内容回到用户自己写的那份、控件解锁
     p._ctrls["click_text_voice_match"]["on"](False)
     p.root.update_idletasks()
     assert str(_box.cget("state")) == "normal", "关掉统一后文字框仍被锁着"
     assert _box.get("1.0", "end-1c") == _custom, \
         f"关掉统一后没回到用户文字：{_box.get('1.0', 'end-1c')!r}"
+    for _k in ("click_sfx_source", "click_sfx_builtin", "click_sfx_dir"):
+        for _b in p._ctrls[_k].get("btns", ()):
+            assert str(_b.cget("state")) == "normal", \
+                f"关掉统一后 {_k} 的按钮仍被锁着"
+    # 来源不是「音效文件夹」时统一不成立 -> 开关应当被自动关掉
+    app.cfg["click_sfx_source"] = "内置音效"
+    p._sync_from_cfg()
+    assert app.cfg["click_text_voice_match"] is False, \
+        "来源不是音效文件夹时统一仍开着（内部不变量没守住）"
     # 空目录时不锁成空框：仍禁止编辑（统一模式就是这样），但内容应是空
-    app.cfg["click_text_voice_dir"] = _tf.mkdtemp(prefix="fx_ui_pack0_")
+    app.cfg["click_sfx_source"] = "音效文件夹"
+    app.cfg["click_sfx_dir"] = _tf.mkdtemp(prefix="fx_ui_pack0_")
+    p._sync_from_cfg()
     p._ctrls["click_text_voice_match"]["on"](True)
     p.root.update_idletasks()
     assert _box.get("1.0", "end-1c") == "", "空语音包目录下文字框应为空"
-    assert "没找到音频" in p._ctrls["click_text_voice_dir"]["label"].cget("text")
+    assert "没找到音频" in p._ctrls["click_sfx_dir"]["label"].cget("text")
     p._ctrls["click_text_voice_match"]["on"](False)
-    app.cfg["click_text_voice_dir"] = ""
+    app.cfg["click_sfx_dir"] = ""
+    app.cfg["click_sfx_source"] = "内置音效"
 
     # 2e) 「其他设置」页：层级 / 多开开关已注册，且写的是字符串档位
     for k in ("layer_fullscreen", "layer_mouse", "multi_fullscreen", "multi_mouse"):
@@ -434,10 +461,12 @@ def main():
     p.root.update_idletasks()
     assert _shown("点击表情", "图案"), "内置图案时「图案」行应当可见"
     assert _shown("点击表情", "颜色"), "内置图案时「颜色」行应当可见"
+    assert _shown("点击表情", "图片方向"), \
+        "「图片方向」是通用选项，内置图案时也该可见"
     assert not _shown("点击表情", "图片素材"), \
         "内置图案时「图片素材」行应当整行藏掉"
     assert not _shown("点击表情", "单次选择"), \
-        "内置图案时「单次选择」行应当整行藏掉"
+        "「单次选择」只适用于图片文件夹，内置图案时应当藏掉"
     app.cfg["click_emoji_source"] = "自选图片"
     p._sync_from_cfg()
     p.root.update_idletasks()
@@ -446,7 +475,10 @@ def main():
     assert not _shown("点击表情", "颜色"), \
         "自选图片时「颜色」行应当整行藏掉"
     assert _shown("点击表情", "图片素材"), "自选图片时「图片素材」行应当可见"
-    assert _shown("点击表情", "单次选择"), "自选图片时「单次选择」行应当可见"
+    assert _shown("点击表情", "图片方向"), \
+        "「图片方向」是通用选项，自选图片时也该可见"
+    assert not _shown("点击表情", "单次选择"), \
+        "「单次选择」只适用于图片文件夹，自选图片时应当藏掉"
     # 素材行只留当前来源那一个按钮（互斥，另一个 pack_forget）
     _row = _find_label(p._pages["点击表情"], "图片素材")
     _row = _row.master
@@ -484,11 +516,32 @@ def main():
 
     assert _row_texts("点击表情", 2) == ["启用点击表情", "图案来源"], \
         f"点击表情前两行顺序不对：{_row_texts('点击表情', 2)}"
-    assert _row_texts("点击文字", 3) == ["启用点击文字", "语音包文件夹",
-                                        "语音与文字统一"], \
-        f"点击文字前三行顺序不对：{_row_texts('点击文字', 3)}"
+    assert _row_texts("点击文字", 2) == ["启用点击文字",
+                                        "文字（一行一个，点击时轮换取下一个）"], \
+        f"点击文字前两行顺序不对：{_row_texts('点击文字', 2)}"
     assert _row_texts("点击音效", 2) == ["启用点击音效", "音效来源"], \
         f"点击音效前两行顺序不对：{_row_texts('点击音效', 2)}"
+    # 语音设置已全部并入「点击音效」：这两个页面里不该再有语音相关的行
+    for _pg in ("点击表情", "点击文字"):
+        _cards = [c for c in p._pages[_pg].winfo_children()
+                  if c in p._card_rows]
+        _all = " ".join(str(l.cget("text"))
+                        for _c in _cards for r in p._card_rows[_c]
+                        for l in _walk_labels(r["w"]))
+        for _gone in ("语音文件夹", "语音包文件夹", "点击时播放语音",
+                      "语音与文字统一"):
+            assert _gone not in _all, f"{_pg} 页仍留着「{_gone}」这一行"
+    # 「语音与文字统一」只在「点击音效」页、且只在音效文件夹那一档下出现
+    app.cfg["click_sfx_source"] = "内置音效"
+    p._sync_from_cfg()
+    assert not _shown("点击音效", "语音与文字统一"), \
+        "来源不是音效文件夹时「语音与文字统一」也该藏掉"
+    app.cfg["click_sfx_source"] = "音效文件夹"
+    p._sync_from_cfg()
+    assert _shown("点击音效", "语音与文字统一"), \
+        "音效文件夹那一档应当显示「语音与文字统一」"
+    app.cfg["click_sfx_source"] = "内置音效"
+    p._sync_from_cfg()
 
     # 8c) 悬浮提示：停在名称上 0.4 秒弹出，离开即收；行被藏起来时不弹
     p._show_page("点击表情")
@@ -611,21 +664,38 @@ def main():
     p.root.update()
     assert p._canvas.yview()[0] == _cb, "侧栏滚轮不应带动内容区"
 
-    # 悬浮操作条：最小尺寸下仍在窗口内、不盖住左下角缩放手柄
+    # 悬浮操作条：最小尺寸下仍在窗口内、贴右下角、与内容区同宽、且不盖住缩放手柄
     p._set_size(win_w=p.W_MIN, win_h=p.H_MIN)
     p.root.update()
     fx, fy = p._fab.winfo_x(), p._fab.winfo_y()
     fw, fh = p._fab.winfo_width(), p._fab.winfo_height()
     assert p._fab.winfo_manager() == "place", p._fab.winfo_manager()
-    assert p._fab.place_info().get("anchor") == "sw", \
-        f"操作条应贴在左下角：{p._fab.place_info()}"
+    assert p._fab.place_info().get("anchor") == "se", \
+        f"操作条应贴在右下角：{p._fab.place_info()}"
     assert 0 <= fx and 0 <= fy and fx + fw <= p.W + 1 and fy + fh <= p.H + 1, \
         f"操作条越界：{fx},{fy} {fw}x{fh} 窗口 {p.W}x{p.H}"
-    assert fx >= p.GRIP_CORNER, \
-        f"操作条压住了左下角手柄：左 {fx} < {p.GRIP_CORNER}"
+    # 宽度 = 内容区（窗口 − 侧栏 120），且与实际内容区宽度一致
+    assert fw == p.W - 120, \
+        f"操作条宽 {fw} 与内容区 {p.W - 120} 不同宽（拖宽窗口后要跟着变）"
+    _cont = p._inner.master
+    assert abs(int(_cont.winfo_width()) - fw) <= 1, \
+        f"内容区宽 {_cont.winfo_width()} 与操作条 {fw} 不一致"
     assert fy + fh <= p.H - p.GRIP + 1, \
         f"操作条压住了底边手柄：底 {fy + fh} > {p.H - p.GRIP}"
+    assert fx + fw <= p.W - p.GRIP_CORNER + 1, \
+        f"操作条压住了右下角手柄：右 {fx + fw} > {p.W - p.GRIP_CORNER}"
+    # 两行布局：暂停独占一行，下面「隐藏到托盘 / 退出」并排
     assert p.pause_btn.winfo_ismapped(), "暂停按钮应可见"
+    assert str(p.pause_btn.cget("state")) == "normal"
+    _fab_kids = [k for k in p._fab.winfo_children() if k.winfo_class() == "Frame"]
+    assert len(_fab_kids) == 1, f"第二行容器不对：{_fab_kids}"
+    assert int(_fab_kids[0].winfo_y()) > int(p.pause_btn.winfo_y()), \
+        "「隐藏到托盘 / 退出」那一行应当在暂停按钮**下面**"
+    # 拖宽窗口后宽度必须跟着内容区走
+    p._set_size(win_w=900, win_h=560)
+    p.root.update()
+    assert int(p._fab.winfo_width()) == 900 - 120, \
+        f"拖宽后操作条宽 {p._fab.winfo_width()}（应为 {900 - 120}）"
     p._fit_height()
     p.root.update_idletasks()
 
@@ -673,6 +743,38 @@ def main():
     assert _bound, "「帧率上限」的名称上没有挂提示（<Enter> 无绑定）"
     _bound2 = p.root.tk.call("bind", str(_probe), "<Leave>")
     assert _bound2, "「帧率上限」的名称上没有挂收起提示的绑定（<Leave>）"
+
+    # 8g) 套用预设**不该**触发条件行重排（那正是"点预设时整页闪一下"的根因）
+    _repacked = []
+    _orig_repack = fx_ui.ControlPanel._repack
+
+    def _spy_repack(self, entries):
+        _repacked.append(len(entries))
+        return _orig_repack(self, entries)
+
+    app.cfg["click_emoji_source"] = "图片文件夹"
+    p._sync_from_cfg()
+    p._show_page("点击表情")
+    p.root.update_idletasks()
+    _h_before = int(p._pages["点击表情"].winfo_reqheight())
+    fx_ui.ControlPanel._repack = _spy_repack
+    try:
+        for _n in ("爱心雨", "彩带庆祝", "音符跳动"):
+            p._preset(_n)
+            p.root.update_idletasks()
+    finally:
+        fx_ui.ControlPanel._repack = _orig_repack
+    assert not _repacked, \
+        f"套用预设触发了 {len(_repacked)} 次行重排（预设会闪烁）"
+    assert int(p._pages["点击表情"].winfo_reqheight()) == _h_before, \
+        "套用预设不该改变页面高度（变了窗口就会跟着抖）"
+    assert app.cfg["click_emoji_source"] == "图片文件夹", \
+        f"套用预设把来源改成了 {app.cfg['click_emoji_source']}"
+    # 但来源真的变了仍然要重排（短路不能把正常显隐也吃掉）
+    app.cfg["click_emoji_source"] = "内置图案"
+    p._sync_from_cfg()
+    p.root.update_idletasks()
+    assert _shown("点击表情", "图案"), "改了来源之后「图案」行应当显示出来"
 
     p.root.destroy()
     # 清理测试写出的 UI 状态文件，避免污染实机默认页

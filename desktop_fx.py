@@ -207,27 +207,15 @@ DEFAULTS = {
     "click_text_spin": 0.75,
     "click_text_life": 1.4,         # 从弹出到消失的秒数
     "click_text_opacity": 1.0,
-    # ---- 点击文字的语音包（wav / mp3 / wma / m4a）----
-    # 开着「语音与文字统一」时，文字栏会被自动填上语音包里每条音频的名字并
-    # **置为只读**：点击时随机挑一条音频，弹出的就是它的名字 —— 看到的那行字
-    # 与听到的那段声音永远是同一条。关掉则文字仍可自由编辑，语音与文字各自
-    # 随机、互不相关（那次点击只是一起发生）。
-    # 顺序固定为「先挑音频、再用它的名字」，所以"统一"是构造上保证的，
-    # 不是靠两处随机凑巧对上。
-    "click_text_voice_dir": "",
+    # ---- 点击文字与音效的联动（所有音频配置都归「点击音效」这一页）----
+    # 「语音与文字统一」= 点了之后弹出的字与听到的声音永远是同一条。开着时
+    # 文字栏自动填上音频名并**置为只读**：点击时先随机挑一条音频、再拿它的名字
+    # 当文字，顺序固定为"先挑后播"，所以两边对得上是**构造上保证的**，不是靠
+    # 两处随机凑巧对上。
+    # 它**只在「音效文件夹」那一档下可用**：统一需要一个装着多条音频的目录，
+    # 内置音效/单个音效都给不出"多行文字"。开着时音色来源那一组控件会被锁住。
     "click_text_voice_match": False,
-    # ---- 点击语音（点一下随机播一段音频）----
-    # **独立于两个点击特效的开关**：只要它开着，任何一次鼠标左键点击都会
-    # 随机播 `click_voice_dir` 里的一段（wav / mp3 / wma），不需要图案或
-    # 文字也开着 —— 用户完全可能只想要声音。
-    # 播放同一时刻只响一个：上一段没放完时新的点击**直接丢弃**（不排队），
-    # 排队会让连点变成一串越来越滞后的拖音。
-    "click_voice_enabled": False,
-    "click_voice_dir": "",
-    # ---- 点击音效（独立特效「点击音效」，与上面那个语音包不是同一件事）----
-    # 上面 `click_voice_*` 是挂在「点击表情」页里的语音，这里则是**一个独立
-    # 的特效分类**：不画任何像素，只负责"点一下响一声"。两者的差别在用途 ——
-    # 只想要声音、不要任何图案/文字时用这一个。
+    # ---- 点击音效（独立特效分类，不画任何像素，只负责"点一下响一声"）----
     # 三个来源：内置音效（随程序打包的 assets/sfx）/ 单个音效文件 / 音效文件夹
     # 随机。后两档与图案来源同一套语义。
     "click_sfx_enabled": False,
@@ -569,21 +557,18 @@ PRESETS = {
     # 都显式关掉全屏特效（与上面几个预设同一个理由：预设是"整套方案"）。
     "青轴打字音": dict(rain_enabled=False, snow_enabled=False,
                  petal_enabled=False, meteor_enabled=False,
-                 click_sfx_enabled=True, click_sfx_source="内置音效",
+                 click_sfx_enabled=True,
                  click_sfx_builtin="青轴.wav",
-                 click_sfx_file="", click_sfx_dir="",
                  click_sfx_keyboard=True),
     "木鱼": dict(rain_enabled=False, snow_enabled=False,
                petal_enabled=False, meteor_enabled=False,
-               click_sfx_enabled=True, click_sfx_source="内置音效",
+               click_sfx_enabled=True,
                click_sfx_builtin="木鱼2.wav",
-               click_sfx_file="", click_sfx_dir="",
                click_sfx_keyboard=False),
     "水滴": dict(rain_enabled=False, snow_enabled=False,
                petal_enabled=False, meteor_enabled=False,
-               click_sfx_enabled=True, click_sfx_source="内置音效",
+               click_sfx_enabled=True,
                click_sfx_builtin="水滴声.wav",
-               click_sfx_file="", click_sfx_dir="",
                click_sfx_keyboard=False),
     # ---- 点击文字 ----
     # 三路内容：日常夸夸 / 网络梗 / 职场黑话。字体、颜色、装饰都跟着内容走，
@@ -673,6 +658,24 @@ PRESET_GROUPS = {
     "点击文字": ["好耶", "绝绝子", "破防了", "冲鸭", "打工人",
                "互联网黑话", "古风", "简洁无装饰"],
 }
+
+# 预设**不携带**的键：素材/来源的选择（用哪张图、哪个图片文件夹、哪个音效、
+# 哪个音效文件夹，以及依赖目录的「语音与文字统一」）。
+#
+# 为什么必须显式排除：预设存的是"这套效果长什么样"，不是"我电脑里放着哪些
+# 素材"。而 `save_preset` 快照的是**全部** DEFAULTS 键 —— 不排除就会把保存
+# 那一刻的来源与路径一起冻进预设，于是"套用一个旧的自定义预设，图案来源悄悄
+# 跳回内置图案"。路径类键更糟：预设跟着拷到别的机器上就指着一个不存在的目录。
+# `apply_preset` 也要挡一遍：老的 presets_user.json 里已经存着这些键了。
+# `click_sfx_builtin` **不在**这个列表里：它指的是随程序打包的内置音效
+# （assets/sfx/青轴.wav），换台机器照样在；「青轴打字音」那个预设的身份就是
+# "用青轴这一声"，把它排除掉预设就没意义了。真正不能搬的是**用户自己的**
+# 路径与来源选择。
+PRESET_EXCLUDE = (
+    "click_emoji_source", "click_emoji_files", "click_emoji_custom_dir",
+    "click_sfx_source", "click_sfx_file", "click_sfx_dir",
+    "click_text_voice_match",
+)
 
 
 class App:
@@ -770,6 +773,25 @@ class App:
             self.last_error = None
 
     # ---------------------------------------------------------------- 配置
+    @staticmethod
+    def _migrate_voice_keys(data):
+        """旧配置的语音键 → 「点击音效」的文件夹来源。
+
+        语音配置以前分散在两个页面上（点击表情的"点击语音"、点击文字的"语音包"），
+        现在统一到「点击音效」。这里把用户**已经选好的目录**搬过去，别让他重新
+        指一次。只在目标为空时搬 —— 已有的新值优先。
+
+        就地改 `data`（load() 紧接着遍历它），不额外维护一份中间态。
+        """
+        old = str(data.get("click_text_voice_dir", "") or
+                  data.get("click_voice_dir", "") or "")
+        if not old or str(data.get("click_sfx_dir", "") or ""):
+            return
+        if not os.path.isdir(old):
+            return                  # 目录早就没了，搬过去也只是留个坏路径
+        data["click_sfx_dir"] = old
+        data["click_sfx_source"] = "音效文件夹"
+
     def load(self):
         """读入已存在的键，未知键忽略（配置 schema 演进时旧文件仍可用）。
         文件损坏时回退到 DEFAULTS —— 这是预期行为，但要留下记录，
@@ -784,6 +806,7 @@ class App:
                 data = json.load(f)
             if not isinstance(data, dict):
                 raise ValueError("config root is not an object")
+            self._migrate_voice_keys(data)
             rejected = []
             for k, v in data.items():
                 if k not in DEFAULTS:
@@ -1045,6 +1068,11 @@ class App:
         for k, v in p.items():
             if k.startswith("_") or k not in DEFAULTS:
                 continue
+            # 素材/来源类键一律跳过：内置预设本来就不写它们，老的自定义预设里
+            # 却存着（save_preset 快照的是全部 DEFAULTS 键）。不挡的话，套用一个
+            # 旧预设就会把用户当前的图片文件夹 / 音效文件夹整个换掉。
+            if k in PRESET_EXCLUDE:
+                continue
             ok, val = _coerce_cfg_value(k, v)
             if ok:
                 fresh[k] = val
@@ -1063,7 +1091,8 @@ class App:
             return False, f"“{name}”与内置预设重名"
         if name in self.user_presets:
             return False, f"“{name}”已存在，请换个名称"
-        snap = {k: self.cfg[k] for k in DEFAULTS if k in self.cfg}
+        snap = {k: self.cfg[k] for k in DEFAULTS
+                if k in self.cfg and k not in PRESET_EXCLUDE}
         snap["_page"] = page
         self.user_presets[name] = snap
         ok = self._save_user_presets()

@@ -701,6 +701,7 @@ class ControlPanel:
         self.root.geometry(f"{w}x{h}+{x}+{y}")
         self._apply_wraplength(w)
         self._layout_grips(w, h)
+        self._fab_layout()
 
     # ------------------------------------------------------------ 拖拽缩放
     _GRIP_CURSOR = {
@@ -780,6 +781,7 @@ class ControlPanel:
         self.root.geometry(f"{w}x{h}+{left}+{top}")
         self._apply_wraplength(w)
         self._layout_grips(w, h)
+        self._fab_layout()
 
     def _rz_end(self, _e):
         if not self._rz:
@@ -1043,40 +1045,44 @@ class ControlPanel:
 
         # ---- 悬浮操作条：暂停 / 隐藏到托盘 / 退出 ----
         # 这三个按钮原来在侧栏底部（pack 布局）：窗口一矮、特效项一多就被
-        # 挤得够不着。改成 place 贴在**窗口左下角**，再小的窗口也看得见；
-        # 位置抬离左下角 20px，把 12px 的角落缩放手柄整个让出来（被盖住
+        # 挤得够不着。改成 place 贴在**窗口右下角**，再小的窗口也看得见。
+        # 布局保持原来那个两行的样子（暂停独占一行，下面「隐藏到托盘 |
+        # 退出」并排），宽度与右侧内容区**同宽**（= 窗口宽 − 侧栏 120），
+        # 于是它读起来是内容区的一条底栏，而不是浮在上面的一块贴纸。
+        # 位置抬离右下角 20px，把 12px 的角落缩放手柄整个让出来（被盖住
         # 就没法从角落拖大窗口了）。
         fab = tk.Frame(root, bg=CARD)
-        # x=16 而不是 10：左下角手柄宽 12px，贴太近会把它盖住（被盖住就
-        # 没法从角落拖大窗口）；y=-20 让条子底边避开 6px 的底边手柄。
-        fab.place(relx=0.0, rely=1.0, anchor="sw", x=16, y=-20)
         self._fab = fab
         self._paused = False
         self.pause_btn = tk.Button(fab, text="暂停", bg=BTN, fg=TEXT, bd=0,
-                                   relief="flat", font=FONT_LABEL, padx=12,
-                                   pady=6, cursor="hand2",
+                                   relief="flat", font=FONT_LABEL, pady=6,
+                                   cursor="hand2",
                                    activebackground=ACCENT_HOVER,
                                    activeforeground=ON_ACCENT,
                                    command=self._pause)
-        self.pause_btn.pack(side="left", padx=(8, 2), pady=6)
+        self.pause_btn.pack(fill="x", padx=6, pady=(6, 4))
         self.pause_btn.bind("<Enter>", lambda e: self._paint_pause(True))
         self.pause_btn.bind("<Leave>", lambda e: self._paint_pause(False))
         self._bind_tip(self.pause_btn, "暂停或继续全部特效（Ctrl+Alt+R）。")
+        brow = tk.Frame(fab, bg=CARD)
+        brow.pack(fill="x", padx=6, pady=(0, 6))
         for txt, cmd, bg, fg, hbg, hfg, tip in (
                 ("隐藏到托盘", self.hide, BTN, TEXT, BTN_H, TEXT,
                  "收进托盘图标；右键那个图标可以再唤出面板。"),
                 ("退出", self._quit, DANGER_SOFT, DANGER_SOFT_FG, DANGER,
                  WHITE, "退出程序，特效与面板一起关闭。")):
-            b = tk.Button(fab, text=txt, bg=bg, fg=fg, bd=0, relief="flat",
-                          font=FONT_LABEL, padx=12, pady=6, cursor="hand2",
+            b = tk.Button(brow, text=txt, bg=bg, fg=fg, bd=0, relief="flat",
+                          font=FONT_LABEL, pady=6, cursor="hand2",
                           activebackground=hbg, activeforeground=hfg,
                           command=cmd)
-            b.pack(side="left", padx=2, pady=6)
+            b.pack(side="left", fill="x", expand=True, padx=3)
             b.bind("<Enter>", lambda e, w=b, c=hbg, f=hfg: w.config(bg=c, fg=f))
             b.bind("<Leave>", lambda e, w=b, c=bg, f=fg: w.config(bg=c, fg=f))
             self._bind_tip(b, tip)
+        self._fab_layout()
 
         # ---- 内容区（无滚动条，滚轮仍可上下滚动）----
+        # 内容区留在 nav_cv 右边 = 宽 `W - 120`，悬浮操作条按这个宽度铺满
         cont = tk.Frame(main, bg=BG)
         cont.pack(side="left", fill="both", expand=True)
         canvas = tk.Canvas(cont, bg=BG, highlightthickness=0)
@@ -1262,13 +1268,14 @@ class ControlPanel:
         return False
 
     def _nav_view_h(self):
-        """侧栏可用高度 = canvas 高 − 左下角悬浮操作条让位。
+        """侧栏可用高度 = canvas 高。
 
-        操作条贴在窗口左下角、压在侧栏之上，不扣掉这一段的话最下面那几项
-        （「其它设置」）会正好躲到条子后面 —— 看得见标题点不着。
+        操作条现在贴在**右下角、与内容区同宽**，不再压在侧栏之上，所以这里
+        不用为它扣高度（早期版本贴在左下角时需要扣 —— 那时最下面几项会正好
+        躲在条子后面，滚到底也点不着）。
         """
         try:
-            return max(120, int(self._nav_cv.winfo_height()) - self._fab_clear())
+            return max(120, int(self._nav_cv.winfo_height()))
         except Exception:
             return 120
 
@@ -1415,11 +1422,36 @@ class ControlPanel:
                 except Exception:
                     pass
 
-    def _refresh_rows(self):
-        """重排所有带条件行的卡片（目前只有「点击表情」页有）。"""
+    def _refresh_rows(self, force=False):
+        """重排所有带条件行的卡片（目前只有「点击表情」「点击音效」有）。
+
+        **可见集合没变就一个都不碰**。这不是图省事，是治闪烁：`_repack` 是
+        一次 pack_forget + 重新 pack，卡片在两次布局之间会短暂空掉，而行数一变
+        还会连带改页面高度 —— 表现就是"套用一个预设，整页闪一下"。预设本来就不
+        带素材来源（见 desktop_fx.PRESET_EXCLUDE），条件行在套用预设时不该动，
+        这条短路几乎总是命中，闪烁也就没了。
+        """
         for rows in self._card_rows.values():
-            if any(r["when"] is not None for r in rows):
-                self._repack(rows)
+            if not any(r["when"] is not None for r in rows):
+                continue
+            if not force and not self._rows_changed(rows):
+                continue
+            self._repack(rows)
+
+    @staticmethod
+    def _rows_changed(rows):
+        """按 `when()` 现算的可见集合与当前实际管理状态是否一致。"""
+        for r in rows:
+            if r["when"] is None:
+                continue
+            want = bool(r["when"]())
+            try:
+                now = bool(r["w"].winfo_manager())
+            except Exception:
+                return True
+            if want != now:
+                return True
+        return False
 
     def _src_is_builtin(self):
         """点击表情的图案来源是不是内置图案。"""
@@ -1428,8 +1460,19 @@ class ControlPanel:
             fx_effects.CLICK_SOURCE_BUILTIN
 
     def _src_has_images(self):
-        """来源是图片（自选/文件夹）—— 素材行与「单次选择」只在这种时候有意义。"""
+        """来源是图片（自选/文件夹）—— 素材行在这两档下才出现。"""
         return not self._src_is_builtin()
+
+    def _src_is_folder(self):
+        """来源是「图片文件夹」—— 只有这一档才需要「单次选择」。
+
+        自选图片那一档用户在文件对话框里挑的就是**最终那几张**，一次点击
+        从它们里取哪张已经是明摆着的意图，再让他决定"每颗各抽各的还是整簇
+        同图"是多余的一层。内置图案同理（就一张图案而已）。
+        """
+        return fx_effects.normalize_source(
+            self.app.cfg.get("click_emoji_source")) == \
+            fx_effects.CLICK_SOURCE_FOLDER
 
     def _on_emoji_source(self, _src=None):
         """图案来源变了：立刻重排该显哪几行，并让素材状态行跟上。"""
@@ -1492,6 +1535,21 @@ class ControlPanel:
         if f is None:
             return False
         return int(f.winfo_reqheight()) > self._view_h()
+
+    def _fab_layout(self):
+        """把悬浮操作条按当前窗口尺寸摆到右下角，宽度 = 内容区宽度。
+
+        宽度跟着窗口走（`place` 的 width 不像 pack 会自动拉伸），所以每次
+        改尺寸都要重摆一次 —— 否则拖宽窗口后那条子仍按旧宽摆着，右边空一截。
+        """
+        fab = getattr(self, "_fab", None)
+        if fab is None:
+            return
+        try:
+            fab.place(relx=1.0, rely=1.0, anchor="se", x=-16, y=-20,
+                      width=max(120, int(self.W) - 120))
+        except Exception:
+            pass
 
     def _fab_clear(self):
         """悬浮操作条占掉的窗口底部高度（条子本身 + 离底偏移 + 余量）。
@@ -2097,14 +2155,17 @@ class ControlPanel:
                         tip="自选图片可以选一张或多张；图片文件夹则每次从整摞"
                             "里随机取。GIF 会按原来的速度循环播放。")
         self._choices(c, "单次选择", "click_emoji_pick", fx_effects.CLICK_PICKS,
-                      when=self._src_has_images,
+                      when=self._src_is_folder,
                       tip="整簇同图＝一次点击全用同一张；随机多图＝每颗粒子"
-                          "各抽各的。")
+                          "各抽各的。只在「图片文件夹」下有意义 —— 自选图片里"
+                          "挑的就是最终那几张，来源不是文件夹时这一档藏起来。")
+        # 图片方向是**通用**选项：内置图案（爱心/彩带有朝向）、自选图片、
+        # 图片文件夹都适用，所以不挂 when。
         self._choices(c, "图片方向", "click_emoji_align", IMG_ALIGNS,
-                      when=self._src_has_images,
-                      tip="竖直＝图片保持原朝向（像贴纸撒开）；"
-                          "随扩散方向＝图片跟着自己飞出去的方向转，"
-                          "甩出一条条轨迹，动感更强。")
+                      tip="竖直＝保持原朝向（像贴纸撒开）；"
+                          "随扩散方向＝跟着自己飞出去的方向转，甩出一条条"
+                          "轨迹。三种来源都适用（内置图案里也有朝向明确的"
+                          "形状）；勾了它就等于不要自旋。")
         self._slider(c, "数量", "click_emoji_count", 2, 40, 1, "{:.0f} 个",
                      tip="一次点击炸出多少颗。")
         self._slider(c, "大小", "click_emoji_size", 8, 64, 1, "{:.0f} 像素",
@@ -2116,20 +2177,14 @@ class ControlPanel:
         self._slider(c, "持续时间", "click_emoji_life", 0.2, 1.5, 0.05,
                      "{:.2f} 秒", tip="一簇图案从炸开到散尽的时间。")
         self._toggle(c, "粒子自旋", "click_emoji_rotate",
-                     tip="飞行过程中图案自个儿旋转。")
+                     tip="飞行过程中图案自个儿旋转（勾了「随扩散方向」时"
+                         "自动让位给方向）。")
         self._swatch(c, "颜色", "click_emoji_color", CLICK_EMOJI_COLORS,
                      when=self._src_is_builtin,
                      tip="内置图案的颜色（用图片当图案时不参与绘制）；"
                          "「彩色」＝每颗随机取一色。")
         self._slider(c, "不透明度", "click_emoji_opacity", 0.2, 1.0, 0.01,
                      "{:.0%}", tip="整簇图案的不透明度。")
-        self._toggle(c, "点击时播放语音", "click_voice_enabled",
-                     tip="每次点击随机播一段语音；上一段没播完时新的点击"
-                         "不响应（不排队，也就不会重叠）。")
-        self._folder(c, "语音文件夹", "click_voice_dir",
-                     status=self._voice_status,
-                     tip="放着音频文件的文件夹（wav/mp3/wma/m4a），每次点击"
-                         "随机挑一个播。")
         self._save_bar(c, "点击表情")
         self._preset_block(p, "点击表情")
         return p
@@ -2303,16 +2358,9 @@ class ControlPanel:
         # `_sync_from_cfg` 能刷到它
         for k in (_fk, _dk):
             self._ctrls[k] = {"kind": "path", "refresh": refresh,
-                              "label": status_lb}
+                              "label": status_lb, "btns": list(btns.values())}
         self._folders.append(refresh)
         refresh()
-
-    def _voice_status(self):
-        folder = str(self.app.cfg.get("click_voice_dir", "") or "")
-        if not folder:
-            return ""
-        n = fx_effects.count_audio(folder)
-        return "找到 %d 个音频" % n if n else "没找到音频"
 
     def _page_click_text(self, parent):
         p = tk.Frame(parent, bg=BG)
@@ -2321,26 +2369,19 @@ class ControlPanel:
         c.pack(fill="x", padx=16, pady=(0, 8))
         self._toggle(c, "启用点击文字", "click_text_enabled",
                      tip="打开后点一下鼠标，在光标处弹出一行字并向上飘走。")
-        # 语音包两项排在最前面：「语音与文字统一」管着下面文字框的内容
-        # （开着时它由音频名自动填入并锁定），放在文字框后面等于让用户
-        # 先看到一块"待会儿会变只读"的输入框，顺序别扭。
-        self._folder(c, "语音包文件夹", "click_text_voice_dir",
-                     status=self._voice_pack_status,
-                     tip="放着音频文件的文件夹（wav/mp3/wma/m4a）。开启下面"
-                         "「语音与文字统一」后，每一行文字对应这里的一条音频。")
-        self._toggle(c, "语音与文字统一", "click_text_voice_match",
-                     tip="开启后文字栏自动填入每条音频的名字并变为只读，点击"
-                         "时弹出的字与播出的声永远是同一条；关闭则可自己写"
-                         "文字，声音仍然随机播。")
-        # 这块文字框会被「语音与文字统一」接管：闸门一开就变成只读、内容由
-        # 语音包的文件名派生（见 _sync_text）。
+        # 语音与音效的设置**全部搬到了「点击音效」页**：语音包就是那一页的
+        # 「音效文件夹」，「语音与文字统一」也在那边（且只在那一档下可用）。
+        # 这里只留"文字自己怎么显示"。
+        # 这个框会被「语音与文字统一」接管：闸门一开就变成只读、内容由音效
+        # 文件夹里的音频名派生（见 _sync_text）。
         self._textbox(c, "文字（一行一个，点击时轮换取下一个）",
                       "click_text_list", height=2,
                       gate="click_text_voice_match",
                       fill=self._voice_text_preview,
-                      tip="一行一句，点一次换下一句。开启「语音与文字统一」"
-                          "后这里由音频名自动填入、不能改；文件名的序号"
-                          "（如「01 你好」）会自动去掉。")
+                      tip="一行一句，点一次换下一句。\n"
+                          "在「点击音效」页把「语音与文字统一」打开后，这里会由"
+                          "音效文件夹里的音频名自动填入并**锁定为只读** —— "
+                          "弹出的字与听到的声音永远是同一条。")
         # 9 款字体排 5 列 = 2 行（3 列要 3 行，多 34px）。名字最长 4 个字，
         # 5 列在最小窗口宽度下也放得下（内容区 400px / 5 ≈ 80px）。
         self._choices(c, "字体", "click_text_font", CLICK_FONTS, columns=5,
@@ -2363,18 +2404,10 @@ class ControlPanel:
         self._preset_block(p, "点击文字")
         return p
 
-    def _voice_pack_status(self):
-        """语音包文件夹的附加状态。"""
-        folder = str(self.app.cfg.get("click_text_voice_dir", "") or "")
-        if not folder:
-            return ""
-        n = fx_effects.count_audio(folder)
-        return "找到 %d 个音频" % n if n else "没找到音频"
-
     def _voice_text_preview(self):
-        """统一模式下文字栏要显示的内容：语音包里每条音频的名字。"""
-        folder = str(self.app.cfg.get("click_text_voice_dir", "") or "")
-        return "\n".join(fx_effects.audio_labels(folder))
+        """统一模式下文字栏要显示的内容：音效文件夹里每条音频的名字。"""
+        return "\n".join(
+            fx_effects.audio_labels(fx_effects.voice_pack_dir(self.app.cfg)))
 
     # ------------------------------------------------------------ 点击音效
     def _sfx_is_builtin(self):
@@ -2416,24 +2449,85 @@ class ControlPanel:
 
     def _on_sfx_source(self, _src=None):
         fx_effects.invalidate_media_cache()
+        self._fix_voice_match()
         self._refresh_rows()
+        self._sync_sfx_lock()
+
+    def _fix_voice_match(self):
+        """统一开着但来源不是「音效文件夹」→ 把它关掉。
+
+        统一模式需要"一个装着多条音频的目录"才能把文件名一行行变成弹出文字；
+        内置音效与单个音效都给不出多行文字。与其让界面显示"开着"却实际不生效
+        （文字框没被接管，用户只会以为是自己哪里配错了），不如直接关掉这条
+        不变量。
+        """
+        if not self.app.cfg.get("click_text_voice_match"):
+            return
+        if not self._sfx_is_folder():
+            self.app.set("click_text_voice_match", False)
+
+    def _on_voice_match(self, on):
+        """「语音与文字统一」打开时的联动。
+
+        * 来源切到「音效文件夹」—— 统一模式只在那一档下成立；
+        * **自动启用「点击文字」**：统一的意义就是"弹出的字跟着声音走"，文字
+          特效关着的话用户什么也看不到，这个开关等于白开；
+        * 来源那一组控件被锁住（见 `_sync_sfx_lock`）：开着统一还去换来源，
+          统一会在下一帧失效，而那一帧用户根本看不出来发生了什么。
+        """
+        if not on:
+            self._sync_sfx_lock()
+            return
+        if not self._sfx_is_folder():
+            self.app.set("click_sfx_source", fx_effects.SFX_SOURCE_FOLDER)
+            self._on_sfx_source()
+        if not self.app.cfg.get("click_text_enabled"):
+            self.app.set("click_text_enabled", True)
+        self._sync_sfx_lock()
+
+    def _sync_sfx_lock(self):
+        """「语音与文字统一」开着时，把音效来源那一组控件整体锁住。
+
+        锁的是**按钮**（`state=disabled`）而不是把整行藏起来：那几行正是用户
+        想改的内容，藏掉等于让他猜"开关为什么失效"；灰掉则一眼看得出"被统一
+        占用了，关掉统一就能改"。
+        """
+        locked = bool(self.app.cfg.get("click_text_voice_match"))
+        for key in ("click_sfx_source", "click_sfx_builtin",
+                    "click_sfx_file", "click_sfx_dir"):
+            c = self._ctrls.get(key)
+            if not c:
+                continue
+            for b in c.get("btns", ()):
+                try:
+                    b.config(state="disabled" if locked else "normal")
+                except Exception:
+                    pass
 
     def _sfx_status(self):
-        """音效素材行右侧的状态文案。"""
+        """音效素材行的状态文案：`路径 · 说明`。
+
+        路径**要显示出来**（从尾部截断）：用户选的是哪个文件夹/哪个文件，
+        只回一句"找到 3 个音频"的话他没法确认自己选对了没有 —— 而这正是
+        "选了文件夹却一声不响"最难查的一环。
+        """
         cfg = self.app.cfg
         src = fx_effects.normalize_sfx_source(cfg.get("click_sfx_source"))
         if src == fx_effects.SFX_SOURCE_FILE:
             p = str(cfg.get("click_sfx_file", "") or "")
             if not p:
                 return "还没选音效文件"
-            return ("已选 %s" % fx_effects.sfx_label(p)) if os.path.isfile(p) \
-                else "文件不在了，请重选"
+            if not os.path.isfile(p):
+                return "%s   ·   文件不在了，请重选" % _short_path(p)
+            return "%s   ·   已选" % _short_path(p)
         if src == fx_effects.SFX_SOURCE_FOLDER:
             folder = str(cfg.get("click_sfx_dir", "") or "")
             if not folder:
                 return "还没选文件夹"
             n = fx_effects.count_audio(folder)
-            return ("找到 %d 个音频" % n) if n else "没找到音频"
+            return "%s   ·   %s" % (
+                _short_path(folder),
+                ("找到 %d 个音频" % n) if n else "没找到音频")
         items = fx_effects.list_builtin_sfx()
         return ("内置 %d 个音效" % len(items)) if items else "内置音效缺失"
 
@@ -2475,6 +2569,15 @@ class ControlPanel:
                         status=self._sfx_status, when=self._sfx_has_file,
                         tip="「单个音效」一直响这一个；「音效文件夹」每次"
                             "点击从里面随机挑。支持 wav / mp3 / wma / m4a。")
+        # 「语音与文字统一」只在这一档下存在：它要把**多条**音频各自变成一行
+        # 弹出文字，内置音效与单个音效都给不出多行。
+        self._toggle(c, "语音与文字统一", "click_text_voice_match",
+                     when=self._sfx_is_folder, on_change=self._on_voice_match,
+                     tip="开启后点一下弹出的字就是听到的那条音频的名字，"
+                         "「点击文字」里的文字框会被**锁定为只读**（由这个"
+                         "文件夹里的音频名自动填入）。会自动打开「点击文字」"
+                         "（两者同类互斥，所以「点击表情」会被关掉）；"
+                         "开启期间上面的来源选择会被锁住，关掉统一即可改。")
         self._toggle(c, "键盘点击也触发", "click_sfx_keyboard",
                      tip="开着时打字每按一次键也响一声（只认能出字符的键，"
                          "Ctrl / Shift 这类修饰键不算）。青轴那类打字音效"
@@ -2748,11 +2851,16 @@ class ControlPanel:
                             "on": _on}
 
     # ------------------------------------------------------------ 控件原语
-    def _toggle(self, parent, label, key, pady=8, tip=None, when=None):
+    def _toggle(self, parent, label, key, pady=8, tip=None, when=None,
+                on_change=None):
         """通用开关行：名称 …… 开关（开/关）。
 
         `pady` 可收紧：控件多的页面靠它挤出十几像素（页面高度是有限预算，
         见 MEMORY 里的「面板高度」一节）。
+
+        `on_change(开)` 在写入配置之后、`_sync_from_cfg` 之前调 —— 联动动作
+        （"统一打开时顺便把来源切到文件夹、并自动启用文字特效"）必须在那之前
+        做完，才能被同一轮 `_sync_from_cfg` 刷到界面上。
         """
         app = self.app
         var = tk.BooleanVar(value=bool(app.cfg[key]))
@@ -2765,12 +2873,15 @@ class ControlPanel:
 
         def _on(v):
             app.set(key, bool(v))
+            if on_change is not None:
+                on_change(bool(v))
             # 同类互斥可能连带关掉别的特效开关，回读一次让面板跟着变
             self._sync_from_cfg()
 
         _Toggle(row, var, command=_on).pack(side="right")
         # 不再挂 var.trace：_sync_from_cfg 回写变量时不该反过来再 set 一次
-        self._ctrls[key] = {"kind": "toggle", "var": var, "on": _on}
+        self._ctrls[key] = {"kind": "toggle", "var": var, "on": _on,
+                            "label": lb}
 
     def _slider(self, parent, label, key, lo, hi, res, fmt, tip=None, when=None):
         app = self.app
@@ -2921,7 +3032,9 @@ class ControlPanel:
                 b.bind("<Leave>", lambda e, w=b: w.config(bg=BTN))
                 btns.insert(0, b)
         refresh()
-        self._ctrls[key] = {"kind": "choices", "refresh": refresh}
+        # 按钮一并登记：外层要能在「语音与文字统一」打开时把来源那一组**锁住**
+        # （统一模式要求来源固定在「音效文件夹」，不能让用户中途换掉）。
+        self._ctrls[key] = {"kind": "choices", "refresh": refresh, "btns": btns}
 
     def _textbox(self, parent, label, key, height=3, gate=None, fill=None,
                  tip=None, when=None):
@@ -3131,6 +3244,10 @@ class ControlPanel:
 
     def _sync_from_cfg(self):
         app = self.app
+        # 先收一条不变量：「统一」只在音效文件夹那一档下成立（外部改配置 /
+        # 预设 / 老配置都可能在别的来源下开着它）。放在最前面，控件回读之前
+        # 就收干净，后面读到的都是最终状态。
+        self._fix_voice_match()
         for key, c in self._ctrls.items():
             v = app.cfg.get(key)
             if v is None:
@@ -3155,6 +3272,7 @@ class ControlPanel:
         # 预设/外部改动可能换掉「图案来源」：条件行（图案选择、素材行、
         # 单次选择）要跟着显隐，不然面板会和实际配置对不上。
         self._refresh_rows()
+        self._sync_sfx_lock()
 
     def _pause(self):
         p = self.app.toggle_pause()

@@ -18,6 +18,7 @@
 
 不建窗口、不构造 App，只碰内存缓冲。
 """
+import math
 import os
 import shutil
 import sys
@@ -529,7 +530,8 @@ def test_registry_and_defaults():
               "click_text_enabled", "click_text_list", "click_text_color",
               "click_text_size", "click_text_font", "click_text_deco",
               "click_text_rise", "click_text_life", "click_text_opacity",
-              "click_text_voice_dir", "click_text_voice_match"):
+              "click_text_voice_match", "click_sfx_dir",
+              "click_emoji_align"):
         if k not in d.DEFAULTS:
             return False, f"DEFAULTS 缺 {k}"
     if d.DEFAULTS["click_emoji_shape"] not in F._SHAPE_NAMES:
@@ -1195,16 +1197,16 @@ def test_voice_releases_on_failure():
 
 
 def test_click_asset_defaults():
-    """四个新配置键存在、类型正确，坏值被钳制。"""
+    """来源/素材类配置键存在、类型正确，坏值被钳制。"""
     want = (("click_emoji_source", str), ("click_emoji_custom_dir", str),
-            ("click_voice_enabled", bool), ("click_voice_dir", str))
+            ("click_sfx_enabled", bool), ("click_sfx_dir", str))
     for k, t in want:
         if k not in d.DEFAULTS:
             return False, f"DEFAULTS 缺 {k}"
         if not isinstance(d.DEFAULTS[k], t):
             return False, f"{k} 的默认值类型是 {type(d.DEFAULTS[k])}，期望 {t}"
     bad = []
-    for k, v in (("click_voice_dir", 123), ("click_voice_dir", ["C:/x"]),
+    for k, v in (("click_sfx_dir", 123), ("click_sfx_dir", ["C:/x"]),
                  ("click_emoji_custom_dir", 3.5),
                  ("click_emoji_source", True)):
         ok, _ = d._coerce_cfg_value(k, v)
@@ -1212,8 +1214,8 @@ def test_click_asset_defaults():
             bad.append((k, v))
     if bad:
         return False, f"坏值被收下了：{bad}"
-    for k, v, exp in (("click_voice_enabled", "是", True),
-                      ("click_voice_enabled", "关", False)):
+    for k, v, exp in (("click_sfx_enabled", "是", True),
+                      ("click_sfx_enabled", "关", False)):
         ok, got = d._coerce_cfg_value(k, v)
         if not ok or got is not exp:
             return False, f"{k}={v!r} 应转成 {exp}，实得 {got!r}"
@@ -1232,12 +1234,20 @@ def test_scene_voice_wiring():
     calls = []
 
     class _Spy:
+        def play_path(self, p):
+            calls.append(p)
+            return True
+
         def play_random(self, f):
             calls.append(f)
             return True
 
     sc = Scene(W, H)
     sc.voice = _Spy()
+    # 必须**两个**都换：click_sfx 在 __init__ 里就拿到了当时的播放器，
+    # 换 scene.voice 换不掉它 —— 忘了这行，测试会"什么都没发生"，
+    # 而产品代码本身是好的（这类替身失配最难查）。
+    sc.click_sfx.player = sc.voice
     box = {"fired": True}
 
     def fake_update(dt, ox, oy, keys=False):
@@ -1248,13 +1258,13 @@ def test_scene_voice_wiring():
     sc.mouse.update = fake_update
     buf = np.zeros(W * H, np.uint32)
     # 语音开着、两个点击特效都关着
-    sc.cfg = _base_cfg(click_voice_enabled=True, click_voice_dir=folder)
+    sc.cfg = _base_cfg(**_sfx_pack(folder), click_sfx_enabled=True)
     for k in range(6):
         box["fired"] = k >= 1
         sc.step(1.0 / 60.0, buf, W, H, buf)
     on_count = len(calls)
     off_calls = len(calls)
-    sc.cfg = _base_cfg(click_voice_enabled=False, click_voice_dir=folder)
+    sc.cfg = _base_cfg(**_sfx_pack(folder), click_sfx_enabled=False)
     for k in range(6):
         box["fired"] = k >= 1
         sc.step(1.0 / 60.0, buf, W, H, buf)
@@ -1263,12 +1273,22 @@ def test_scene_voice_wiring():
         return False, f"开着时触发了 {on_count} 次（期望 1：只在点击那一帧）"
     if len(calls) != off_calls:
         return False, "关掉之后仍在触发"
-    if calls and calls[0] != folder:
-        return False, f"传下去的文件夹不对：{calls[0]!r}"
-    return True, "只在点击那一帧触发一次、传对文件夹，与点击特效开关无关"
+    if calls and not str(calls[0]).startswith(folder):
+        return False, f"播的不是那个文件夹里的音频：{calls[0]!r}"
+    return True, ("只在点击那一帧触发一次、播的来自那个文件夹，"
+                  "与两个点击特效的开关无关")
 
 
 # ------------------------------------------------- 8. 点击文字的语音包
+def _sfx_pack(folder):
+    """把一个目录表达成「点击音效」的"音效文件夹"来源（统一模式认这个）。
+
+    语音目录已经并入音效来源 —— 「语音与文字统一」要在**多条**音频里各取一行
+    字，所以它只在「音效文件夹」那一档下成立。
+    """
+    return {"click_sfx_source": F.SFX_SOURCE_FOLDER, "click_sfx_dir": folder}
+
+
 def _mk_pack(folder=None, names=("01-你好.wav", "02_再见.mp3", "3. 走起.wma")):
     """造一个语音包文件夹（真音频文件，名字带序号）。"""
     folder = folder or tempfile.mkdtemp(prefix="fx_textpack_")
@@ -1325,7 +1345,7 @@ def test_text_voice_match_pairs_text_and_audio():
     后者随机挑也能通过，测不出"两边各自随机"这个真正的失败模式。
     """
     folder = _mk_pack()
-    cfg = _tcfg(click_text_voice_dir=folder, click_text_voice_match=True,
+    cfg = _tcfg(**_sfx_pack(folder), click_text_voice_match=True,
                 click_text_list="自定义甲\n自定义乙", click_text_deco="无")
     t = ClickTextField(W, H)
     pairs, used = [], []
@@ -1357,7 +1377,7 @@ def test_text_voice_match_falls_back():
     cases = [("", "没选语音包"), (empty, "空目录"),
              (os.path.join(empty, "不存在"), "目录不存在")]
     for folder, name in cases:
-        cfg = _tcfg(click_text_voice_dir=folder, click_text_voice_match=True,
+        cfg = _tcfg(**_sfx_pack(folder), click_text_voice_match=True,
                     click_text_list="甲\n乙", click_text_deco="无")
         t = ClickTextField(W, H)
         t.set_pointer(W * 0.5, H * 0.5, 1)
@@ -1379,7 +1399,7 @@ def test_text_voice_match_falls_back():
 def test_text_voice_off_is_independent():
     """关闭统一：文字可自定义（轮换），这一次点击不指定音频。"""
     folder = _mk_pack()
-    cfg = _tcfg(click_text_voice_dir=folder, click_text_voice_match=False,
+    cfg = _tcfg(**_sfx_pack(folder), click_text_voice_match=False,
                 click_text_list="甲\n乙\n丙", click_text_deco="无")
     t = ClickTextField(W, H)
     seq = []
@@ -1855,14 +1875,20 @@ def test_img_align_wiring():
               spr_ids=np.zeros(20, np.int32), align=True)
     if eng.count != 20:
         return False, f"粒子数 {eng.count}"
-    want = np.floor((np.arctan2(eng.vy[:20], eng.vx[:20])
-                     + np.pi * 0.5) / (2.0 * np.pi) * 12 + 0.5) % 12
+    # `rot` 存的是**弧度**（角度 + 90°），两条上屏路径各自换算成档位 ——
+    # 所以这里比的是弧度本身，不是档下标。
+    want = (np.arctan2(eng.vy[:20], eng.vx[:20]) + np.pi * 0.5) % (2.0 * np.pi)
     got = eng.rot[:20]
     diff = int((np.abs(got - want) > 1e-4).sum())
     if diff:
-        return False, f"{diff}/20 个粒子的旋转档与飞行方向不符"
-    if not bool(((got >= 0) & (got < 12)).all()):
-        return False, f"档位越界：{got.min()}~{got.max()}"
+        return False, f"{diff}/20 个粒子的旋转角与飞行方向不符"
+    steps = [F._rot_step(x) for x in got]
+    if len(set(steps)) < 8:
+        return False, f"20 个粒子只落在 {len(set(steps))} 个方向档（对不上）"
+    for i in range(20):
+        exp = F._rot_step(want[i])
+        if F._rot_step(got[i]) != exp:
+            return False, f"第 {i} 颗粒子换算出的档位 {F._rot_step(got[i])} != {exp}"
     if bool((eng.spin[:20] != 0).any()):
         return False, "align 模式下 spin 必须为 0（否则档位会被逐帧搅乱）"
     # 默认（align=False）时 rot 仍是随机角：判据是"不是整数档"而不是"超过 12"
@@ -1872,9 +1898,13 @@ def test_img_align_wiring():
                spread=200.0, gravity=0.0, rotate=False, life=1.0,
                spr_ids=np.zeros(20, np.int32))
     r2 = eng2.rot[:20]
-    if bool(np.allclose(r2, np.round(r2), atol=1e-4)):
-        return False, f"不勾选时 rot 也被写成了整数档：{r2[:5]}"
-    return True, "20 个粒子的旋转档 = (飞行角 + 90°) 的 12 档量化，spin 归零"
+    if not bool(((r2 >= 0) & (r2 < 2.0 * math.pi)).all()):
+        return False, f"不勾选时 rot 不是随机角：{r2.min()}~{r2.max()}"
+    # 随机角与"角度 + 90°"那族角几乎不可能逐个吻合（20 个全中 = 方差为 0）
+    if bool(np.allclose(r2, want, atol=1e-3)):
+        return False, "不勾选时 rot 也被写成了方向角（应当仍是随机角）"
+    return True, ("20 个粒子的 rot = (飞行角 + 90°) 的弧度，换算成 12 档后与"
+                  "方向一一对应；不勾选时仍是随机角")
 
 
 def test_img_align_builtin_unaffected():
@@ -2153,18 +2183,18 @@ def test_click_sfx_defaults():
 
 
 def test_text_pack_defaults():
-    """两个新配置键：类型正确、坏值被钳制、默认关闭。"""
-    for k, t in (("click_text_voice_dir", str),
-                 ("click_text_voice_match", bool)):
-        if k not in d.DEFAULTS:            return False, f"DEFAULTS 缺 {k}"
+    """语音目录已并入 `click_sfx_dir`；这里守住类型、钳制与默认值。"""
+    for k, t in (("click_sfx_dir", str), ("click_text_voice_match", bool)):
+        if k not in d.DEFAULTS:
+            return False, f"DEFAULTS 缺 {k}"
         if not isinstance(d.DEFAULTS[k], t):
             return False, f"{k} 默认值类型是 {type(d.DEFAULTS[k])}，期望 {t}"
     if d.DEFAULTS["click_text_voice_match"] is not False:
         return False, "「语音与文字统一」默认应当是关闭的"
-    if d.DEFAULTS["click_text_voice_dir"] != "":
-        return False, "语音包目录默认应当是空"
+    if d.DEFAULTS["click_sfx_dir"] != "":
+        return False, "音效目录默认应当是空"
     bad = []
-    for k, v in (("click_text_voice_dir", 7), ("click_text_voice_dir", ["a"]),
+    for k, v in (("click_sfx_dir", 7), ("click_sfx_dir", ["a"]),
                  ("click_text_voice_match", "也许")):
         ok, _ = d._coerce_cfg_value(k, v)
         if ok:
@@ -2218,9 +2248,10 @@ def test_scene_plays_the_matched_audio():
     # 1) 统一模式：必须走 play_path，且参数就是那行字对应的那条音频
     sc = Scene(W, H)
     sc.voice = _Spy()
+    sc.click_sfx.player = sc.voice
     sc.cfg = _base_cfg(click_text_enabled=True, click_text_voice_match=True,
-                       click_text_voice_dir=folder, click_text_deco="无",
-                       click_text_list="自定义甲")
+                       click_text_deco="无", click_text_list="自定义甲",
+                       **_sfx_pack(folder))
     _drive(sc)
     if len(calls) != 1 or calls[0][0] != "path":
         shutil.rmtree(folder, ignore_errors=True)
@@ -2232,25 +2263,27 @@ def test_scene_plays_the_matched_audio():
         return False, (f"场景播的 {F.audio_label(path)!r} 与弹出的 "
                        f"{pop and pop['text']!r} 不一致")
 
-    # 2) 关闭统一、开着「点击表情」页的随机语音 -> 退回随机源
+    # 2) 关闭统一、开着「点击音效」-> 走那一档的随机播放
     calls.clear()
     sc2 = Scene(W, H)
     sc2.voice = _Spy()
+    sc2.click_sfx.player = sc2.voice
     sc2.cfg = _base_cfg(click_text_enabled=True, click_text_voice_match=False,
-                        click_text_voice_dir=folder, click_text_list="自定义甲",
-                        click_text_deco="无", click_voice_enabled=True,
-                        click_voice_dir=folder)
+                        click_text_list="自定义甲", click_text_deco="无",
+                        click_sfx_enabled=True, **_sfx_pack(folder))
     _drive(sc2)
-    if calls != [("random", folder)]:
+    if len(calls) != 1 or calls[0][0] != "path" \
+            or not calls[0][1].startswith(folder):
         shutil.rmtree(folder, ignore_errors=True)
-        return False, f"未指定音频时没退回随机语音源：{calls}"
+        return False, f"未指定音频时没走「点击音效」那一档：{calls}"
 
     # 3) 文字特效关着时队列必须是空的（否则下次开起来会播旧音频）
     calls.clear()
     sc3 = Scene(W, H)
     sc3.voice = _Spy()
+    sc3.click_sfx.player = sc3.voice
     sc3.cfg = _base_cfg(click_text_enabled=False, click_text_voice_match=True,
-                        click_text_voice_dir=folder, click_voice_enabled=False)
+                        click_sfx_enabled=False, **_sfx_pack(folder))
     _drive(sc3)
     shutil.rmtree(folder, ignore_errors=True)
     if calls:
@@ -2260,6 +2293,173 @@ def test_scene_plays_the_matched_audio():
 
 
 # ------------------------------------------------------------------ 驱动
+def test_presets_never_carry_assets():
+    """预设**不携带**素材/来源：套用预设不能把图案来源改回内置图案。
+
+    根因是 `save_preset` 快照的是**全部** DEFAULTS 键 —— 不排除就会把保存
+    那一刻的 `click_emoji_source` / 图片文件夹 / 音效文件夹一起冻进预设。
+    用户报的现象就是"点了预设，来源悄悄跳回内置图案"。所以两端都要挡：
+    保存时不取，套用时也跳过（老 presets_user.json 里已经存着了）。
+    """
+    for k in d.PRESET_EXCLUDE:
+        for name, pre in d.PRESETS.items():
+            if k in pre:
+                return False, f"内置预设「{name}」不该带 {k}"
+    # 反过来：内置音效是随程序打包的文件，预设**可以**带（否则「青轴打字音」
+    # 就没有身份了），而且必须真的指向一个存在的文件
+    for name, pre in d.PRESETS.items():
+        b = pre.get("click_sfx_builtin", "")
+        if b and not any(os.path.basename(x) == b for x in F.list_builtin_sfx()):
+            return False, f"预设「{name}」指向的内置音效 {b} 不存在"
+    app = d.App.__new__(d.App)
+    app.cfg = dict(d.DEFAULTS)
+    app.snapshot = dict(app.cfg)
+    app.user_presets = {}
+    app._autosave_dirty = False
+    # 老预设里存着来源与路径（模拟历史文件）
+    app.user_presets["老预设"] = dict(
+        d.PRESETS["爱心雨"], click_emoji_source="图片文件夹",
+        click_emoji_custom_dir=r"C://表情//猫猫",
+        click_sfx_source="音效文件夹", click_sfx_dir=r"C://音效",
+        click_text_voice_match=True)
+    app.cfg["click_emoji_source"] = "自选图片"
+    app.cfg["click_emoji_files"] = r"C://图//a.png"
+    app.cfg["click_sfx_dir"] = r"C://我的音效"
+    app.apply_preset("老预设")
+    if app.cfg["click_emoji_source"] != "自选图片":
+        return False, f"套用预设把图案来源改成了 {app.cfg['click_emoji_source']}"
+    if app.cfg["click_emoji_files"] != r"C://图//a.png":
+        return False, "套用预设把自选图片换掉了"
+    if app.cfg["click_sfx_dir"] != r"C://我的音效":
+        return False, "套用预设把音效文件夹换掉了"
+    if app.cfg["click_text_voice_match"]:
+        return False, "套用预设把「语音与文字统一」打开了"
+    if app.cfg["click_emoji_shape"] != "爱心":
+        return False, "预设该生效的键（图案形状）反而没生效"
+    # 保存预设时也不该把这些键存进去
+    app.cfg["click_emoji_source"] = "图片文件夹"
+    ok, info = app.save_preset("我的", "点击表情")
+    saved = app.user_presets.get("我的", {})
+    if not ok:
+        return False, f"保存预设失败：{info}"
+    for k in d.PRESET_EXCLUDE:
+        if k in saved:
+            return False, f"保存的自定义预设里混进了 {k}"
+    if saved.get("click_emoji_shape") != app.cfg["click_emoji_shape"]:
+        return False, "保存预设时把该存的键弄丢了"
+    return True, ("预设两端都不带素材/来源：套用旧预设不会换掉当前来源与路径，"
+                  "保存的新预设里也没有这些键")
+
+
+def test_align_also_applies_to_builtin_shapes():
+    """「图片方向」是**通用**选项：内置图案也要跟着方向转。
+
+    判据不看像素，看 `rot`：勾了之后每一颗粒子的旋转角都必须等于
+    `atan2(vy, vx) + 90°`（而不是随机角），且 `spin` 被关掉 —— 勾着自旋
+    的话 rot 会被逐帧累加，方向瞬间就散了，这个选项等于不起作用。
+    """
+    from _verify_kinds import _base_cfg
+    cfg = _base_cfg(click_emoji_enabled=True,
+                    click_emoji_source=F.CLICK_SOURCE_BUILTIN,
+                    click_emoji_align=F.CLICK_ALIGN_SPREAD,
+                    click_emoji_count=16.0, click_emoji_spread=300.0,
+                    click_emoji_gravity=0.0, click_emoji_rotate=True)
+    f = ClickEmojiField(W, H)
+    f.set_pointer(W * 0.5, H * 0.5, 1)
+    f.update(1.0 / 60.0, cfg)
+    n = f.engine.count
+    if n <= 0:
+        return False, "内置图案没有生成粒子"
+    rot = f.engine.rot[:n]
+    want = (np.arctan2(f.engine.vy[:n], f.engine.vx[:n])
+            + math.pi * 0.5) % (2.0 * math.pi)
+    if int((np.abs(rot - want) > 1e-4).sum()):
+        return False, "内置图案的旋转角没有跟着飞行方向"
+    if bool((f.engine.spin[:n] != 0).any()):
+        return False, "勾了随扩散方向却还留着自旋（方向会被搅散）"
+    # 默认（竖直）时恢复随机角
+    cfg2 = dict(cfg, click_emoji_align=F.CLICK_ALIGN_VERTICAL)
+    f2 = ClickEmojiField(W, H)
+    f2.set_pointer(W * 0.5, H * 0.5, 1)
+    f2.update(1.0 / 60.0, cfg2)
+    r2 = f2.engine.rot[:f2.engine.count]
+    if bool(np.allclose(r2, want, atol=1e-3)):
+        return False, "竖直档下 rot 也被写成了方向角"
+    return True, "内置图案在「随扩散方向」下角度＝飞行角+90° 且自旋关闭；竖直档仍是随机角"
+
+
+def test_voice_match_only_with_folder_source():
+    """「语音与文字统一」只在「音效文件夹」那一档下成立。
+
+    统一模式要把**多条**音频各自变成一行弹出文字 —— 内置音效与单个音效都
+    给不出多行，硬撑着"开着"只会让文字框没被接管、用户以为自己哪里配错了。
+    """
+    folder = _mk_pack()
+    for src in (F.SFX_SOURCE_BUILTIN, F.SFX_SOURCE_FILE):
+        cfg = {"click_text_voice_match": True, "click_sfx_source": src,
+               "click_sfx_file": os.path.join(folder, "a.wav"),
+               "click_sfx_dir": folder, "click_text_list": "甲\n乙",
+               "click_text_deco": "无"}
+        if F.voice_pack_dir(cfg):
+            return False, f"来源={src} 时不该给出统一模式的目录"
+        if F.voice_match_on(cfg):
+            return False, f"来源={src} 时统一模式被判成生效"
+        t = ClickTextField(W, H)
+        t.set_pointer(W * 0.5, H * 0.5, 1)
+        t.update(1.0 / 60.0, cfg)
+        t.pops = [p for p in t.pops if p["t"] < 0.05]
+        if not t.pops or t.pops[-1]["text"] not in ("甲", "乙"):
+            shutil.rmtree(folder, ignore_errors=True)
+            return False, f"来源={src} 时统一模式没有退回自定义文字"
+        if t.take_voice() is not None:
+            shutil.rmtree(folder, ignore_errors=True)
+            return False, f"来源={src} 时仍排了待播音频"
+    cfg = dict(click_text_voice_match=True, **_sfx_pack(folder),
+               click_text_list="甲\n乙", click_text_deco="无")
+    if not F.voice_match_on(cfg):
+        shutil.rmtree(folder, ignore_errors=True)
+        return False, "音效文件夹 + 统一开着时反而判定为不生效"
+    if F.voice_pack_dir(cfg) != folder:
+        shutil.rmtree(folder, ignore_errors=True)
+        return False, f"统一模式取到的目录不对：{F.voice_pack_dir(cfg)!r}"
+    # 开着但还没选目录 -> 不生效（退回自定义文字）
+    if F.voice_match_on({"click_text_voice_match": True,
+                         **_sfx_pack("")}):
+        shutil.rmtree(folder, ignore_errors=True)
+        return False, "目录为空时不该判定统一生效"
+    shutil.rmtree(folder, ignore_errors=True)
+    return True, ("只有「音效文件夹」才让统一生效；内置/单文件两档退回自定义"
+                  "文字且不排音频；目录为空也不生效")
+
+
+def test_voice_config_migration():
+    """旧配置里的语音目录会自动搬进「点击音效」的音效文件夹。"""
+    folder = _mk_pack()
+    for old_key in ("click_text_voice_dir", "click_voice_dir"):
+        data = {old_key: folder, "click_sfx_dir": ""}
+        d.App._migrate_voice_keys(data)
+        if data.get("click_sfx_dir") != folder:
+            shutil.rmtree(folder, ignore_errors=True)
+            return False, f"{old_key} 没被搬进 click_sfx_dir"
+        if data.get("click_sfx_source") != F.SFX_SOURCE_FOLDER:
+            shutil.rmtree(folder, ignore_errors=True)
+            return False, f"{old_key} 迁移后来源没切到音效文件夹"
+    # 目标已有值时不动（用户的当前选择优先）
+    data = {"click_text_voice_dir": folder, "click_sfx_dir": r"C://我的音效"}
+    d.App._migrate_voice_keys(data)
+    if data["click_sfx_dir"] != r"C://我的音效":
+        shutil.rmtree(folder, ignore_errors=True)
+        return False, "已有音效目录时不该被旧键覆盖"
+    # 目录已经不存在 -> 不搬（搬过去只是个坏路径）
+    data = {"click_text_voice_dir": r"C://早没了//目录", "click_sfx_dir": ""}
+    d.App._migrate_voice_keys(data)
+    if data["click_sfx_dir"]:
+        shutil.rmtree(folder, ignore_errors=True)
+        return False, "目录不存在时不该搬"
+    shutil.rmtree(folder, ignore_errors=True)
+    return True, "两个旧语音键都会搬进音效文件夹；已有值/目录不存在时不搬"
+
+
 def main():
     tests = [
         test_all_shapes_draw,
@@ -2324,6 +2524,10 @@ def main():
         test_img_align_builtin_unaffected,
         test_ui_align_list_matches_impl,
         test_builtin_sfx_available,
+        test_presets_never_carry_assets,
+        test_align_also_applies_to_builtin_shapes,
+        test_voice_match_only_with_folder_source,
+        test_voice_config_migration,
         test_sfx_source_normalize_and_target,
         test_click_sfx_triggers_and_dedups,
         test_scene_sfx_mouse_and_keyboard,
