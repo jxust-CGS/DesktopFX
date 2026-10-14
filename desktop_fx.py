@@ -155,6 +155,11 @@ DEFAULTS = {
     "pet_opacity": 1.0,
     # 光标停住多少秒后渐隐（0 = 一直跟着不消失）
     "pet_idle_fade": 1.6,
+    # 光标要真的移动多少像素（**净位移**）宠物才现身；0 = 一有移动就现身。
+    # 门槛量净位移而不是累计路程：原地来回抖动能刷出很长的累计路程，但那
+    # 显然是"没在走"。鼠标轻轻一碰就蹦出一队站在原地不动的小猫小狗，比
+    # 干脆不显示更突兀。
+    "pet_min_travel": 90.0,
     # ---- 点击表情（点一下在光标处炸开一簇图案）----
     # 图案由 fx_effects 用 PIL 现画（与宠物同一套做法），所以换图案/颜色只需
     # 重建精灵缓存，不依赖任何图片资源或系统字体。
@@ -429,22 +434,22 @@ PRESETS = {
               petal_enabled=False, meteor_enabled=False,
               pet_enabled=True, pet_kind="小猫", pet_count=2,
               pet_size=56, pet_follow=0.55, pet_color="#F2C27B",
-              pet_opacity=1.0, pet_idle_fade=1.6),
+              pet_opacity=1.0, pet_idle_fade=1.6, pet_min_travel=90),
     "小狗": dict(rain_enabled=False, snow_enabled=False,
               petal_enabled=False, meteor_enabled=False,
               pet_enabled=True, pet_kind="小狗", pet_count=2,
               pet_size=58, pet_follow=0.55, pet_color="#B9CBE8",
-              pet_opacity=1.0, pet_idle_fade=1.6),
+              pet_opacity=1.0, pet_idle_fade=1.6, pet_min_travel=90),
     "一队小猫": dict(rain_enabled=False, snow_enabled=False,
                 petal_enabled=False, meteor_enabled=False,
                 pet_enabled=True, pet_kind="小猫", pet_count=6,
                 pet_size=44, pet_follow=0.66, pet_color="#F2C27B",
-                pet_opacity=1.0, pet_idle_fade=1.6),
+                pet_opacity=1.0, pet_idle_fade=1.6, pet_min_travel=90),
     "一群小动物": dict(rain_enabled=False, snow_enabled=False,
                  petal_enabled=False, meteor_enabled=False,
                  pet_enabled=True, pet_kind="小猫", pet_count=10,
                  pet_size=36, pet_follow=0.72, pet_color="#9FD8C0",
-                 pet_opacity=1.0, pet_idle_fade=2.2),
+                 pet_opacity=1.0, pet_idle_fade=2.2, pet_min_travel=90),
     # ---- 点击表情 ----
     # 像「水面」一样把全屏特效显式关掉：预设是"整套方案"，只写自己那几个键
     # 会让用户上一次开着的雨继续下，看起来像没生效。

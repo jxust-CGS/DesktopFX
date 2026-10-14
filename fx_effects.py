@@ -3093,11 +3093,19 @@ class PetField:
     * **朝向迟滞**：按水平速度左右翻转，带速度阈值 + 需连续保持一小段时间。
       没有迟滞的话，鼠标原地画小圈会让宠物每帧左右横跳。
 
-    * **静止渐隐**：光标停住一小会儿就淡出，一动立刻淡入并在光标身后重新落位。
-      渐隐而不是"啪"地消失，是因为后者在余光里像闪断。
+    * **静止渐隐 + 现身门槛**：光标停住一小会儿就淡出；而重新出现要等光标
+      **真的走了一段**（`pet_min_travel`，量的是净位移）。两处都是为了同一件事：
+      宠物不该"摆好姿势等人来" —— 鼠标轻轻一碰就蹦出一队站在原地不动的小猫
+      小狗，比不显示更突兀。
 
-    * **点击表情**：点击时领头那只头顶弹出一个可爱图标，带回弹缩放 + 上飘 + 淡出。
-      图标同样是代码画的（爱心 / 星星 / 音符 / 闪光）。
+    * **沿轨迹现身**：满足门槛时沿**刚走过的那段路径**把队伍铺开，而不是在光标
+      身后排成一条直线。它们一出现就已经在轨迹上、立刻顺着轨迹追上来，观感是
+      "一直跟在后面、刚显形"，而不是凭空列队站好。路径按**弧长**采样（每 12px
+      一个点）：快速划动时一帧能跨几十像素，按帧记会漏掉中间的转折，队伍就会
+      切直线穿过拐角。
+
+    * **点击不唤醒**：按钮/右键点一下只是刷新"静止计时"，不会让宠物现身 ——
+      光标没动，现身了也只能杵在原地，正是上面要避免的那种状态。
 
     与其它特效共用 resize/update/draw 的接口约定，另加 `set_pointer()` ——
     目标点与点击事件来自外部鼠标，由 Scene 每帧喂进来。
@@ -3125,6 +3133,12 @@ class PetField:
     _BLINK_TIME = 0.11          # 单次眨眼时长
     _BLINK_GAP = (2.2, 6.0)     # 两次眨眼的间隔范围（随机）
 
+    # 光标路径采样（供"沿轨迹现身"用）：按**弧长**每 `_TRAIL_STEP` 像素记一个点。
+    # 按帧记会漏掉快速划动时一帧跨过的几十像素，队伍就会切直线穿过拐角。
+    _TRAIL_STEP = 12.0
+    _TRAIL_MAX = 60             # 最多保留 60 点（约 720 像素的路径）
+    _SEAT_GAP = 1.15            # 现身时把间距拉开一点，留出追赶的余地
+
     def __init__(self, w, h, seed=53):
         self.rng = np.random.default_rng(seed)
         self.w, self.h = w, h
@@ -3144,7 +3158,18 @@ class PetField:
         self._blink_next = self.rng.uniform(self._BLINK_GAP[0],
                                             self._BLINK_GAP[1], self.MAX_PETS)
         self._n = 0                 # 当前宠物数
-        self._placed = False
+        self._placed = False        # 已铺开；未满足现身门槛时恒为 False
+        # 现身门槛：量的是**净位移**（从锚点起算），不是累计弧长 —— 鼠标原地
+        # 来回抖动能刷出可观的累计弧长，但那显然是"没在走"，不该让宠物蹦出来。
+        self._anchor_x = self._mx
+        self._anchor_y = self._my
+        self._travel = 0.0
+        self._trail = []            # 光标最近走出的路径（按弧长采样）
+        # 队伍的"身后方向"（单位向量）。**必须是连续的状态量**：停下来时
+        # "身后"左右各有一个等距解，只按当场几何判断会让某只挑错一侧，停成
+        # 与前一只重叠（实测体型 80 时第 2 只正好叠在第 0 只上）。
+        self._dir_x = -1.0
+        self._dir_y = 0.0
         self._phase = 0.0           # 步行相位（驱动帧序号与上下浮动）
         self._speed = 0.0
         # 静止渐隐
@@ -3169,25 +3194,78 @@ class PetField:
         由 `update()` 统一处理 —— 一帧里指针可能被喂多次（Scene 里聚光灯 /
         颜料盘 / 宠物各要一次），不能在喂的时候直接改状态。
 
-        点击的作用是**把渐隐中的宠物叫回来**（见 `update()` 的静止渐隐）：
-        鼠标停在原地不动时点一下也算一次交互。
+        点击**不能**让宠物现身（现身只看移动）：光标没动，露面了也只能杵在
+        原地，那恰恰是本类要避免的观感。点击只用来刷新"静止计时"，让已经跟
+        上来的一队别因为点了一下就提前散场。
         """
         x = float(x)
         y = float(y)
         # 位移阈值 1px：DPI 缩放下光标可能报出亚像素抖动，不该被当成"在动"
-        if abs(x - self._mx) + abs(y - self._my) > 1.0:
+        if math.hypot(x - self._mx, y - self._my) > 1.0:
             self._moved = True
+            self._push_trail(x, y)
         self._mx, self._my = x, y
+        # 净位移（相对本轮锚点）：每次喂指针刷新，门槛在 update 里判
+        self._travel = math.hypot(x - self._anchor_x, y - self._anchor_y)
         if clicked:
             self._clicked = int(clicked)
+
+    def _push_trail(self, x, y):
+        """把光标路径按**弧长**记下来（每 `_TRAIL_STEP` 像素一个点）。
+
+        首次采样要把起步点一起补上，否则轨迹从第二个采样点才开始，起步那
+        一小段就丢了 —— 沿轨迹铺开时最靠后的几只会被外推到错的位置。
+        """
+        t = self._trail
+        if not t:
+            t.append((self._mx, self._my))
+        lx, ly = t[-1]
+        if math.hypot(x - lx, y - ly) >= self._TRAIL_STEP:
+            t.append((x, y))
+            if len(t) > self._TRAIL_MAX:
+                del t[0]
+
+    def _back_point(self, dist):
+        """从光标沿**刚走过的路径**往回 `dist` 像素处的坐标。
+
+        路径总长不够时沿末端切线继续往外推：10 只 × 间距 46 需要四百多像素
+        的路径，而刚够现身门槛时只有一小段，直接放弃会让后面几只叠在一起。
+        连方向都没有（路径不足两点）才退化成水平向左。
+        """
+        cx, cy = self._mx, self._my
+        acc = 0.0
+        qx, qy = cx, cy
+        for tx, ty in reversed(self._trail):
+            seg = math.hypot(tx - qx, ty - qy)
+            if seg > 1e-6 and acc + seg >= dist:
+                t = (dist - acc) / seg
+                return qx + (tx - qx) * t, qy + (ty - qy) * t
+            acc += seg
+            qx, qy = tx, ty
+        extra = dist - acc
+        if len(self._trail) >= 2:
+            (ax, ay), (bx, by) = self._trail[0], self._trail[1]
+            ux, uy = bx - ax, by - ay
+            m = math.hypot(ux, uy)
+            if m > 1e-6:
+                return qx - ux / m * extra, qy - uy / m * extra
+        return qx - extra, qy
 
     def resize(self, w, h):
         self.w, self.h = w, h
 
     def reset(self):
-        """关掉特效时清场：下次打开重新从光标处出现，而不是从上次的位置跑来。"""
+        """关掉特效时清场：下次打开重新从光标处出现，而不是从上次的位置跑来。
+
+        门槛的锚点也跟着挪到当前光标：关着的时候光标可能已经跑了大半屏，
+        不清的话一打开就立刻满足门槛、宠物凭空冒出来。
+        """
         self._placed = False
         self._n = 0
+        self._anchor_x, self._anchor_y = self._mx, self._my
+        self._travel = 0.0
+        self._trail.clear()
+        self._dir_x, self._dir_y = -1.0, 0.0
         self.vx[:] = 0.0
         self.vy[:] = 0.0
         self._hold[:] = 0.0
@@ -3222,6 +3300,8 @@ class PetField:
         spacing = size * 0.82       # 队列间距跟着体型走
         # 0 = 不消失（一直跟着）
         idle_fade = max(0.0, float(cfg.get("pet_idle_fade", 1.6)))
+        # 现身门槛（像素净位移，0 = 一有移动就现身）
+        min_travel = max(0.0, float(cfg.get("pet_min_travel", 90.0)))
 
         try:
             self._ensure_sprite(cfg)
@@ -3237,28 +3317,47 @@ class PetField:
         clicked = self._clicked
         self._clicked = 0
 
-        # ---------------- 静止计时与唤醒
-        # 点击也算"有交互"：光标不动时点一下，宠物该回来给个表情，
-        # 而不是继续隐身。
+        # ---------------- 现身门槛
+        # 达到门槛就重置锚点（下一轮重新累计）再放行。门槛量的是**净位移**：
+        # 原地来回抖动刷出的累计弧长很可观，但那显然是"没在走"，不该让一队
+        # 宠物蹦出来。
+        # `> 0` 这一半不能省：门槛为 0（"一有移动就现身"）时，光判"数值达标"
+        # 会让光标**根本没动**也算过 —— 渐隐完成后同一帧就重新达标、宠物接着
+        # 又现身，于是动画在"淡出→淡入"之间无限循环地闪。
+        if self._travel > 0.0 and self._travel >= min_travel:
+            self._anchor_x, self._anchor_y = self._mx, self._my
+            self._travel = 0.0
+            armed = True
+        else:
+            armed = False
+
+        # ---------------- 静止计时
+        # 点击只刷新计时：光标没动时点一下不该让宠物现身（现身了也只能杵在
+        # 原地），但已经跟上来的一队也不该因为点了一下就提前散场。
         if moved or clicked:
             self._idle = 0.0
-            if self._hidden:
-                # 重新出现时**直接落在光标身后**，而不是从隐身前的老位置
-                # 冲过来 —— 那会像被甩出去一样。
-                self._hidden = False
-                self._seat(n, spacing)
-                self._n = n
-                self._placed = True
-                self._fade = 0.0
         else:
             self._idle += dt
 
-        # 首次出现 / 改数量：把队伍直接铺在光标身后。否则它们会从 (0,0)
-        # 排队跑过来，像被甩出去一样。
-        if not self._placed or n != self._n:
-            self._seat(n, spacing)
+        if not self._placed:
+            # 还没露面：得先真的走起来。铺开时沿**刚走过的那段路径**，它们
+            # 一出现就已经在轨迹上、立刻顺着轨迹追上来，观感是"一直跟在后面、
+            # 刚显形"，而不是在光标旁边列队站好。
+            if not armed:
+                # 没露面就别留着上次的速度，否则一现身就带着旧惯性窜出去
+                self._speed = 0.0
+                return
+            self._hidden = False
+            self._seat_on_trail(n, spacing * self._SEAT_GAP)
             self._n = n
             self._placed = True
+            self._fade = 0.0
+            self._idle = 0.0
+        elif n != self._n:
+            # 改数量：按原间距重铺。鼠标正在快速划动时这里有一次瞬移，但换来
+            # 的是不用为"新来的从队尾走进来"再养一套状态。
+            self._seat_on_trail(n, spacing)
+            self._n = n
 
         # ---------------- 渐隐 / 淡入
         want = 0.0 if (idle_fade > 0.0 and self._idle >= idle_fade) else 1.0
@@ -3267,14 +3366,26 @@ class PetField:
         elif self._fade > want:
             self._fade = max(want, self._fade - dt / self._FADE_OUT)
         if want == 0.0 and self._fade <= 0.01:
-            # 完全隐去后冻结物理：看不见的东西不必算，等唤醒时重新落位
+            # 完全隐去：退回"没露面"并重置锚点 —— 下次得再真的走一段才重新
+            # 现身。这正是"不要显示一队不动的宠物在原地等"的另一半。
             self._hidden = True
+            self._placed = False
+            self._n = 0
+            self._anchor_x, self._anchor_y = self._mx, self._my
+            self._travel = 0.0
             self._speed = 0.0
             return
 
-        # 隐去期间不推进物理（唤醒时会 _seat 重排）
+        # 隐去期间不推进物理（重新现身时会沿轨迹重铺）
         if self._hidden:
             return
+
+        # 队伍方向：由领头那只更新；它慢下来就**保留最后一次方向**（见 `_dir`
+        # 的说明 —— 停下来之后方向不能重新变回"当场几何"那种有歧义的判法）。
+        v0 = math.hypot(float(self.vx[0]), float(self.vy[0]))
+        if v0 > self._WALK_SPEED:
+            self._dir_x = -float(self.vx[0]) / v0
+            self._dir_y = -float(self.vy[0]) / v0
 
         # 刚度：follow=0 时松垮（慢悠悠），follow=1 时紧咬不放。
         # 阻尼取临界值 c = 2√k 并略微过阻尼（×1.03）—— 欠阻尼的宠物会在
@@ -3286,18 +3397,29 @@ class PetField:
             if i == 0:
                 gx, gy = self._mx, self._my
             else:
-                # 目标 = 前一只身后 spacing 处（沿两者连线后退）。
-                # 用"身后一点"而不是"直接追前一只的位置"：后者会让整队挤成
-                # 一坨，因为每只都想贴到同一个点上。
+                # 目标 = 前一只**身后** spacing 处。用"身后一点"而不是"直接追
+                # 前一只的位置"：后者会让整队挤成一坨，因为每只都想贴到同一个点。
+                #
+                # 身后方向优先取**前一只的运动方向**，只在它几乎不动时才退回
+                # "两者连线"。连线方向在这里有个正反馈陷阱：光标掉头时某只可能
+                # 正处于前一只的前方，此时连线方向恰好反转，会把"落后"误判成
+                # "超前"、反而把它推得更远 —— 队伍就此倒序排开，而且倒序排列
+                # 本身也是方程的稳定点，再也回不来。
                 ax, ay = float(self.px[i - 1]), float(self.py[i - 1])
-                dx = ax - float(self.px[i])
-                dy = ay - float(self.py[i])
-                d = (dx * dx + dy * dy) ** 0.5
-                if d > 1e-3:
-                    gx = ax - dx / d * spacing
-                    gy = ay - dy / d * spacing
+                avx, avy = float(self.vx[i - 1]), float(self.vy[i - 1])
+                aspd = math.hypot(avx, avy)
+                if aspd > self._WALK_SPEED:
+                    # 前一只在动：身后 = 它的运动反向。取**局部**方向而不是全局
+                    # 队伍方向，队伍才会顺着走过的路径蜿蜒。
+                    bx, by = -avx / aspd, -avy / aspd
                 else:
-                    gx, gy = ax, ay
+                    # 它停下来了：沿用连续状态量 `_dir`。**不能**退回"两者连线"
+                    # —— 静止时"身后"左右各有一个等距解，挑错一侧就会停成与
+                    # 前一只重叠（实测体型 80 时第 2 只正好叠在第 0 只上，
+                    # 而且那个重叠位也是方程的稳定点，进去就出不来）。
+                    bx, by = self._dir_x, self._dir_y
+                gx = ax + bx * spacing
+                gy = ay + by * spacing
             fx = k * (gx - float(self.px[i]))
             fy = k * (gy - float(self.py[i]))
             self.vx[i] += (fx - c * float(self.vx[i])) * dt
@@ -3347,15 +3469,34 @@ class PetField:
         ph = self._phase * 1.15 + float(self._gait_off[i])
         return int(ph) % nf
 
-    def _seat(self, n, spacing):
-        """把 n 只宠物沿当前朝向铺在光标身后（首次出现 / 改数量时调用）。"""
+    def _seat_on_trail(self, n, spacing):
+        """把 n 只宠物沿刚走过的路径铺在光标身后（满足门槛现身 / 改数量时用）。
+
+        沿轨迹铺而不是在光标身后拉一条直线：一队宠物显形时应该像是"一直跟在
+        后面、刚被看见"，而不是凭空在光标旁边列队站好。朝向按**队伍排列方向**
+        定（宠物看着前面那只），而不是一律朝右。
+        """
+        self.vx[:n] = 0.0
+        self.vy[:n] = 0.0
+        self._hold[:n] = 0.0
         for i in range(n):
-            self.px[i] = self._mx - spacing * i
-            self.py[i] = self._my
-            self.vx[i] = 0.0
-            self.vy[i] = 0.0
-            self._face[i] = 1.0
-            self._hold[i] = 0.0
+            x, y = self._back_point(spacing * i)
+            self.px[i] = x
+            self.py[i] = y
+        # 队伍方向由**铺开结果**反推：现身那一瞬间速度还是 0，等它涨起来
+        # （几帧）之前都得靠这个值，否则队尾会挑错"身后"的一侧。
+        if n >= 2:
+            dx = float(self.px[1] - self.px[0])
+            dy = float(self.py[1] - self.py[0])
+            m = math.hypot(dx, dy)
+            if m > 1e-6:
+                self._dir_x, self._dir_y = dx / m, dy / m
+        # 朝向按队伍整体方向定：**队内保持一致**。逐只按"与前一只的横向差"判
+        # 会在曲线拐弯处让队内互相打架（同一队里一半朝左一半朝右，很像坏了）；
+        # 横向差太小时保持原朝向，免得竖直方向的挪动把整队翻来翻去。
+        dx = self._mx - float(self.px[0])
+        if abs(dx) > 6.0:
+            self._face[:n] = -1.0 if dx < 0.0 else 1.0
 
     def draw(self, u32, w, h, cfg):
         if not self.active():

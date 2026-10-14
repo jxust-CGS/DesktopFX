@@ -35,20 +35,35 @@ W, H = 480, 360
 
 
 def _cfg(**over):
-    """基线配置。**默认关掉静止渐隐**（`pet_idle_fade=0`）。
+    """基线配置。**默认关掉静止渐隐与现身门槛**（`pet_idle_fade=0`、
+    `pet_min_travel=0`）。
 
-    物理类用例要的是"宠物稳定跟到位"，而渐隐会在光标停住 1.6 秒后把它们冻住
-    （隐去时物理不再推进）—— 混在一起会让用例变成在测两件事。渐隐本身有专门
-    的用例，各测各的。
+    这两条都是"出场 / 退场"的时序策略，而物理类用例要的是"宠物稳定跟到位"：
+    渐隐会在光标停住 1.6 秒后把它们冻住（隐去时物理不再推进）；现身门槛要求
+    先移动够一段距离，而 `_step()` 只在循环外喂一次指针、位移常常只有几十
+    像素，开着门槛就永远不会露面。两者各有专门用例，各测各的。
     """
     cfg = dict(pet_enabled=True, pet_kind="小猫", pet_count=2.0,
                pet_size=56.0, pet_follow=0.55, pet_color="#F2C27B",
-               pet_opacity=1.0, pet_idle_fade=0.0)
+               pet_opacity=1.0, pet_idle_fade=0.0, pet_min_travel=0.0)
     cfg.update(over)
     return cfg
 
 
-def _step(p, fps, secs, cfg, target=(0.0, 0.0)):
+def _step(p, fps, secs, cfg, target=(0.0, 0.0), approach=60.0):
+    """把光标挪到 target 并推进 secs 秒。
+
+    `approach`：先把光标放在 `target - approach` 再移到 target。PetField 的
+    现身门槛要求光标真的走过一段，而它的初始光标正好落在画布中心 —— 测试里
+    写"设到中心"就是零位移，宠物永远不会露面（那条门槛本身有专门用例）。
+
+    中间必须**单独占一帧**：门槛量的是"当前净位移"（每次喂指针重算），同一帧
+    内直接再喂一次会把刚才那段落差抹掉 —— 那对应的是"甩出去又收回原位"，
+    产品语义上本来就不该触发。
+    """
+    if approach > 0.0:
+        p.set_pointer(target[0] - approach, target[1])
+        p.update(1.0 / fps, cfg)
     p.set_pointer(*target)
     for _ in range(max(1, int(fps * secs))):
         p.update(1.0 / fps, cfg)
@@ -169,7 +184,7 @@ def test_face_hysteresis():
 def test_face_flips_on_sustained_move():
     """持续朝一个方向走，必须翻到那一面。
 
-    注意先要在右边**落位**再往左跑：`_seat()` 会让宠物直接出现在光标处，
+    注意先要在右边**落位**再往左跑：`_seat_on_trail()` 把第一只铺在光标处，
     所以"第一次把光标设在左边"并不会产生任何位移。
     """
     p = PetField(W, H)
@@ -225,27 +240,44 @@ BG_BRIGHT = np.uint32(0xFFF0F0F0)
 BG_DARK = np.uint32(0xFF202020)
 
 
-def _pin_mouse(sc, x, y):
-    """把 Scene 的鼠标位置钉在画布中心。
+def _pin_mouse(sc, x, y, travel=0.0):
+    """把 Scene 的鼠标位置钉在 (x, y)。
 
     `MouseProbe` 读的是**真实光标**，测试环境里它可能在任何地方（甚至在测试
     画布之外）—— 那样宠物会被整只裁掉，"鼠标层有没有像素"就成了碰运气。
     这里替换掉 update()，让 mx/my 固定下来；返回值仍要是"本帧位移"，给 0
     就不会顺带触发涟漪与水波。
+
+    `travel > 0` 时改成"先用十几帧从 (x - travel, y) 滑到 (x, y) 再钉住"：
+    PetField 的现身门槛要求光标**真的走过一段**，钉死在一点是走不出来的
+    （那正是这个门槛要拦的情况）。
     """
+    state = {"n": 0}
+    start_x = float(x) - travel
+
     def fake(dt, ox, oy):
-        sc.mouse.mx = float(x)
+        if travel > 0.0 and state["n"] < 12:
+            state["n"] += 1
+            sc.mouse.mx = start_x + travel * (state["n"] / 12.0)
+        else:
+            sc.mouse.mx = float(x)
         sc.mouse.my = float(y)
         return 0.0
     sc.mouse.update = fake
-    sc.mouse.mx = float(x)
+    sc.mouse.mx = start_x
     sc.mouse.my = float(y)
 
 
 def _draw_on(bg_pack, cfg, x=None, y=None):
     """把宠物画在指定底色上，返回整块缓冲。"""
     p = PetField(W, H)
-    p.set_pointer(W * 0.5 if x is None else x, H * 0.5 if y is None else y)
+    tx = W * 0.5 if x is None else x
+    ty = H * 0.5 if y is None else y
+    # 先挪一段：现身门槛要求光标真的动过（默认目标正好是初始光标位置，零位移）。
+    # 这一段单独占一帧 —— 门槛量的是"当前净位移"，同帧内再喂一次会抹掉它。
+    p.set_pointer(tx - 60.0, ty)
+    p.update(1.0 / 60.0, cfg)
+    p.set_pointer(tx, ty)
     for _ in range(40):
         p.update(1.0 / 60.0, cfg)
     buf = np.full(W * H, np.uint32(bg_pack), np.uint32)
@@ -335,8 +367,9 @@ def test_scene_draws_into_mouse_layer():
     """开宠物 → 只出现在鼠标层；关掉 → 两层都干净。"""
     from _verify_kinds import _base_cfg
     sc = Scene(W, H)
-    _pin_mouse(sc, W * 0.5, H * 0.5)
-    sc.cfg = _base_cfg(pet_enabled=True, pet_size=56.0, pet_count=2.0)
+    _pin_mouse(sc, W * 0.5, H * 0.5, travel=60.0)
+    sc.cfg = _base_cfg(pet_enabled=True, pet_size=56.0, pet_count=2.0,
+                       pet_min_travel=0.0)
     fs = np.zeros(W * H, np.uint32)
     ms = np.zeros(W * H, np.uint32)
     for _ in range(40):
@@ -366,11 +399,11 @@ def test_layer_activity_includes_pets():
     """空层跳过的信号必须把宠物算进去，否则宠物会被冻在屏幕上。"""
     from _verify_kinds import _base_cfg
     sc = Scene(W, H)
-    _pin_mouse(sc, W * 0.5, H * 0.5)
+    _pin_mouse(sc, W * 0.5, H * 0.5, travel=60.0)
     sc.cfg = _base_cfg()
     if sc.layer_activity() != (False, False):
         return False, "全关时却被报成有内容"
-    sc.cfg = _base_cfg(pet_enabled=True, pet_size=56.0)
+    sc.cfg = _base_cfg(pet_enabled=True, pet_size=56.0, pet_min_travel=0.0)
     blank = np.zeros(W * H, np.uint32)
     for _ in range(40):
         sc.step(1.0 / 60.0, blank, W, H, blank)
@@ -475,7 +508,15 @@ def test_blink_overlay_is_cropped():
 
 
 # ---------------------------------------------------------- 6. 静止渐隐
-def _run(p, cfg, fps, secs, target, click=0, feed=True):
+def _run(p, cfg, fps, secs, target, click=0, feed=True, approach=0.0):
+    """逐帧喂同一个目标点。
+
+    `approach > 0` 时先挪一段再开始（现身门槛要求光标真的动过，见 `_step`）。
+    这一段同样要单独占一帧。
+    """
+    if approach > 0.0:
+        p.set_pointer(target[0] - approach, target[1])
+        p.update(1.0 / fps, cfg)
     for k in range(max(1, int(fps * secs))):
         if feed:
             p.set_pointer(target[0], target[1],
@@ -529,33 +570,118 @@ def test_idle_fade_zero_never_hides():
     return True, "阈值 0 时静止 5 秒仍全程可见"
 
 
-def test_click_wakes_hidden_pets():
-    """光标不动时点一下，宠物该回来 —— 点击也算交互。
+def test_click_does_not_wake_hidden_pets():
+    """隐去之后**原地点击不能**把它们叫出来 —— 得真的移动。
 
-    这条是"静止渐隐"的配套：没有它，用户必须晃一下鼠标才能把宠物叫回来，
-    而原地点击（比如在空白桌面点一下）恰恰是最自然的"我想看它们"的动作。
+    这是刻意的行为选择：点击不改变光标位置，宠物露面也只能杵在原地，正是
+    "一队不动的宠物站在那儿"那种观感。点击只刷新静止计时，让已经跟上来的
+    一队不至于因为点了一下就提前散场。
     """
     p = PetField(W, H)
     cfg = _cfg(pet_idle_fade=0.8)
     c = (W * 0.5, H * 0.5)
-    _run(p, cfg, 60, 2.0, c)
+    _run(p, cfg, 60, 2.0, c, approach=60.0)
     if not p._hidden:
         return False, "前提不成立：静止 2 秒后没有隐去"
     p.set_pointer(c[0], c[1], 1)            # 原地点击（位置没变）
     p.update(1.0 / 60.0, cfg)
-    if p._hidden:
-        return False, "原地点击没有把宠物叫回来"
-    if p._fade <= 0.0:
-        return False, "点击后没有开始淡入"
-    # 别只看状态位：淡入要真的把像素画回来。
-    # 注意坐标必须留在画面内 —— 宠物中心超出屏幕就会被整只裁掉，
-    # 那时"画不出像素"跟唤醒成不成功毫无关系。
-    _run(p, cfg, 60, 0.6, c)
+    if not p._hidden or p.active():
+        return False, "原地点击把宠物叫出来了（没动就会杵在原地，不该出现）"
+    # 移动够门槛才回来，而且要真的把像素画回来（别只看状态位）
+    _run(p, cfg, 60, 0.6, (c[0] + 60.0, c[1]))
+    if p._hidden or not p.active():
+        return False, "移动 60 像素后仍没回来"
     buf = np.zeros(W * H, np.uint32)
     p.draw(buf, W, H, cfg)
     if not (buf > 0).any():
-        return False, "点击唤醒后画不出任何像素"
-    return True, "隐去状态下原地点击能唤醒并淡入，且真的重新画了出来"
+        return False, "唤醒后画不出任何像素"
+    return True, "原地点击不唤醒；移动 60 像素后回来并真的重新画了出来"
+
+
+# ---------------------------------------------------------- 7. 现身门槛
+def test_min_travel_gates_appearance():
+    """现身门槛：没走够就不动声色，走够了才露面。"""
+    p = PetField(W, H)
+    cfg = _cfg(pet_min_travel=100.0)
+    start = (100.0, 180.0)
+    p.set_pointer(*start)
+    p.reset()                       # 模拟"特效刚打开"：锚点对齐当前光标
+    p.update(1.0 / 60.0, cfg)
+    if p._placed:
+        return False, "刚打开、光标一下都没动就现身了"
+
+    for k in range(1, 46):          # 走 90 像素（差一点）
+        p.set_pointer(start[0] + k * 2.0, start[1])
+        p.update(1.0 / 60.0, cfg)
+    if p._placed:
+        return False, "只走了 90 像素（门槛 100）就现身了"
+
+    for k in range(46, 66):         # 再走一段，越过门槛
+        p.set_pointer(start[0] + k * 2.0, start[1])
+        p.update(1.0 / 60.0, cfg)
+    if not p._placed:
+        return False, "走满 130 像素仍未现身"
+    return True, "没动 / 走 90 像素都不现身，越过 100 像素门槛后现身"
+
+
+def test_wiggle_in_place_never_appears():
+    """原地来回抖动不算"开始移动"：门槛量净位移，不是累计路程。
+
+    累计路程在来回抖动时能轻松刷到几千像素，但用户明明没在走 —— 按累计判
+    会让宠物在光标旁边原地蹦出来，正是这次要修掉的观感。
+    """
+    p = PetField(W, H)
+    cfg = _cfg(pet_min_travel=100.0)
+    c = (240.0, 180.0)
+    p.set_pointer(*c)
+    p.reset()
+    for k in range(600):            # 10 秒，±30 像素来回
+        p.set_pointer(c[0] + (30.0 if (k // 5) % 2 else -30.0), c[1])
+        p.update(1.0 / 60.0, cfg)
+    if p._placed:
+        return False, "原地来回抖动 10 秒后仍然现身了（判成累计路程了？）"
+    for k in range(61):             # 改成单向走 120 像素
+        p.set_pointer(c[0] + 30.0 + k * 2.0, c[1])
+        p.update(1.0 / 60.0, cfg)
+    if not p._placed:
+        return False, "改成单向走 120 像素后仍不现身"
+    return True, "原地抖动 10 秒不现身；换成单向走 120 像素后现身"
+
+
+def test_appears_spread_along_trail():
+    """露面时队伍沿**刚走过的路径**铺开，而不是在光标身后拉一条直线。
+
+    门槛取 150：第一段（向右 120）走完净位移是 120，差一点；拐弯后往下走，
+    净位移涨到 hypot(120, 2k)，k=45 时越过 150 —— 露面发生在**拐弯之后**，
+    轨迹已经是个 L 形，铺开的队伍才会纵向拉开。
+    """
+    p = PetField(W, H)
+    cfg = _cfg(pet_count=4.0, pet_min_travel=150.0, pet_size=40.0)
+    p.set_pointer(80.0, 60.0)
+    p.reset()
+    for k in range(61):             # 先向右走 120（不够门槛，不露面）
+        p.set_pointer(80.0 + k * 2.0, 60.0)
+        p.update(1.0 / 60.0, cfg)
+    if p._placed:
+        return False, "门槛没生效：走 120 像素就露面了"
+    for k in range(61):             # 再向下走，途中越过门槛
+        p.set_pointer(200.0, 60.0 + k * 2.0)
+        p.update(1.0 / 60.0, cfg)
+        if p._placed:
+            break
+    if not p._placed:
+        return False, "拐弯后走满门槛仍未露面"
+
+    ys = [float(p.py[i]) for i in range(4)]
+    spread = max(ys) - min(ys)
+    if spread < 8.0:
+        return False, (f"队伍铺在一条水平线上（y 极差 {spread:.1f}）—— "
+                       f"没有沿轨迹铺开")
+    d0 = ((float(p.px[0]) - p._mx) ** 2 + (float(p.py[0]) - p._my) ** 2) ** 0.5
+    if d0 > 3.0:
+        return False, f"第一只没落在光标处（偏 {d0:.1f} 像素）"
+    return True, (f"沿 L 形路径铺开（y 极差 {spread:.0f} 像素），"
+                  f"第一只在光标处（偏 {d0:.1f}）")
 
 
 # ---------------------------------------------------------- 7. 跟随链规模
@@ -569,7 +695,7 @@ def test_ten_pets_chain_visible():
     p = PetField(W, H)
     cfg = _cfg(pet_count=float(PetField.MAX_PETS), pet_size=36.0,
                pet_follow=0.72)
-    _run(p, cfg, 60, 2.5, (W * 0.5, H * 0.5))
+    _run(p, cfg, 60, 2.5, (W * 0.5, H * 0.5), approach=60.0)
     spread = float(np.ptp(p.px[:PetField.MAX_PETS]))
     if spread < 36.0 * 0.82 * (PetField.MAX_PETS - 1) * 0.55:
         return False, (f"10 只首尾跨度只有 {spread:.0f} 像素，队伍挤成一坨了")
@@ -644,10 +770,10 @@ def test_registry():
             return False, f"预设 {n} 含未登记的键：{bad}"
     for k in ("pet_enabled", "pet_kind", "pet_count", "pet_size",
               "pet_follow", "pet_color", "pet_opacity",
-              "pet_idle_fade"):
+              "pet_idle_fade", "pet_min_travel"):
         if k not in d.DEFAULTS:
             return False, f"DEFAULTS 缺 {k}"
-    return True, "分类/分层/启停键/导航/预设 六处登记齐全（8 个 pet_ 键）"
+    return True, "分类/分层/启停键/导航/预设 六处登记齐全（9 个 pet_ 键）"
 
 
 def test_kind_and_values_sane():
@@ -666,7 +792,7 @@ def test_kind_and_values_sane():
                           pet_size=48.0))
     if p._frames_walk is None:
         return False, "未知种类没有兜底，精灵构建失败"
-    for k in ("pet_idle_fade",):
+    for k in ("pet_idle_fade", "pet_min_travel"):
         if k not in d.DEFAULTS:
             return False, f"DEFAULTS 缺 {k}"
     # 已去掉的功能不该在配置里留下"无效开关"（面板上会多一个拨了没用的项）
@@ -719,11 +845,12 @@ def test_negative_copy_instead_of_over():
     Pet2 = mod.PetField
     cfg = dict(pet_enabled=True, pet_kind="小猫", pet_count=2.0,
                pet_size=56.0, pet_follow=0.55, pet_color="#F2C27B",
-               pet_opacity=1.0)
+               pet_opacity=1.0, pet_idle_fade=0.0, pet_min_travel=0.0)
 
     def draw_on(pack):
         p = Pet2(W, H)
-        p.set_pointer(W * 0.5, H * 0.5)
+        # 挪一段再停下：现身门槛要求"光标真的动过"，钉在初始位置是画不出来的
+        p.set_pointer(120.0, H * 0.5)
         for _ in range(40):
             p.update(1.0 / 60.0, cfg)
         buf = np.full(W * H, np.uint32(pack), np.uint32)
@@ -762,7 +889,10 @@ def main():
         test_blink_overlay_is_cropped,
         test_idle_fade_hides_then_wakes,
         test_idle_fade_zero_never_hides,
-        test_click_wakes_hidden_pets,
+        test_click_does_not_wake_hidden_pets,
+        test_min_travel_gates_appearance,
+        test_wiggle_in_place_never_appears,
+        test_appears_spread_along_trail,
         test_ten_pets_chain_visible,
         test_ten_pets_ok,
         test_blend_depends_on_destination,
