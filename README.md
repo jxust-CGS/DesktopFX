@@ -269,12 +269,12 @@ DesktopFX/
 ├── _verify_window_ripple.py # 窗口水波专项：事件流(移动 / 缩放 / 最小化 / 恢复 / 静止时绝对零注入) / 逐帧热点追踪 / 四个方向的活塞相位 / 拉宽缩窄同式 / 幅度∝速度并饱和 / 30·60·120 帧率无关 / **只向外**(窗内漏量 < 20% 且波包重心单调外移) / 两种包形积分一致 / 与旧写法波高一致(对照组) / Scene 接线与共用水面(带对照组) / 关闭即清场
 ├── _verify_wave_draw.py    # 水波上屏专项：查表着色 vs 逐项公式(独立重算，最大通道差 ≤ 1) / 染色通道顺序 / 缓存命中 / 直写与掩码写语义(脏缓冲下掩码版必须保住他人像素) / 包围盒被缓冲边界切时不越界 / 零波场不写字节
 ├── _verify_render_loop.py  # 渲染循环性能探针：真实循环下把每帧耗时拆到 特效 update/draw / 上屏 / 抢顶，报帧间隔 p50·p95·max 与掉帧数（配置用副本，不动用户配置）
-├── _verify_perf.py         # 4K 双屏最坏情况（暴雨 + 120 涟漪）性能基准
-├── _verify_perf_layers.py  # 4K 双屏最坏情况（多图层全开）性能 + 3600 帧稳定性基准
+├── _verify_perf.py         # 4K 双屏最坏情况（暴雨 + 120 涟漪）性能基准；**带判据**：≥20 ms/帧 才判红退出（14/20 两条线，原先只打印不给退出码 = 没有判据）
+├── _verify_perf_layers.py  # 4K 双屏最坏情况（多图层全开）性能 + 3600 帧稳定性基准；判红用**相对本机单层基线的倍数**（>5×，实测 1.3~1.4×）而不是绝对毫秒——跨 CPU 不可移植，且这个极端组合本来就高于 60 帧预算
 ├── _diag_layers.py         # 真机验证：雨+聚光灯同屏启动，抓帧差分确认画到桌面
 ├── _diag_zorder.py         # 诊断：30ms 轮询覆盖层与面板的 z 序相对位置，抓周期性互压
 ├── _diag_above.py          # 诊断（只读）：摊开"谁压在覆盖层之上"，逐窗标注会不会被判为遮挡
-├── _run_all_verify.py      # 分层顺序跑验证脚本并汇总（`--fast` 约 1 分钟 / `--skip-slow` 约 3 分钟 / 全量约 11 分钟；必须顺序，并行会互相干扰出假失败）
+├── _run_all_verify.py      # 分层顺序跑验证脚本并汇总（`--fast` 13 个脚本约 75 秒 / `--skip-slow` 约 3 分钟 / 全量约 11 分钟；必须顺序，并行会互相干扰出假失败）
 ├── _verify_stability.py    # 18000 帧长跑：内存泄漏 / 帧耗时漂移 / 池溢出
 ├── _verify_mouse_init.py   # 鼠标探针首帧幽灵位移修复验证
 ├── _verify_dpi.py          # DPI 感知声明验证
@@ -283,6 +283,8 @@ DesktopFX/
 ├── _verify_ui_resize.py     # 面板可缩放 + 底部提示迁移：八个手柄齐备 / 拖角时对边钉住 / 拖到最小被夹住 / 尺寸落盘与重启还原 / 自适应高度只放开高度 / 折行宽度跟随 / 恢复默认尺寸
 ├── _verify_startup_noflicker.py  # 启动无闪动：构造期窗口全程隐藏、__init__ 末尾才一次性显示，高度不跳变
 ├── _verify_render_guard.py  # 渲染线程的异常保护 + 三处 JSON 原子写：线程入口落盘并拆覆盖窗、帧级 try 覆盖 pump 与帧率控制（AST 判"在 try **体内**"+ 两条负向对照）、原子写无残留 / 失败清理 / 往返一致、`.gitattributes` 行尾属性
+├── _verify_cfg_coerce.py    # 配置值钳制：字符串写的布尔（"no" 不再是真）/ 坏数值与 NaN 回退出厂值且面板照常打开 / 天文数字拦下 / 合法值零误伤（88 个默认值 + 350 个预设值全过）/ 被忽略的键写日志但不计入熔断 / 用户预设同样过闸（含"旧实现确有该 bug"的负向对照）
+├── _verify_attach_rollback.py  # 挂到壁纸层失败时的清理对称性：回读失败必须回写原样式（不留"没有父亲却有 WS_CHILD"的孤儿窗）、取不到样式时一次都不能写（否则拿 0 回写会抹掉全部样式）（真机打桩 + AST 负向对照）
 ├── _verify_single_instance.py # 互斥体跨进程语义 + 跨进程唤醒消息
 ├── _verify_error_reporting.py # 故障可见性：落盘/去重/熔断/UI 横幅/上报路径自保
 ├── _verify_tray.py         # 托盘：TaskbarCreated 重挂 / 开机竞态 / 真机图标可见
@@ -355,7 +357,7 @@ python _runtime_test.py
 # 稳定性脚本额外需要 psutil：pip install psutil
 
 # 或者按范围分层跑（推荐）：改完代码先用 --fast，别一律跑全量
-python _run_all_verify.py --fast        # 核心回归，约 40 秒
+python _run_all_verify.py --fast        # 核心回归（13 个脚本），约 75 秒
 python _run_all_verify.py --skip-slow   # 略过性能/长跑/烟雾，约 3 分钟
 python _run_all_verify.py               # 全量，约 11 分钟
 python _verify_visibility.py

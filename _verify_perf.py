@@ -1,6 +1,14 @@
 # -*- coding: utf-8 -*-
-"""最坏情况性能基准：暴雨 (620 drops) + 大量涟漪，看是否还能 60 FPS。"""
+"""最坏情况性能基准：暴雨 (620 drops) + 大量涟漪，看是否还能 60 FPS。
+
+**退出码就是判据**（`_run_all_verify.py` 只认 returncode）：
+    0  < 14 ms/帧  最坏情况稳过 60 FPS
+    0  14~20 ms/帧 50~60 FPS，满帧刚好够（警告但不拦）
+    1  >= 20 ms/帧 明显掉帧，回归不通过
+本机 2026-10-14 实测基线：纯雨 6.43 ms、雨+120 涟漪 17.40 ms（57 FPS）。
+"""
 import os
+import sys
 import time
 import numpy as np
 
@@ -11,6 +19,7 @@ import desktop_fx as d
 
 
 def main():
+    """跑基准。返回 True = 通过（退出码 0），False = 掉帧（退出码 1）。"""
     W, H = 3840, 1200          # 用户的 4K 双屏
     cfg = dict(d.PRESETS["暴雨"])
     print(f"benchmark on {W}x{H}, 暴雨 preset:")
@@ -60,11 +69,16 @@ def main():
     print()
     if dt_full < 14:
         print(f"  ✓ 最坏情况还能 60+ FPS（{1000/dt_full:.0f} FPS）")
+        return True
     elif dt_full < 20:
         print(f"  ~ 50-60 FPS（{1000/dt_full:.0f} FPS）— 满帧刚好够")
-    else:
-        print(f"  ✗ 掉帧（{1000/dt_full:.0f} FPS）— 需要降上限或优化")
+        # 警告但不拦：4K 双屏极端组合下贴着 60 帧可接受，落在硬线以内
+        return True
+    print(f"  ✗ 掉帧（{1000/dt_full:.0f} FPS）— 需要降上限或优化")
+    return False
 
 
 if __name__ == "__main__":
-    main()
+    # 只打印不退出码的脚本在 `_run_all_verify.py` 眼里永远是绿的 ——
+    # 这个脚本存在的全部意义就是当性能回归的判据，所以结论必须落到退出码。
+    sys.exit(0 if main() else 1)

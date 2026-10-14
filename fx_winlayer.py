@@ -707,6 +707,11 @@ class Overlay:
         # 在系统眼里仍是"顶层窗"，GetParent 返回的是 owner（恒为 0）——
         # 父子关系形同虚设，还可能被当成独立顶层窗重新参与 z 序竞争。
         style = user32.GetWindowLongW(self.hwnd, GWL_STYLE)
+        # 取不到样式（窗口已失效）时 style 是 0，**绝不能拿它做后续的写回** ——
+        # 那会把窗口的全部样式抹成 0（连 WS_VISIBLE 都没了）。下面两条回滚
+        # 分支都要用这个值，所以在本函数入口就挡掉。
+        if not style:
+            return False
         user32.SetWindowLongW(self.hwnd, GWL_STYLE,
                               (style & ~WS_POPUP_STYLE) | WS_CHILD)
         # 回读校验，而不是看 SetLastError：SetWindowLong 成功时并不保证把
@@ -714,6 +719,14 @@ class Overlay:
         # 不会触发任何内部动作，残留的旧错误码会被当成失败 —— 结果是明明
         # 挂得上却静默降级成"沉底窗口"。回读才是可靠的判据。
         if not (user32.GetWindowLongW(self.hwnd, GWL_STYLE) & WS_CHILD):
+            # 回滚样式再降级，与下面 SetParent 失败那条分支保持对称。
+            # 不回滚就会留下"没有父亲却有 WS_CHILD"的窗口：系统按孤儿子窗
+            # 处理它（不上屏、不参与正常 z 序），而且**不可自愈** ——
+            # _parented 仍是 False，_detach_parent() 开头就直接返回，
+            # 此后没有任何路径会来修它。
+            # 此处还没调过 SetParent，分层表面未受影响，所以不必
+            # _rebuild_layered_surface()；_origin 也还是旧值，无需复位。
+            user32.SetWindowLongW(self.hwnd, GWL_STYLE, style)
             return False
         # SetParent 的返回值是"原来的父亲"，顶层窗时就是 NULL，无法据此判断成败，
         # 因此直接回读 GetParent 校验；不成立就回滚样式，别留下半吊子状态。

@@ -10,6 +10,7 @@
 """
 import ctypes
 import json
+import math
 import os
 import queue
 import sys
@@ -166,6 +167,79 @@ DEFAULTS = {
     # 等于"任务栏浮在特效之前"。
     "avoid_taskbar": True,
 }
+
+# ---------------------------------------------------------------- 配置钳制
+# 布尔值的各种写法。用户手改配置时写成 "on"/"关"/"是" 都是显然的意图，
+# 按意图转换；转不过去的（`{}`、`[]`）才当坏值。
+_TRUE_WORDS = frozenset(("1", "true", "yes", "on", "开", "是", "启用"))
+_FALSE_WORDS = frozenset(("0", "false", "no", "off", "关", "否", "禁用"))
+
+# 数值的粗略上界。**真正的值域由 UI 滑条与预设负责**（那是唯一的正常写入
+# 路径），这里只拦"手改出来的天文数字"：`rain_amount` 写成 1e9 会让
+# `set_amount` 去分配十亿个粒子。现有配置里最大的量级是 meteor_speed 1520，
+# 1e6 留了三个数量级余量。
+_ABS_LIMIT = 1e6
+
+
+def _coerce_cfg_value(key, value):
+    """把配置里的值钳制到该键应有的类型。返回 (是否可用, 值)。
+
+    `load()` 原先只判 `k in DEFAULTS`，值原样收下 —— **键对了不代表值对了**。
+    手改/旧版本遗留的坏值各自有一个很难查的症状：
+
+    - `"rain_enabled": "yes"` —— 非空字符串 `bool()` 恒为真，于是**写了关闭
+      却仍然开着**；用户只会觉得"这个开关坏了"，不会想到去看配置文件。
+    - `"fps": "true"` —— UI 构造期 `float()` 抛 ValueError，**特效在跑但面板
+      打不开**（异常在面板构造里，用户看不到任何提示）。
+    - `"fps": NaN` / `Infinity` —— Python 的 json 模块接受这两个**非标准**
+      字面量，读进来是 float('nan')，下游 `int(cfg[...])` 直接抛错。
+      所以数值一律要过 `math.isfinite`。
+    """
+    default = DEFAULTS.get(key)
+    if default is None:
+        return False, None
+
+    if isinstance(default, bool):
+        if isinstance(value, bool):
+            return True, value
+        # 注意顺序：bool 是 int 的子类，真正的布尔已在上面返回了
+        if isinstance(value, (int, float)):
+            return True, bool(value)
+        if isinstance(value, str):
+            s = value.strip().lower()
+            if s in _TRUE_WORDS:
+                return True, True
+            if s in _FALSE_WORDS:
+                return True, False
+        return False, None
+
+    if isinstance(default, float):
+        # JSON 里 `true` 不是 1，布尔被当数值用一定是写错了
+        if isinstance(value, bool):
+            return False, None
+        if isinstance(value, str):
+            try:
+                value = float(value.strip())
+            except ValueError:
+                return False, None
+        if isinstance(value, (int, float)):
+            f = float(value)
+            if math.isfinite(f) and abs(f) <= _ABS_LIMIT:
+                return True, f
+        return False, None
+
+    if isinstance(default, str):
+        if not isinstance(value, str):
+            return False, None
+        # **只管类型，不管取值是否合法。** 档位这类"语义"归一化归
+        # `apply_z_mode`（它把任何不认识的档位静默归到最上层），这是既有约定，
+        # `_verify_layer_switch.test_config_backward_compat` 明确要求
+        # "load() 不该过滤值"。颜色格式同理：`hex_to_bgr()` 自带兜底。
+        return True, value
+
+    # dict / list / None 这类复合默认值：没有可靠的类型判据，原样接受，
+    # 由具体消费方自检（目前 DEFAULTS 里没有这种键，留作以后的安全出口）。
+    return False, None
 
 PRESETS = {
     # 毛毛雨保留"细雨"身份（雨量最少 / 雨丝最短 / 速度最慢），但颜色与不透明度
@@ -427,15 +501,32 @@ class App:
     def load(self):
         """读入已存在的键，未知键忽略（配置 schema 演进时旧文件仍可用）。
         文件损坏时回退到 DEFAULTS —— 这是预期行为，但要留下记录，
-        否则用户会发现"设置莫名其妙变回出厂值"且查不到原因。"""
+        否则用户会发现"设置莫名其妙变回出厂值"且查不到原因。
+
+        每个值还要过 `_coerce_cfg_value` 的钳制：转不过去的保持 DEFAULTS 里的
+        出厂值，并把被忽略的键报出来。报的时候用 fatal=False —— 这是启动期的
+        数据问题，不是运行期故障，不该计入"连续失败"从而停掉渲染。
+        """
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if not isinstance(data, dict):
                 raise ValueError("config root is not an object")
+            rejected = []
             for k, v in data.items():
-                if k in DEFAULTS:
-                    self.cfg[k] = v
+                if k not in DEFAULTS:
+                    continue
+                ok, val = _coerce_cfg_value(k, v)
+                if ok:
+                    self.cfg[k] = val
+                else:
+                    rejected.append(k)
+            if rejected:
+                shown = "、".join(sorted(rejected)[:10])
+                if len(rejected) > 10:
+                    shown += f" 等 {len(rejected)} 项"
+                self.report_error("config-coerce", ValueError(
+                    f"已忽略非法配置值，改用出厂值：{shown}"), fatal=False)
             return True
         except FileNotFoundError:
             return True          # 首次运行，用 DEFAULTS 即可
@@ -672,8 +763,20 @@ class App:
         # 同时过滤掉 DEFAULTS 里已经不存在的键 —— 老的自定义预设会带着
         # 已删除功能的配置（例如退役的 lightning），不过滤就会在内存 cfg 里
         # 留下阴魂不散的残留键。
-        self.cfg.update({k: v for k, v in p.items()
-                         if not k.startswith("_") and k in DEFAULTS})
+        #
+        # 值也要过钳制：内置预设来自代码（可信），但**用户预设来自
+        # presets_user.json**，手改同一个文件同样能写出 `"rain_enabled": "yes"`
+        # 这种"写了关闭却开着"的值 —— 与 load() 是同一类问题，别漏这一半。
+        # 转不过去的键直接跳过（沿用当前值），不整体失败：预设里坏一项
+        # 不该让其余九十多项也不生效。
+        fresh = {}
+        for k, v in p.items():
+            if k.startswith("_") or k not in DEFAULTS:
+                continue
+            ok, val = _coerce_cfg_value(k, v)
+            if ok:
+                fresh[k] = val
+        self.cfg.update(fresh)
         self._normalize_exclusive(prefer=p)   # 预设整块写入、绕过 set()，这里收拢
         self.snapshot = dict(self.cfg)
         self._autosave_dirty = True
