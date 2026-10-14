@@ -11,7 +11,7 @@ import os
 import tkinter as tk
 
 from _win32 import user32, HANDLE, HWND, INT, UINT, hwnd_int, screen_pixel
-from _paths import app_root
+from _paths import app_root, atomic_write_json
 import fx_kinds
 
 # ------------------------------------------------------------------ 设计系统
@@ -1143,8 +1143,10 @@ class ControlPanel:
         窗口宽高），不会像原来那样把其它键覆盖掉。
         """
         try:
-            with open(_UI_STATE_PATH, "w", encoding="utf-8") as f:
-                json.dump(self._ui, f, ensure_ascii=False)
+            # 原子写：写坏了读取端会静默回到默认尺寸 + 默认页面（这里
+            # except: pass 连 error.log 都不留），用户看不出发生过什么。
+            # indent=None —— ui_state.json 本来就是紧凑无缩进的。
+            atomic_write_json(_UI_STATE_PATH, dict(self._ui), indent=None)
         except Exception:
             pass
 

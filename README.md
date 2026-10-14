@@ -282,6 +282,7 @@ DesktopFX/
 ├── _verify_ui_runtime.py    # 面板运行时冒烟：侧栏遍历 / 预设就地刷新 / 滚动，真实 Tk 下实例化
 ├── _verify_ui_resize.py     # 面板可缩放 + 底部提示迁移：八个手柄齐备 / 拖角时对边钉住 / 拖到最小被夹住 / 尺寸落盘与重启还原 / 自适应高度只放开高度 / 折行宽度跟随 / 恢复默认尺寸
 ├── _verify_startup_noflicker.py  # 启动无闪动：构造期窗口全程隐藏、__init__ 末尾才一次性显示，高度不跳变
+├── _verify_render_guard.py  # 渲染线程的异常保护 + 三处 JSON 原子写：线程入口落盘并拆覆盖窗、帧级 try 覆盖 pump 与帧率控制（AST 判"在 try **体内**"+ 两条负向对照）、原子写无残留 / 失败清理 / 往返一致、`.gitattributes` 行尾属性
 ├── _verify_single_instance.py # 互斥体跨进程语义 + 跨进程唤醒消息
 ├── _verify_error_reporting.py # 故障可见性：落盘/去重/熔断/UI 横幅/上报路径自保
 ├── _verify_tray.py         # 托盘：TaskbarCreated 重挂 / 开机竞态 / 真机图标可见

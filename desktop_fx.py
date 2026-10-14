@@ -18,7 +18,7 @@ import time
 import winreg
 
 from _win32 import user32, kernel32
-from _paths import app_root
+from _paths import app_root, atomic_write_json
 import fx_kinds
 
 # 源码运行 = 项目目录；PyInstaller 冻结 = exe 所在目录（用户数据随 exe 走）
@@ -445,10 +445,16 @@ class App:
 
     def save(self):
         """存盘失败不能静默：否则用户调了半天设置，重启后全部复原且毫无提示。
-        常见诱因是 config.json 变成只读（网盘同步、权限问题）。"""
+        常见诱因是 config.json 变成只读（网盘同步、权限问题）。
+
+        走原子写（临时文件 + os.replace）：直接覆盖是"先 truncate 再逐块写"，
+        中途断电或被强杀会留下半截 JSON，而 load() 碰到损坏文件是**整体回退
+        DEFAULTS** —— 用户半天的调参一次归零，界面上还看不出发生过什么。"""
         try:
-            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-                json.dump(self.cfg, f, ensure_ascii=False, indent=2)
+            # 传快照而不是 self.cfg 本身：json.dump 会**迭代**这个 dict，
+            # 另一条线程此刻新增键就会 RuntimeError（实测可复现）。
+            # 一次 dict() 顺手把迭代期竞争也消掉了。
+            atomic_write_json(CONFIG_PATH, dict(self.cfg))
             return True
         except Exception as exc:
             self.report_error("config-save", exc)
@@ -622,8 +628,9 @@ class App:
     def _save_user_presets(self):
         """写入用户预设文件。失败时上报但不抛异常。"""
         try:
-            with open(USER_PRESETS_PATH, "w", encoding="utf-8") as f:
-                json.dump(self.user_presets, f, ensure_ascii=False, indent=2)
+            # 原子写：预设文件损坏时读取端是"当作没有预设"，等于用户存的
+            # 方案被无声清空，同样是走临时文件 + os.replace。
+            atomic_write_json(USER_PRESETS_PATH, dict(self.user_presets))
             return True
         except Exception as exc:
             self.report_error("user-presets-save", exc)
@@ -734,6 +741,31 @@ class App:
 
     # ---------------------------------------------------------------- 渲染
     def _render_loop(self):
+        """渲染线程入口。**整个线程体都在保护里**，理由与托盘的 _tray_main 同构。
+
+        渲染线程是 daemon，pythonw 下 stderr 是 None：一次未捕获异常就等于
+        线程静默死亡，而进程照常活着 —— 面板能打开、托盘图标还在、所有开关都
+        能调，只是屏幕上什么特效都没有，error.log 干干净净。症状和无任何提示
+        的崩溃等价，却比崩溃难查得多。
+
+        `finally` 兜住资源：`_render_frames` 正常退出时已经自己拆过覆盖窗，
+        这里再拆一次是幂等的（destroy 把每个句柄释放后置 None）；只有异常栈
+        展开才会真正走到这里。挂在 `_render_frames` 末尾的清理代码在栈展开时
+        是不执行的 —— 那正是原来漏掉的那一半。
+        """
+        try:
+            self._render_frames()
+        except BaseException as exc:
+            self.report_error("render-thread", exc)
+            raise
+        finally:
+            for ov in (getattr(self, "overlays", None) or []):
+                try:
+                    ov.destroy()
+                except Exception:
+                    pass
+
+    def _render_frames(self):
         # 延迟导入，保证 numpy 缺失时能在主线程友好提示
         import numpy as np
         import fx_winlayer
@@ -743,9 +775,21 @@ class App:
         # 两层各一个覆盖窗口：全屏特效层 / 鼠标特效层。两层的显示层级由用户
         # 分别设定（最上层 / 仅桌面图层），一个窗口做不到两种 z 序，必须分开。
         ov_fs = Overlay(fx_kinds.LAYER_TOPMOST)
-        ov_fs.create()
         ov_ms = Overlay(fx_kinds.LAYER_TOPMOST)
-        ov_ms.create()
+        try:
+            ov_fs.create()
+            ov_ms.create()
+        except BaseException:
+            # create() 有三处显式 raise（窗口建不出来 / ShowWindow 后不可见 /
+            # CreateDIBSection 失败，受限会话与资源耗尽时会真的发生）。
+            # 两层都先建对象再建窗口，所以第二个失败时第一个已经持有
+            # HWND + HBITMAP + 两个 DC —— 必须在这里拆掉，否则它们活到进程结束。
+            for ov in (ov_fs, ov_ms):
+                try:
+                    ov.destroy()
+                except Exception:
+                    pass
+            raise
         self.overlay = ov_fs
         self.overlays = [ov_fs, ov_ms]
         w, h = ov_fs.w, ov_fs.h
@@ -783,19 +827,24 @@ class App:
             last = t0
             cfg = self.snapshot
 
-            if self.paused:
-                for ov in (ov_fs, ov_ms):
-                    try:
-                        ov.u32[:] = 0
-                        ov.present()
-                    except Exception:
-                        pass
-                    ov.pump()
-                self.paused_idle = True
-                time.sleep(0.05)
-                continue
-
             try:
+                # 暂停分支也在这层保护里：`ov.pump()` 会走 wndproc
+                # （"调出面板"请求、窗口重建都从那里进来），裸跑在
+                # try 之外就又是一次"线程静默死亡"。
+                if self.paused:
+                    for ov in (ov_fs, ov_ms):
+                        try:
+                            ov.u32[:] = 0
+                            ov.present()
+                        except Exception:
+                            # 清屏是尽力而为：暂停期间上不了屏不该算
+                            # 渲染失败，所以不交给熔断计数
+                            pass
+                        ov.pump()
+                    self.paused_idle = True
+                    time.sleep(0.05)
+                    continue
+
                 now = time.perf_counter()
 
                 # 1) 桌面层存活自检（低频）：桌面层是资源管理器壁纸窗口的
@@ -921,6 +970,38 @@ class App:
                 ms_empty = not ms_has
                 self.clear_error()
                 frame += 1
+
+                # 泵消息与帧率控制也放进本帧的保护范围：它们原先在 try 之外，
+                # `pump()`（DispatchMessage → wndproc）或 `float(cfg["fps"])`
+                # 抛异常都会直接掀翻整个渲染线程，且不留任何日志。
+                # ⚠️ 位置硬性要求：必须在 try 体**内**、except 之前。
+                # 放到 except 之后（缩进相同）会变成"只在帧失败时才泵消息"——
+                # 语法合法、运行不报错，但正常路径再也不泵消息、不限帧率。
+                ov_fs.pump()
+                ov_ms.pump()
+
+                # ---------------- 帧率控制与统计
+                cost = time.perf_counter() - t0
+                self.cost_ms = self.cost_ms * 0.9 + (cost * 1000.0) * 0.1
+                fps_ema = fps_ema * 0.92 + (1.0 / max(dt, 1e-4)) * 0.08
+                self.fps = fps_ema
+
+                target = 1.0 / max(20.0, min(144.0, float(cfg["fps"])))
+                # **按绝对时刻排程**，而不是"每帧睡 target − cost"。后者会把
+                # `time.sleep` 的过冲（Windows 上实测约 0.4~0.5ms，高精度定时器的
+                # 粒度）**逐帧累积**，60Hz 目标只能跑到 57.7 帧/秒 —— 明明算力只用
+                # 了 10.6ms/16.7ms，却因为每帧都白丢半毫秒而欠帧。绝对排程下这一帧
+                # 睡多了下一帧就自动少睡，误差不累积，帧率才真的贴着目标。
+                next_t += target
+                now2 = time.perf_counter()
+                if next_t <= now2:
+                    # 已经落后（偶发卡帧 / 刚改过帧率 / 刚从暂停恢复）：重锚到"现在"，
+                    # 别攒出一串要连补的帧 —— 那会让画面突然快放一段。
+                    next_t = now2
+                else:
+                    rest = next_t - now2
+                    if rest > 0.001:
+                        time.sleep(rest)
             except Exception as exc:      # 单帧异常不终止整个特效
                 # 偶发单帧异常（如改分辨率瞬间 DIB 正在重建）应当容忍，
                 # 但连续失败说明彻底坏了 —— 记日志并在熔断后干净退出，
@@ -934,39 +1015,19 @@ class App:
                     break
                 time.sleep(0.2)
 
-            ov_fs.pump()
-            ov_ms.pump()
-
-            # ---------------- 帧率控制与统计
-            cost = time.perf_counter() - t0
-            self.cost_ms = self.cost_ms * 0.9 + (cost * 1000.0) * 0.1
-            fps_ema = fps_ema * 0.92 + (1.0 / max(dt, 1e-4)) * 0.08
-            self.fps = fps_ema
-
-            target = 1.0 / max(20.0, min(144.0, float(cfg["fps"])))
-            # **按绝对时刻排程**，而不是"每帧睡 target − cost"。后者会把
-            # `time.sleep` 的过冲（Windows 上实测约 0.4~0.5ms，高精度定时器的
-            # 粒度）**逐帧累积**，60Hz 目标只能跑到 57.7 帧/秒 —— 明明算力只用
-            # 了 10.6ms/16.7ms，却因为每帧都白丢半毫秒而欠帧。绝对排程下这一帧
-            # 睡多了下一帧就自动少睡，误差不累积，帧率才真的贴着目标。
-            next_t += target
-            now2 = time.perf_counter()
-            if next_t <= now2:
-                # 已经落后（偶发卡帧 / 刚改过帧率 / 刚从暂停恢复）：重锚到"现在"，
-                # 别攒出一串要连补的帧 —— 那会让画面突然快放一段。
-                next_t = now2
-            else:
-                rest = next_t - now2
-                if rest > 0.001:
-                    time.sleep(rest)
-
+        # 正常出口（stop_evt / 熔断 break）走到这里。异常栈展开的出口由
+        # `_render_loop` 的 finally 兜底 —— 挂在 while 之后的清理代码在栈展开
+        # 时是不执行的，所以那边必须有一份（destroy 幂等，重复调用无害）。
         for ov in (ov_fs, ov_ms):
             try:
                 ov.u32[:] = 0
                 ov.present()
             except Exception:
                 pass
-            ov.destroy()
+            try:
+                ov.destroy()
+            except Exception:
+                pass          # 清理阶段抛异常会盖掉原始故障，绝不能
 
     def _ripple_color(self, hex_to_bgr):
         c = self.snapshot["ripple_color"]

@@ -30,6 +30,7 @@ FAST = [
     "_verify_ui_runtime.py",      # 面板运行时冒烟（8s）
     "_verify_ui_resize.py",       # 窗口可缩放 / 尺寸记忆 / 提示迁移（16s）
     "_verify_layer_skip.py",      # 层判空的安全不变量，无窗口（22s）
+    "_verify_render_guard.py",    # 渲染线程异常保护 + 三处 JSON 原子写（6s）
     "_verify_window_ripple.py",   # 窗口 = 水面活塞（事件流 / 物理 / 接线，无窗口，1s）
     "_verify_wave_draw.py",       # 水面上屏：查表着色 + 直写（1s）
     "_verify_startup_noflicker.py",  # 启动无闪动：构造期全程隐藏（1s）

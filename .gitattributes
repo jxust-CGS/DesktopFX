@@ -1,0 +1,7 @@
+# 启动器 .bat 必须是 CRLF。
+#   * cmd.exe 用系统 ANSI 代码页（中文 Windows 是 GBK/936）读 .bat；
+#   * LF 结尾时 `goto LABEL` 会报"找不到标签"，启动器彻底打不开。
+# 仓库里存 LF、检出时转成 CRLF —— 否则这份保证就落在每台开发机的全局
+# core.autocrlf 上：换一台 autocrlf 不是 true 的机器 clone，双击即闪退，
+# 而且 git 不会提示任何东西。硬性要求必须由仓库自己兜住。
+*.bat text eol=crlf
