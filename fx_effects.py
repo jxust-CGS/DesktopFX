@@ -4021,10 +4021,47 @@ def _font(name, px):
 
 
 # ------------------------------------------------------------ 点击特效的素材
-# 「点击表情」的两种图案来源：内置图案（代码画）与自定义图片（用户文件夹）。
+# 「点击表情」的图案来源，三种：
+#   内置图案   —— 代码画的 8 种形状，不依赖任何文件
+#   自选图片   —— 直接挑若干张图片文件（选一张就是"只用这一张"）
+#   图片文件夹 —— 整个目录，随机取图
 CLICK_SOURCE_BUILTIN = "内置图案"
-CLICK_SOURCE_CUSTOM = "自定义图片"
-CLICK_SOURCES = (CLICK_SOURCE_BUILTIN, CLICK_SOURCE_CUSTOM)
+CLICK_SOURCE_FILES = "自选图片"
+CLICK_SOURCE_FOLDER = "图片文件夹"
+CLICK_SOURCES = (CLICK_SOURCE_BUILTIN, CLICK_SOURCE_FILES, CLICK_SOURCE_FOLDER)
+# 早期版本只有"自定义图片"（= 从文件夹取图）。旧配置里存的这个值必须当成
+# 文件夹处理，否则升级后用户会看到设置莫名其妙回到"内置图案"。
+CLICK_SOURCE_LEGACY = "自定义图片"
+
+# 一次点击里怎么用这些素材
+CLICK_PICK_MULTI = "随机多图"       # 每颗粒子各自随机
+CLICK_PICK_ONE = "整簇同图"         # 一次点击只用同一张
+CLICK_PICKS = (CLICK_PICK_MULTI, CLICK_PICK_ONE)
+
+
+def normalize_source(value):
+    """来源值归一化（含把旧的「自定义图片」认成「图片文件夹」）。"""
+    s = str(value or "")
+    if s == CLICK_SOURCE_FILES:
+        return CLICK_SOURCE_FILES
+    if s in (CLICK_SOURCE_FOLDER, CLICK_SOURCE_LEGACY):
+        return CLICK_SOURCE_FOLDER
+    return CLICK_SOURCE_BUILTIN
+
+
+def click_source_target(cfg):
+    """配置 -> `(素材种类, 素材内容)`。
+
+    种类为空串表示"用内置图案"（也是任何未知取值的兜底）。把这层判断收在
+    一处：解码池要它、面板要它、测试要它，散在三个地方迟早对不上。
+    """
+    src = normalize_source(cfg.get("click_emoji_source", CLICK_SOURCE_BUILTIN))
+    if src == CLICK_SOURCE_FILES:
+        return "files", str(cfg.get("click_emoji_files", "") or "")
+    if src == CLICK_SOURCE_FOLDER:
+        return "folder", str(cfg.get("click_emoji_custom_dir", "") or "")
+    return "", ""
+
 
 _IMG_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp")
 # 音频只认 MCI 自带设备能放的那几种。flac / ogg / opus 在多数机器上装不上
@@ -4057,42 +4094,198 @@ def _scan_files(folder, exts):
     return out
 
 
-def _load_click_image(path, px):
-    """读一张图 -> 预乘 RGBA float32（与 `_build_shape` 同格式）。
+_FILES_TTL = 2.0                # 自选图片列表的缓存时长（秒，与音频同一套理由）
+_FILES_CACHE = {}
 
-    长边缩到 `px` 且**保持比例** —— 表情包里的图多是矩形，硬拉成正方形会
-    变形。任何一步失败都返回 None：文件夹里混进一个 0 字节文件、一个改了
-    后缀的网页图都是常事，不该让整池子作废。
+
+def scan_image_files(raw):
+    """把「自选图片」存的多行路径解析成**真实存在**的图片路径（不缓存）。
+
+    过滤掉已被删掉/改名的文件：用户存了 20 张、事后删了两张，剩下的 18 张
+    应该照常能用，而不是整批作废。
+
+    **解码池走这条不带缓存的路**：它在后台线程里跑，几十次 `isfile` 无所谓，
+    但要的是"用户刚删掉的那张下一批就不再出现"。带缓存的那份留给面板 ——
+    它每 200ms 问一次，不缓存就是每 200ms 几十次 stat。
+    """
+    raw = str(raw or "")
+    if not raw:
+        return []
+    out = []
+    for line in raw.replace("\r", "\n").split("\n"):
+        p = line.strip().strip('"').strip()
+        if p and p.lower().endswith(_IMG_EXTS):
+            try:
+                if os.path.isfile(p):
+                    out.append(p)
+            except OSError:
+                continue
+    return out
+
+
+def list_image_files(raw):
+    """同上，但带 2 秒缓存（面板每 200ms 一查，显示"已选 N 张图片"）。"""
+    raw = str(raw or "")
+    if not raw:
+        return []
+    now = time.monotonic()
+    hit = _FILES_CACHE.get(raw)
+    if hit is not None and now - hit[0] < _FILES_TTL:
+        return hit[1]
+    out = scan_image_files(raw)
+    if len(_FILES_CACHE) > 32:
+        _FILES_CACHE.clear()
+    _FILES_CACHE[raw] = (now, out)
+    return out
+
+
+def _frame_indexes(n, cap):
+    """从一个 n 帧的动图里挑出最多 `cap` 帧的下标（等间隔，**含首尾**）。
+
+    步长取 `(n-1)/(cap-1)` 而不是 `n/cap`：后者的最后一帧会落在 `n - n/cap`
+    上（24 帧抽 12 帧时是第 22 帧），**尾帧永远取不到** —— 而 GIF 的尾帧常常
+    正是"回到起始姿势"的那一帧，丢了会让循环看起来缺一拍。
+    """
+    n, cap = max(1, int(n)), max(1, int(cap))
+    if n <= cap:
+        return list(range(n))
+    if cap == 1:
+        return [0]                 # 只留一帧：取首帧（步长公式会除零）
+    step = (n - 1) / float(cap - 1)
+    out = []
+    for i in range(cap):
+        k = min(n - 1, int(round(i * step)))
+        if not out or out[-1] != k:
+            out.append(k)
+    return out
+
+
+def _frame_ms(im):
+    """取当前帧的显示时长（毫秒），夹到合理区间。
+
+    很多 GIF 把 `duration` 写成 0（含义是"越快越好"）；浏览器按 100ms 处理，
+    这里跟着这个约定 —— 否则一帧 0 秒会让动画瞬间跑完、看着像静态。
+    """
+    try:
+        d = float(im.info.get("duration", 0) or 0)
+    except Exception:
+        d = 0.0
+    if d <= 0.0:
+        d = 100.0
+    return min(max(d, 40.0), 1000.0)
+
+
+def _load_click_frames(path, px, max_frames=1):
+    """读一张图 -> `(帧列表, 每帧秒数)`，每帧都是预乘 RGBA float32。
+
+    **动图（GIF / WebP）会取出多帧**，所以返回值是列表而不是单张：静态图就是
+    长度为 1 的列表，调用方不必分支。
+
+    长边缩到 `px` 且**保持比例** —— 表情包里的图多是矩形，硬拉成正方形会变形。
+    任何一步失败都返回 None：文件夹里混进一个 0 字节文件、一个改了后缀的网页图
+    都是常事，不该让整池子作废。
     """
     if _PImage is None:
         return None
     try:
         im = _PImage.open(path)
-        im.seek(0)                  # GIF / 动图只取第一帧
-        im = im.convert("RGBA")
-        w, h = im.size
-        if w < 1 or h < 1:
-            return None
-        sc = float(max(8, int(px))) / float(max(w, h))
-        im = im.resize((max(1, int(round(w * sc))), max(1, int(round(h * sc)))),
-                       _LANCZOS)
+        n = int(getattr(im, "n_frames", 1) or 1)
+        frames, durs = [], []
+        for k in _frame_indexes(n, max_frames):
+            # seek 之后再 convert：PIL 的 GIF 解码器在 seek 时就完成了帧合成
+            # （局部更新 / dispose 都已处理），所以 convert 拿到的是完整画面。
+            im.seek(k)
+            durs.append(_frame_ms(im))
+            fr = im.convert("RGBA")
+            w, h = fr.size
+            if w < 1 or h < 1:
+                return None
+            sc = float(max(8, int(px))) / float(max(w, h))
+            fr = fr.resize((max(1, int(round(w * sc))),
+                            max(1, int(round(h * sc)))), _LANCZOS)
+            arr = np.asarray(fr).astype(np.float32) * (1.0 / 255.0)
+            arr[..., :3] *= arr[..., 3:4]       # 直通 alpha -> 预乘
+            frames.append(np.ascontiguousarray(arr))
     except Exception:
         return None
-    arr = np.asarray(im).astype(np.float32) * (1.0 / 255.0)
-    arr[..., :3] *= arr[..., 3:4]           # 直通 alpha -> 预乘
-    return np.ascontiguousarray(arr)
+    if not frames:
+        return None
+    # 抽帧必须**补偿帧时长**：抽掉一半的帧、剩下的就该慢一倍，整段动画的总
+    # 时长才与原来的 GIF 一致。漏掉这一步的表现是"大动图播起来快得看不清"
+    # —— 而小动图（帧数没超上限、没抽帧）完全正常，很容易被当成"那张图本身
+    # 就快"。所以按 `原始帧数 / 实抽帧数` 放大。
+    step = n / float(len(frames)) if frames else 1.0
+    return frames, max(0.04, sum(durs) / len(durs) / 1000.0 * step)
+
+
+class ClickSpriteSet:
+    """一套可上屏的表情包素材：把"每张图可能有若干帧"统一成**扁平帧表**。
+
+    做成对象而不是 list，是因为绘制端每颗粒子每帧都要问"我这张图现在该画第
+    几帧"：扁平表 + 三个定长数组，取帧就是两次数组索引；换成 list-of-dict 会
+    变成每帧几十次字典查找（40 颗粒子 × 60 帧/秒）。
+
+    动画**整簇共用一个时间轴**（`_BurstEngine._anim_t` 一路累加），各资源按
+    自己的帧数取模 —— 于是"8 帧的 GIF"和"20 帧的 GIF"混在同一簇里，也能各按
+    各的节奏循环。
+
+    `__len__` 是**资源数**（一张图算一个），不是帧数：粒子的 `spr_id` 指的是
+    "第几张图"。空集合时 `len() == 0`，因此 `if sprites:` 照常可用。
+    """
+
+    def __init__(self, res=()):
+        """`res` = `[(帧列表, 每帧秒数), ...]`，每个元素是一张图。"""
+        self.frames = []
+        n = len(res)
+        self.starts = np.zeros(n, np.int32)
+        self.counts = np.ones(n, np.int32)
+        # **必须是 float64。** 帧号是 `int(t / dur)`，而 float32 存不下 0.1
+        # （最接近的是 0.10000000149）：`0.1 / float32(0.1)` = 0.99999998，
+        # `int()` 截断成 0 —— 每一帧的边界处都会少走一帧。单次看只差一个
+        # 浮点 epsilon，但 `t` 是长时间累加的，误差会随循环次数一点点累积
+        # （跑到几千秒时动画节拍会明显不齐）。
+        self.durs = np.ones(n, np.float64)
+        for j, (frames, dur) in enumerate(res):
+            self.starts[j] = len(self.frames)
+            self.counts[j] = len(frames)
+            self.durs[j] = max(0.04, float(dur))
+            self.frames.extend(frames)
+        self.animated = int((self.counts > 1).sum())
+
+    def __len__(self):
+        return int(self.starts.size)
+
+    def __bool__(self):
+        return bool(self.frames)
+
+    def nbytes(self):
+        return sum(f.nbytes for f in self.frames)
+
+    def frame_at(self, j, t):
+        """第 `j` 张图在时刻 `t`（秒）该显示的那一帧。"""
+        st = int(self.starts[j])
+        n = int(self.counts[j])
+        if n <= 1:
+            return self.frames[st]
+        return self.frames[st + (int(t / float(self.durs[j])) % n)]
 
 
 class ClickImagePool:
-    """自定义表情包的图库：扫文件夹 -> 解码 -> 存成能直接上屏的精灵。
+    """自定义表情包的图库：拿到路径 -> 解码 -> 存成能直接上屏的精灵。
 
     两条硬约束决定了它的形状：
 
     * **解码绝不能进渲染线程。** 一张 2000×2000 的 JPG 解码 + 缩放要几十
-      毫秒，放在 `update()` 里就是"每次点击掉一帧"。所以扫描与解码跑在一条
-      后台线程上，渲染端只读**已经就绪**的那一份精灵表。
-    * **文件夹可能有几千张。** 先按文件名排序、再**随机打乱**取前
-      `MAX_FILES` 张：不洗牌的话用户永远只见到文件名靠前的那几十张。
+      毫秒，动图还要乘以帧数，放在 `update()` 里就是"每次点击掉一帧"。所以
+      扫描与解码跑在一条后台线程上，渲染端只读**已经就绪**的那一份精灵表。
+    * **素材可能很多。** 文件夹可能有几千张，动图每张又有多帧：前者先按
+      文件名排序、再**随机打乱**取前 `MAX_FILES` 张（不洗牌的话用户永远只
+      见到文件名靠前的那几十张），后者按 `MAX_ANIM_FRAMES` 抽帧、整池子再
+      受 `MAX_TOTAL_BYTES` 约束。
+
+    两种来源走同一条流水线，只是"候选路径怎么来"不同：
+    `folder` = 扫目录（顺序打乱），`files` = 用户自己挑的那几张（**顺序保留**，
+    那是他一张张选出来的意图）。
 
     每张图存 `SIZE_STEPS` 档尺寸，粒子直接从池里随机取条目 —— "图随机"与
     "大小随机"于是统一成一件事（不需要再给粒子单独做位图缩放）。
@@ -4104,27 +4297,37 @@ class ClickImagePool:
 
     MAX_FILES = 64
     SIZE_STEPS = (0.74, 1.0)
+    # 单个动图最多抽这么多帧：帧数直接乘进内存与解码时间，而点击特效的粒子
+    # 只有二三十像素，超过十几帧的差别肉眼已经看不出来。
+    MAX_ANIM_FRAMES = 12
+    # 整池子的帧数据预算（24MB）。按**字节**而不是按帧数封顶：同一张图在
+    # 64px 目标尺寸下的单帧内存是 40px 的 2.6 倍，"多少帧"这个数字单独看
+    # 没有意义。
+    MAX_TOTAL_BYTES = 24 << 20
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._want = None           # 待处理的 (folder, px)
-        self._dir = ""              # 已完成的 (folder, px)
-        self._px = 0
-        self._sprites = []          # 只整体替换，从不就地改
-        self._files = 0             # 上次扫到的可用文件数
+        self._want = None           # 待处理的 (kind, src, px)
+        self._done = None           # 已完成的 (kind, src, px)
+        self._sprites = ClickSpriteSet()    # 只整体替换，从不就地改
+        self._files = 0             # 上次可用的图片数
         self._failed = 0            # 解码失败个数（面板会显示，别静默）
         self._rng = random.Random(0x5F3C14)
         self._thread = None
         self._wake = threading.Event()
 
     # ---------------------------------------------------------- 渲染线程侧
-    def configure(self, folder, px):
-        """登记"我要用这个文件夹、这个尺寸"。重复登记是**零成本**的。
+    @staticmethod
+    def _job(kind, src, px):
+        return (str(kind or ""), str(src or ""), max(8, int(px)))
+
+    def configure(self, kind, src, px):
+        """登记"我要用这批素材、这个尺寸"。重复登记是**零成本**的。
 
         每次 `update` 都会调它（拖动"大小"滑块时每帧都在变），所以这里
         只做一次比较、一次赋值 —— 真正的重建由 worker 去合并执行。
         """
-        job = (str(folder or ""), max(8, int(px)))
+        job = self._job(kind, src, px)
         with self._lock:
             if job == self._want:
                 return
@@ -4133,43 +4336,46 @@ class ClickImagePool:
         self._wake.set()
 
     def sprites(self):
-        """当前可用的精灵快照（list，元素是预乘 RGBA 数组）。空 = 还没就绪。"""
+        """当前可用的素材快照（`ClickSpriteSet`）。空 = 还没就绪。"""
         with self._lock:
             return self._sprites
 
     def stats(self):
-        """(精灵条目数, 扫到的文件数, 解码失败数)。"""
+        """(素材条目数, 可用图片数, 解码失败数)。"""
         with self._lock:
             return len(self._sprites), self._files, self._failed
 
-    def state(self, folder):
+    def state(self, kind, src, px):
         """给面板的一句话状态。
 
-        `done` 必须比较**整个 job**（文件夹 + 尺寸）而不是只看文件夹：用户
-        拖「大小」滑块时尺寸每帧都在变，"文件对了"并不代表这一批就是用当前
+        `done` 必须比较**整个 job**（种类 + 来源 + 尺寸）而不是只看路径：用户
+        拖「大小」滑块时尺寸每帧都在变，"路径对了"并不代表这一批就是用当前
         尺寸做的。
         """
+        job = self._job(kind, src, px)
         with self._lock:
-            n, files, failed = len(self._sprites), self._files, self._failed
-            done = (self._want is not None and self._want == (self._dir, self._px))
-        if not folder:
+            sp, files, failed = self._sprites, self._files, self._failed
+            done = (self._done == job)
+        if not kind or not str(src or "").strip():
             return ""
         if not done:
             return "读取中…"
         if files == 0:
             return "没找到图片"
-        out = "已载入 %d 张" % n
+        out = "已载入 %d 张" % len(sp)
+        if sp.animated:
+            out += "（%d 张动图）" % sp.animated
         if failed:
-            out += "（%d 张读不了）" % failed
+            out += "，%d 张读不了" % failed
         return out
 
     def clear(self):
-        """丢掉现有素材并停止装载（换文件夹时由 configure 直接覆盖，这是
+        """丢掉现有素材并停止装载（换来源时由 configure 直接覆盖，这是
         给"清空"和测试用的）。"""
         with self._lock:
             self._want = None
-            self._dir, self._px = "", 0
-            self._sprites = []
+            self._done = None
+            self._sprites = ClickSpriteSet()
             self._files = 0
             self._failed = 0
         self._wake.set()
@@ -4189,8 +4395,7 @@ class ClickImagePool:
             self._wake.wait(0.5)
             self._wake.clear()
             with self._lock:
-                job = self._want
-                done = (self._dir, self._px)
+                job, done = self._want, self._done
             if job is None or job == done:
                 continue
             # **绝不能把异常漏出去**：pythonw 下后台线程死掉连 traceback 都
@@ -4202,28 +4407,42 @@ class ClickImagePool:
                 pass
 
     def _load(self, job):
-        folder, px = job
-        paths = _scan_files(folder, _IMG_EXTS)
-        self._rng.shuffle(paths)
-        out = []
+        kind, src, px = job
+        if kind == "files":
+            # 不走面板那份缓存：用户刚删掉的那张，下一批就不该再出现
+            paths = scan_image_files(src)
+        else:
+            paths = _scan_files(src, _IMG_EXTS)
+            # 目录里的东西是"随机素材"，洗牌才有意义；自选的那几张保持原序。
+            self._rng.shuffle(paths)
+        out, used = [], 0
         for p in paths[:self.MAX_FILES]:
             if not self._wanted(job):
-                return              # 用户改过文件夹/尺寸，这一批作废
+                return              # 用户改过素材/尺寸，这一批作废
+            if used >= self.MAX_TOTAL_BYTES:
+                break               # 预算用尽：保留已经装好的那部分
             ok = False
             for sc in self.SIZE_STEPS:
-                spr = _load_click_image(p, int(round(px * sc)))
-                if spr is not None:
-                    ok = True
-                    out.append(spr)
+                got = _load_click_frames(p, int(round(px * sc)),
+                                         self.MAX_ANIM_FRAMES)
+                if got is None:
+                    continue
+                frames, dur = got
+                need = sum(f.nbytes for f in frames)
+                if used + need > self.MAX_TOTAL_BYTES and out:
+                    break
+                used += need
+                out.append((frames, dur))
+                ok = True
             if not ok:
                 # 按**文件**计数而不是按档位：同一个坏文件会在两档上各失败
                 # 一次，显示成"2 张读不了"会让用户去找并不存在的第二张。
                 with self._lock:
                     self._failed += 1
         with self._lock:
-            self._dir, self._px = job
-            self._sprites = out
-            self._files = len(paths)
+            self._done = job
+            self._sprites = ClickSpriteSet(out)
+            self._files = min(len(paths), self.MAX_FILES)
 
     def _wanted(self, job):
         with self._lock:
@@ -4264,6 +4483,18 @@ def list_audio(folder):
 def count_audio(folder):
     """文件夹里有多少个可播放的音频。"""
     return len(list_audio(folder))
+
+
+def invalidate_media_cache():
+    """让"目录/文件列表"的缓存立刻失效。
+
+    面板上的**选择 / 清除动作**之后要调它：列表带 2 秒 TTL（那是为了别每
+    200ms 扫一次盘），但用户刚点完"清除"却还看到"已选 3 张"，会以为按钮
+    没生效。人主动做的事应当立刻看到结果，只有"他在资源管理器里改了文件、
+    程序自己去发现"那种情况才值得等 TTL。
+    """
+    _FILES_CACHE.clear()
+    _AUDIO_CACHE.clear()
 
 
 # 文件名开头的音轨号：「01 你好」「12_再见」「3. 走起」-> 去掉序号。
@@ -4450,6 +4681,11 @@ class _BurstEngine:
         self.rgb = np.zeros((n, 3), np.float32)
         # 自定义表情包模式下每颗粒子指向外部精灵表的下标（内置图案模式恒 0）
         self.spr_id = np.zeros(n, np.int32)
+        # 外部素材（动图）共用的动画时间轴。它在有粒子时一路累加，各张图按
+        # 自己的帧数取模 —— 于是"8 帧的 GIF"和"20 帧的 GIF"混在一簇里也能
+        # 各按各的节奏循环。不做成"每颗粒子各自的相位"是因为那样得为每个
+        # 粒子再加一个时间数组；而同一次点击的粒子本来就该看起来整齐。
+        self._anim_t = 0.0
         self.count = 0              # 已用槽位数（紧凑存放，死掉的会被换到前面）
 
     def active(self):
@@ -4525,6 +4761,9 @@ class _BurstEngine:
             return
         n = self.count
         sl = slice(0, n)
+        # 取模是为了长时间运行后不让浮点精度掉到帧间隔以下（连开几天才会遇到，
+        # 但那时症状是"动图突然卡成静帧"，极难查）。
+        self._anim_t = (self._anim_t + dt) % 3600.0
         self.t[sl] += dt
         if getattr(self, "_gravity", 0.0):
             self.vy[sl] += 260.0 * dt
@@ -4553,10 +4792,12 @@ class _BurstEngine:
         `tint` 非空时整簇用同一个颜色（点击表情的"主色"模式）。
         `imgs` 非空时改用**外部精灵表**（自定义表情包）：每颗粒子按
         `spr_id` 取自己那一张，图案与颜色都不再参与 —— 这条路径下精灵是
-        矩形（用户图片保持原比例），所以裁剪必须**分别**取宽与高。
+        矩形（用户图片保持原比例），所以裁剪必须**分别**取宽与高。若它是
+        `ClickSpriteSet`（有动图），还会按 `_anim_t` 取当前该显示的那一帧。
         """
         if self.count == 0 or opacity <= 0.004:
             return
+        anim = imgs if isinstance(imgs, ClickSpriteSet) else None
         n_img = len(imgs) if imgs is not None else 0
         for i in range(self.count):
             t = float(self.t[i])
@@ -4574,7 +4815,10 @@ class _BurstEngine:
                 j = int(self.spr_id[i])
                 if j < 0 or j >= n_img:
                     continue
-                spr = imgs[j]
+                # 动图按共用时间轴取帧；静态素材就是它本身（`frame_at` 里
+                # `counts == 1` 那条分支，等于直接返回）。
+                spr = anim.frame_at(j, self._anim_t) if anim is not None \
+                    else imgs[j]
             else:
                 r, g, b = (self.rgb[i] if tint is None else tint)
                 hexc = "#%02X%02X%02X" % (int(r), int(g), int(b))
@@ -4718,7 +4962,11 @@ class ClickEmojiField:
             life=float(cfg.get("click_emoji_life", 1.1)))
 
     def _spawn_custom(self, cfg, sprites):
-        """自定义表情包：每颗粒子随机挑一张图。
+        """自定义表情包：按「单次选择」决定这一簇怎么取图。
+
+        * 随机多图 —— 每颗粒子各自随机（热闹，但一次点击里花样多）；
+        * 整簇同图 —— 一次点击只用同一张（看得清这张图本身，动图尤其明显：
+          十几个粒子同步播同一段动画，而不是各演各的）。
 
         不自旋、不做尺寸抖动 —— 图片精灵不是矢量，两者都要重采样；而"图
         随机 × 池子里两档尺寸"本来就提供了同样的视觉变化，白付那笔账不划算。
@@ -4727,6 +4975,11 @@ class ClickEmojiField:
                            self.engine.MAX))
         if count <= 0:
             return
+        n = len(sprites)
+        if str(cfg.get("click_emoji_pick", CLICK_PICK_MULTI)) == CLICK_PICK_ONE:
+            ids = np.full(count, int(self.rng.integers(0, n)), np.int32)
+        else:
+            ids = self.rng.integers(0, n, count)
         self.engine.spawn(
             self._mx, self._my, "", [(255, 255, 255)],
             count=count,
@@ -4736,18 +4989,18 @@ class ClickEmojiField:
             rotate=False,
             life=float(cfg.get("click_emoji_life", 1.1)),
             size_jitter=0.0,
-            spr_ids=self.rng.integers(0, len(sprites), count))
+            spr_ids=ids)
         self._imgs = sprites
 
     def update(self, dt, cfg):
         dt = min(max(float(dt), 0.0), 0.05)
         clicked = self._clicked
         self._clicked = 0
-        custom = (str(cfg.get("click_emoji_source", CLICK_SOURCE_BUILTIN))
-                  == CLICK_SOURCE_CUSTOM)
+        kind, src = click_source_target(cfg)
+        custom = bool(kind)
         if custom:
             # 只登记需求：解码在后台线程做，这里是一次比较的代价。
-            CLICK_IMAGE_POOL.configure(cfg.get("click_emoji_custom_dir", ""),
+            CLICK_IMAGE_POOL.configure(kind, src,
                                        float(cfg.get("click_emoji_size", 22)))
         if clicked:
             sprites = CLICK_IMAGE_POOL.sprites() if custom else None

@@ -46,7 +46,8 @@ def _ecfg(**over):
                click_emoji_color="#FF6B8E", click_emoji_gravity=1.0,
                click_emoji_rotate=True, click_emoji_opacity=1.0,
                click_emoji_source=F.CLICK_SOURCE_BUILTIN,
-               click_emoji_custom_dir="")
+               click_emoji_files="", click_emoji_custom_dir="",
+               click_emoji_pick=F.CLICK_PICK_MULTI)
     cfg.update(over)
     return cfg
 
@@ -918,15 +919,25 @@ def _mk_img_folder(wide=(300, 30), tall=(30, 300)):
     return folder
 
 
-def _wait_pool(folder, timeout=20.0):
-    """等后台解码完成（真的完成，不是"有个数"而已）。"""
+def _wait_pool_at(src, px, kind="folder", timeout=10.0):
+    """等后台把这一批素材解完（判据用**完整状态**，不是"有个数就行"）。
+
+    ⚠️ `px` 必须与 `configure` 时传的**完全一致**：状态是按整个 job（种类 +
+    来源 + 尺寸）比对的，尺寸写错就永远停在"读取中…"、白等到超时 —— 而这种
+    错**不会让任何断言失败**，只是让脚本悄悄慢上二十秒。默认 10 秒超时就是为了
+    让这类错误不至于太贵。
+    """
     t0 = time.time()
     while time.time() - t0 < timeout:
-        st = F.CLICK_IMAGE_POOL.state(folder)
+        st = F.CLICK_IMAGE_POOL.state(kind, src, px)
         if st and st != "读取中…":
             return st
         time.sleep(0.05)
-    return F.CLICK_IMAGE_POOL.state(folder)
+    return F.CLICK_IMAGE_POOL.state(kind, src, px)
+
+
+def _wait_pool(folder, timeout=10.0):
+    return _wait_pool_at(folder, 40, "folder", timeout)
 
 
 def test_custom_image_pool():
@@ -934,7 +945,7 @@ def test_custom_image_pool():
     folder = _mk_img_folder()
     pool = F.CLICK_IMAGE_POOL
     pool.clear()
-    pool.configure(folder, 40)
+    pool.configure("folder", folder, 40)
     st = _wait_pool(folder)
     n, files, failed = pool.stats()
     pool.clear()
@@ -956,12 +967,12 @@ def test_custom_image_sprite_format():
     folder = _mk_img_folder()
     pool = F.CLICK_IMAGE_POOL
     pool.clear()
-    pool.configure(folder, 40)
+    pool.configure("folder", folder, 40)
     _wait_pool(folder)
     sprites = pool.sprites()
-    shapes = sorted({s.shape for s in sprites})
+    shapes = sorted({s.shape for s in sprites.frames})
     bad = []
-    for s in sprites:
+    for s in sprites.frames:
         if s.dtype != np.float32 or s.ndim != 3 or s.shape[2] != 4:
             bad.append(s.shape)
         elif not bool((s[..., :3] <= s[..., 3:4] + 1e-6).all()):
@@ -973,10 +984,10 @@ def test_custom_image_sprite_format():
     if bad:
         return False, f"精灵格式不对：{bad[:3]}"
     # 长边必须落在「目标尺寸 × 尺寸档」上，且矩形保持原比例
-    longs = sorted({max(s.shape[0], s.shape[1]) for s in sprites})
+    longs = sorted({max(s.shape[0], s.shape[1]) for s in sprites.frames})
     ratios = sorted({round(max(s.shape[0], s.shape[1])
                            / max(1, min(s.shape[0], s.shape[1])), 1)
-                     for s in sprites})
+                     for s in sprites.frames})
     if longs != [30, 40]:
         return False, f"长边档位 {longs}（期望 [30, 40] = 40×0.74 / 40×1.0）"
     if max(ratios) < 5.0:
@@ -998,8 +1009,8 @@ def test_custom_image_rect_not_clipped():
     folder = _mk_img_folder(wide=(300, 30), tall=None)
     pool = F.CLICK_IMAGE_POOL
     pool.clear()
-    pool.configure(folder, 60)
-    _wait_pool(folder)
+    pool.configure("folder", folder, 60)
+    _wait_pool_at(folder, 60)          # 尺寸必须与上面 configure 的一致
     sprites = pool.sprites()
     if not sprites:
         pool.clear()
@@ -1007,9 +1018,10 @@ def test_custom_image_rect_not_clipped():
         return False, "图库没载进来，无法判断"
     # 每张图有两个尺寸档，粒子取哪一档是随机的 —— 参照系取**整张表**，
     # 别拿 `sprites[0]`：那是洗过牌的顺序，与这一簇实际用到的那张未必同一档。
-    sizes = sorted({(int(s.shape[1]), int(s.shape[0])) for s in sprites})
+    sizes = sorted({(int(s.shape[1]), int(s.shape[0]))
+                     for s in sprites.frames})
 
-    cfg = _ecfg(click_emoji_source=F.CLICK_SOURCE_CUSTOM,
+    cfg = _ecfg(click_emoji_source=F.CLICK_SOURCE_FOLDER,
                 click_emoji_custom_dir=folder, click_emoji_count=8.0,
                 click_emoji_size=60.0, click_emoji_spread=0.0,
                 click_emoji_gravity=0.0, click_emoji_life=2.0)
@@ -1044,9 +1056,9 @@ def test_custom_image_fallback():
     empty = tempfile.mkdtemp(prefix="fx_click_empty_")
     pool = F.CLICK_IMAGE_POOL
     pool.clear()
-    pool.configure(empty, 40)
+    pool.configure("folder", empty, 40)
     st = _wait_pool(empty)
-    cfg = _ecfg(click_emoji_source=F.CLICK_SOURCE_CUSTOM,
+    cfg = _ecfg(click_emoji_source=F.CLICK_SOURCE_FOLDER,
                 click_emoji_custom_dir=empty, click_emoji_count=12.0,
                 click_emoji_spread=200.0)
     f = ClickEmojiField(W, H)
@@ -1060,11 +1072,11 @@ def test_custom_image_fallback():
     f2 = ClickEmojiField(W, H)
     f2.set_pointer(W * 0.5, H * 0.5, 1)
     buf2 = np.zeros(W * H, np.uint32)
-    f2.update(1.0 / 60.0, _ecfg(click_emoji_source=F.CLICK_SOURCE_CUSTOM,
+    f2.update(1.0 / 60.0, _ecfg(click_emoji_source=F.CLICK_SOURCE_FOLDER,
                                 click_emoji_custom_dir="/no/such/dir",
                                 click_emoji_spread=200.0))
     for _ in range(4):
-        f2.update(1.0 / 60.0, _ecfg(click_emoji_source=F.CLICK_SOURCE_CUSTOM,
+        f2.update(1.0 / 60.0, _ecfg(click_emoji_source=F.CLICK_SOURCE_FOLDER,
                                     click_emoji_custom_dir="/no/such/dir",
                                     click_emoji_spread=200.0))
     f2.draw(buf2, W, H, _ecfg(click_emoji_spread=200.0))
@@ -1377,6 +1389,383 @@ def test_text_voice_off_is_independent():
     return True, "关闭统一时文字按 甲→乙→丙→甲 轮换，且不指定音频"
 
 
+# ------------------------------------------------- 9. 动图素材（GIF 要动起来）
+def _center_color(spr):
+    """精灵正中那个像素的不透明颜色（用来判断"现在是哪一帧"）。"""
+    h, w = spr.shape[0], spr.shape[1]
+    px = spr[h // 2, w // 2]
+    a = float(px[3])
+    if a <= 0.01:
+        return None
+    return tuple(int(round(float(v) * 255.0 / a)) for v in px[:3])
+
+
+def _mk_gif(path, n=24, px=80, dur=100,
+            colors=((255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0))):
+    """造一张多帧 GIF（每帧一个纯色，方便按颜色判断"现在是第几帧"）。"""
+    from PIL import Image
+    frames = [Image.new("RGB", (px, px), colors[i % len(colors)])
+              for i in range(n)]
+    frames[0].save(path, save_all=True, append_images=frames[1:],
+                   duration=dur, loop=0)
+    return path
+
+
+def test_frame_indexes_spread():
+    """抽帧下标：等间隔、**含首尾**、够用时不抽。
+
+    判据写成**性质**（长度 / 首尾 / 严格递增 / 间隔均匀）而不是某个写死的
+    序列 —— 写死序列等于把实现抄进测试，实现改了测试跟着改，什么都守不住。
+    """
+    for n, cap in ((24, 12), (100, 10), (13, 7), (3, 12), (1, 12), (12, 12)):
+        want = min(n, cap)
+        got = F._frame_indexes(n, cap)
+        if len(got) != want:
+            return False, f"{n} 帧抽 {cap} 档得到 {len(got)} 个（期望 {want}）"
+        if got != sorted(set(got)):
+            return False, f"{n}->{cap} 有重复或乱序：{got}"
+        if got[0] != 0:
+            return False, f"{n}->{cap} 没从第 0 帧开始：{got}"
+        if got[-1] != n - 1:
+            return False, (f"{n}->{cap} 的尾帧是 {got[-1]}，应当是 {n - 1}"
+                           f"（尾帧常是「回到起始姿势」那帧，丢了循环会缺一拍）")
+        if len(got) > 2:
+            gaps = [got[i + 1] - got[i] for i in range(len(got) - 1)]
+            if max(gaps) > 2 * min(gaps):
+                return False, f"{n}->{cap} 的间隔不均匀：{gaps}"
+    # 上限为 1 的特例：首尾不可能兼得，取首帧，且不能除零
+    if F._frame_indexes(8, 1) != [0]:
+        return False, "只留一帧时应当取首帧"
+    return True, "6 组帧数都是等间隔、含首尾、无重复；不超上限时原样返回"
+
+
+def test_gif_decodes_all_frames():
+    """GIF 解出多帧，静态图仍是单帧。"""
+    folder = tempfile.mkdtemp(prefix="fx_gif_")
+    try:
+        gif = _mk_gif(os.path.join(folder, "a.gif"), n=6, dur=100)
+        png = os.path.join(folder, "b.png")
+        from PIL import Image
+        Image.new("RGBA", (60, 60), (255, 0, 0, 255)).save(png)
+        got_gif = F._load_click_frames(gif, 40, 12)
+        got_png = F._load_click_frames(png, 40, 12)
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+    if got_gif is None or got_png is None:
+        return False, "解码失败"
+    frames, _dur = got_gif
+    if len(frames) != 6:
+        return False, f"6 帧的 GIF 只解出 {len(frames)} 帧"
+    if len(got_png[0]) != 1:
+        return False, f"静态图解出 {len(got_png[0])} 帧"
+    # 每帧都得是合法的预乘 RGBA
+    for k, fr in enumerate(frames):
+        if fr.dtype != np.float32 or fr.shape[2] != 4:
+            return False, f"第 {k} 帧格式不对：{fr.dtype} {fr.shape}"
+        if not bool((fr[..., :3] <= fr[..., 3:4] + 1e-6).all()):
+            return False, f"第 {k} 帧不是预乘"
+    return True, f"6 帧的 GIF -> 6 帧精灵；静态图 -> 1 帧；每帧都是预乘 float32 RGBA"
+
+
+def test_gif_frame_duration_compensated():
+    """**抽帧必须补偿帧时长**：整段动画的总时长要跟原 GIF 一致。
+
+    漏掉这一步的表现是"大动图播起来快得看不清"，而小动图（没抽帧）完全正常
+    —— 很容易被当成"那张图本身就快"。判据用总时长而不是单帧时长：单帧时长
+    在没抽帧时也等于原值，测不出补偿有没有做。
+    """
+    folder = tempfile.mkdtemp(prefix="fx_gifdur_")
+    try:
+        big = _mk_gif(os.path.join(folder, "big.gif"), n=24, dur=100)   # 2.4s
+        small = _mk_gif(os.path.join(folder, "small.gif"), n=3, dur=100)  # 0.3s
+        fr_big, dur_big = F._load_click_frames(big, 40, 12)
+        fr_small, dur_small = F._load_click_frames(small, 40, 12)
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+    total_big = len(fr_big) * dur_big
+    total_small = len(fr_small) * dur_small
+    if len(fr_big) != 12:
+        return False, f"24 帧的应当抽成 12 帧，实得 {len(fr_big)}"
+    if abs(total_big - 2.4) > 0.35:
+        return False, (f"抽帧后总时长 {total_big:.2f}s（原 2.40s）—— "
+                       f"每帧 {dur_big:.3f}s 没按抽帧比例放大")
+    if abs(total_small - 0.3) > 0.06:
+        return False, (f"没超上限的动图不该改时长：{total_small:.2f}s vs 0.30s")
+    if not (0.15 < dur_big < 0.25):
+        return False, f"抽一半之后每帧应当是 ~0.2s，实得 {dur_big:.3f}s"
+    return True, (f"24 帧抽成 12 帧后每帧 {dur_big:.2f}s、总时长 {total_big:.2f}s"
+                  f"（原 2.40s）；3 帧的 {total_small:.2f}s 未被改动")
+
+
+def test_sprite_set_frames_cycle():
+    """`ClickSpriteSet` 按时间取帧：动图循环、静态恒定、长度是"图数"。"""
+    folder = tempfile.mkdtemp(prefix="fx_set_")
+    try:
+        gif = _mk_gif(os.path.join(folder, "a.gif"), n=4, dur=100)
+        png = os.path.join(folder, "b.png")
+        from PIL import Image
+        Image.new("RGBA", (50, 50), (0, 0, 0, 255)).save(png)
+        fr, dur = F._load_click_frames(gif, 40, 12)
+        p1, d1 = F._load_click_frames(png, 40, 12)
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+    ss = F.ClickSpriteSet([(fr, dur), (p1, d1)])
+    if len(ss) != 2:
+        return False, f"len 应当是图数 2，实得 {len(ss)}"
+    if len(ss.frames) != len(fr) + 1:
+        return False, f"帧总数 {len(ss.frames)} != {len(fr)} + 1"
+    if ss.animated != 1:
+        return False, f"动图计数应当是 1，实得 {ss.animated}"
+    if not ss:
+        return False, "非空集合判成假"
+    if F.ClickSpriteSet([]):
+        return False, "空集合判成真（回退逻辑会失效）"
+
+    # 动图：一个周期内应当把每一帧都走到。
+    # 判据用**颜色**而不是 `id()`：id 会被临时对象复用（实测同一时刻两次
+    # 调用可能给出同一个地址），而"画面上换没换"本来就是颜色的事。
+    got = {_center_color(ss.frame_at(0, k * dur)) for k in range(len(fr))}
+    if len(got) != len(fr):
+        return False, f"一个周期内只走到 {len(got)} 种画面（共 {len(fr)} 帧）"
+    # 循环：走过一整圈之后回到第一帧
+    if _center_color(ss.frame_at(0, 0.0)) != \
+            _center_color(ss.frame_at(0, dur * len(fr))):
+        return False, "动图没有循环回到第一帧"
+    # 静态资源：任意时刻都是同一张
+    if len({_center_color(ss.frame_at(1, t / 10.0)) for t in range(40)}) != 1:
+        return False, "静态素材的帧在变"
+    return True, (f"{len(ss)} 张图 / {len(ss.frames)} 帧；动图一个周期走到 "
+                  f"{len(fr)} 帧后循环回起点，静态素材恒定")
+
+
+def test_animated_sprite_moves_on_screen():
+    """**核心**：动图上屏后画面要逐帧变 —— 这是"GIF 会动"唯一的判据。
+
+    素材只放一个 GIF、粒子不动（扩散与重力都是 0），于是画面里唯一会变的就
+    只剩动画帧本身。取正中那个像素按时间采样：只出现一种颜色就说明"没动"
+    （`_anim_t` 没推进，或 `frame_at` 永远返回第 0 帧）。
+    """
+    folder = tempfile.mkdtemp(prefix="fx_animscreen_")
+    try:
+        _mk_gif(os.path.join(folder, "spin.gif"), n=8, px=80, dur=100)
+        pool = F.CLICK_IMAGE_POOL
+        pool.clear()
+        pool.configure("folder", folder, 48)
+        st = _wait_pool_at(folder, 48)
+        if not st.startswith("已载入"):
+            pool.clear()
+            return False, f"素材没载入：{st!r}"
+        cfg = _ecfg(click_emoji_source=F.CLICK_SOURCE_FOLDER,
+                    click_emoji_custom_dir=folder, click_emoji_count=1.0,
+                    click_emoji_size=48.0, click_emoji_spread=0.0,
+                    click_emoji_gravity=0.0,                     click_emoji_life=10.0,
+                    click_emoji_pick=F.CLICK_PICK_ONE)
+        f = ClickEmojiField(W, H)
+        f.set_pointer(W * 0.5, H * 0.5, 1)
+        f.update(1.0 / 60.0, cfg)
+        seen = []
+        for _ in range(40):
+            f.update(0.05, cfg)
+            buf = np.zeros(W * H, np.uint32)
+            f.draw(buf, W, H, cfg)
+            shot = buf.reshape(H, W)[H // 2, W // 2]
+            if int(shot >> np.uint32(24)) & 0xFF:
+                seen.append(int(shot & 0xFFFFFF))
+        moved = len(set(seen))
+        pool.clear()
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+    if not seen:
+        return False, "动图素材一个像素都没上屏"
+    if moved < 2:
+        return False, (f"40 次采样只出现 {moved} 种颜色 —— 画面上没动，"
+                       f"GIF 被当成静图了")
+    return True, (f"帧时长 0.1s / 采样间隔 0.05s：40 次采样出现 {moved} 种颜色"
+                  f"（隔帧切换，判据成立）")
+
+
+def test_animated_flag_in_state():
+    """素材状态要报告动图张数，否则用户不知道 GIF 有没有被认出来。"""
+    folder = tempfile.mkdtemp(prefix="fx_animstate_")
+    try:
+        _mk_gif(os.path.join(folder, "a.gif"), n=6, px=40, dur=100)
+        from PIL import Image
+        Image.new("RGBA", (40, 40), (255, 0, 0, 255)).save(
+            os.path.join(folder, "b.png"))
+        pool = F.CLICK_IMAGE_POOL
+        pool.clear()
+        pool.configure("folder", folder, 24)
+        st = _wait_pool_at(folder, 24)
+        n, files, _ = pool.stats()
+        pool.clear()
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+    if "2 张动图" not in st:
+        return False, f"状态里没报告动图数：{st!r}"
+    if files != 2:
+        return False, f"可用图片数 {files}（期望 2）"
+    if n != 4:
+        return False, f"素材条目 {n}（2 张图 × 2 档尺寸）"
+    return True, f"{st}（2 张图 × 2 档；动图被单独点名）"
+
+
+# ------------------------------------------------- 10. 三种来源与取图模式
+def test_image_files_source():
+    """「自选图片」：只选一张也成立，多张也行，删掉的文件自动过滤。"""
+    folder = tempfile.mkdtemp(prefix="fx_files_")
+    from PIL import Image
+    try:
+        ps = []
+        for i, nm in enumerate(("a.png", "b.jpg", "c.bmp")):
+            p = os.path.join(folder, nm)
+            Image.new("RGB", (50 + i * 10, 40), (10 * i, 100, 200)).save(p)
+            ps.append(p)
+        raw_all = "\n".join(ps)
+        one = F.list_image_files(ps[0])
+        if one != [ps[0]]:
+            return False, f"只选一张时解析成 {one}"
+        got = F.list_image_files(raw_all)
+        if got != ps:
+            return False, f"三张图解析成 {[os.path.basename(x) for x in got]}"
+
+        # 池子：只选一张 -> 1 图 × 2 档 = 2 个条目
+        pool = F.CLICK_IMAGE_POOL
+        pool.clear()
+        pool.configure("files", ps[0], 40)
+        st = _wait_pool_at(ps[0], 40, kind="files")
+        if not st.startswith("已载入 2 张"):
+            return False, f"只选一张时的状态不对：{st!r}"
+
+        # 多张 -> 6 个条目
+        pool.clear()
+        pool.configure("files", raw_all, 40)
+        st = _wait_pool_at(raw_all, 40, kind="files")
+        if not st.startswith("已载入 6 张"):
+            return False, f"三张图时的状态不对：{st!r}"
+
+        # 删掉中间那张：池子下一批就该少一个，而不是整批作废。
+        # 这里查的是**池子**而不是面板那份缓存列表 —— 缓存有两秒 TTL，
+        # 拿它判"立刻生效"必然失败，而用户真正在意的是"画面上不再出现它"。
+        os.remove(ps[1])
+        if len(F.scan_image_files(raw_all)) != 2:
+            return False, "删掉一个文件后没被过滤掉"
+        pool.clear()
+        pool.configure("files", raw_all, 40)
+        st = _wait_pool_at(raw_all, 40, kind="files")
+        if not st.startswith("已载入 4 张"):
+            return False, f"删掉一张后应当剩 4 个条目：{st!r}"
+        pool.clear()
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+    return True, ("单张 -> 2 个条目、三张 -> 6 个；删掉一个文件后自动过滤，"
+                  "剩下的照常可用")
+
+
+def test_pick_mode_one_vs_multi():
+    """「整簇同图」一次点击只用一张；「随机多图」各颗粒子各自随机。"""
+    folder = tempfile.mkdtemp(prefix="fx_pick_")
+    from PIL import Image
+    try:
+        ps = []
+        for i in range(5):
+            p = os.path.join(folder, "i%d.png" % i)
+            Image.new("RGBA", (40, 40), (20 * i, 90, 200, 255)).save(p)
+            ps.append(p)
+        raw = "\n".join(ps)
+        base = _ecfg(click_emoji_source=F.CLICK_SOURCE_FILES,
+                     click_emoji_files=raw, click_emoji_count=16.0,
+                     click_emoji_spread=150.0)
+        pool = F.CLICK_IMAGE_POOL
+        pool.clear()
+        pool.configure("files", raw, 22)
+        st = _wait_pool_at(raw, 22, kind="files")
+        if not st.startswith("已载入"):
+            pool.clear()
+            return False, f"素材没载入：{st!r}"
+
+        f = ClickEmojiField(W, H)
+        n_one, n_multi, kinds = set(), set(), set()
+        for mode in (F.CLICK_PICK_ONE, F.CLICK_PICK_MULTI):
+            for _ in range(20):
+                f.reset()
+                f.set_pointer(W * 0.5, H * 0.5, 1)
+                f.update(1.0 / 60.0, dict(base, click_emoji_pick=mode))
+                used = set(f.engine.spr_id[:f.engine.count].tolist())
+                if mode == F.CLICK_PICK_ONE:
+                    n_one.add(len(used))
+                else:
+                    n_multi.add(len(used))
+                    kinds |= used
+        pool.clear()
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+    if n_one != {1}:
+        return False, f"整簇同图应当是每次恰好 1 张，实得 {sorted(n_one)}"
+    if max(n_multi) < 2:
+        return False, f"随机多图每次只用 {sorted(n_multi)} 张 —— 没随机起来"
+    if len(kinds) < 2:
+        return False, f"随机多图 20 次只用到了 {len(kinds)} 种图"
+    return True, ("整簇同图 20 次都是 1 张；随机多图每簇 2 张以上、累计用到 "
+                  f"{len(kinds)} 种")
+
+
+def test_source_normalize_and_target():
+    """来源归一化：旧值「自定义图片」等价于文件夹，未知值退回内置图案。"""
+    cases = [(F.CLICK_SOURCE_FILES, F.CLICK_SOURCE_FILES),
+             (F.CLICK_SOURCE_FOLDER, F.CLICK_SOURCE_FOLDER),
+             (F.CLICK_SOURCE_LEGACY, F.CLICK_SOURCE_FOLDER),
+             (F.CLICK_SOURCE_BUILTIN, F.CLICK_SOURCE_BUILTIN),
+             ("", F.CLICK_SOURCE_BUILTIN),
+             ("乱写一通", F.CLICK_SOURCE_BUILTIN),
+             (None, F.CLICK_SOURCE_BUILTIN)]
+    for src, want in cases:
+        got = F.normalize_source(src)
+        if got != want:
+            return False, f"normalize_source({src!r}) = {got!r}，期望 {want!r}"
+    if F.CLICK_SOURCE_LEGACY in F.CLICK_SOURCES:
+        return False, "旧值不该出现在新的选项表里（会被用户选到）"
+    tgt = [
+        (dict(click_emoji_source=F.CLICK_SOURCE_BUILTIN), ("", "")),
+        (dict(click_emoji_source=F.CLICK_SOURCE_FILES,
+              click_emoji_files="a\nb"), ("files", "a\nb")),
+        (dict(click_emoji_source=F.CLICK_SOURCE_FOLDER,
+              click_emoji_custom_dir="C:/x"), ("folder", "C:/x")),
+        (dict(click_emoji_source=F.CLICK_SOURCE_LEGACY,
+              click_emoji_custom_dir="C:/x"), ("folder", "C:/x")),
+        ({}, ("", "")),
+    ]
+    for cfg, want in tgt:
+        got = F.click_source_target(cfg)
+        if got != want:
+            return False, f"click_source_target({cfg}) = {got}，期望 {want}"
+    return True, "7 种取值归一化正确；旧配置「自定义图片」仍按文件夹处理"
+
+
+def test_click_source_defaults():
+    """新增的素材配置键：类型正确、默认值合理、坏值被钳制。"""
+    for k, t in (("click_emoji_files", str), ("click_emoji_pick", str)):
+        if k not in d.DEFAULTS:
+            return False, f"DEFAULTS 缺 {k}"
+        if not isinstance(d.DEFAULTS[k], t):
+            return False, f"{k} 默认值类型是 {type(d.DEFAULTS[k])}，期望 {t}"
+    if d.DEFAULTS["click_emoji_pick"] not in F.CLICK_PICKS:
+        return False, f"默认取图模式 {d.DEFAULTS['click_emoji_pick']!r} 不在选项表里"
+    if d.DEFAULTS["click_emoji_source"] not in F.CLICK_SOURCES:
+        return False, f"默认来源 {d.DEFAULTS['click_emoji_source']!r} 不在选项表里"
+    bad = []
+    for k, v in (("click_emoji_files", 3), ("click_emoji_pick", 1.5),
+                 ("click_emoji_pick", ["a"])):
+        ok, _ = d._coerce_cfg_value(k, v)
+        if ok:
+            bad.append((k, v))
+    if bad:
+        return False, f"坏值被收下了：{bad}"
+    return True, (f"两键类型正确；默认来源 {d.DEFAULTS['click_emoji_source']!r} "
+                  f"与取图模式 {d.DEFAULTS['click_emoji_pick']!r} 都在选项表里；"
+                  f"坏值被拒")
+
+
 def test_no_shadowed_module_defs():
     """产品模块里不能有**同名重复的顶层定义**。
 
@@ -1568,6 +1957,16 @@ def main():
         test_text_voice_off_is_independent,
         test_text_pack_defaults,
         test_scene_plays_the_matched_audio,
+        test_frame_indexes_spread,
+        test_gif_decodes_all_frames,
+        test_gif_frame_duration_compensated,
+        test_sprite_set_frames_cycle,
+        test_animated_sprite_moves_on_screen,
+        test_animated_flag_in_state,
+        test_image_files_source,
+        test_pick_mode_one_vs_multi,
+        test_source_normalize_and_target,
+        test_click_source_defaults,
         test_no_shadowed_module_defs,
     ]
     print("== 点击特效 + 分组 ==")

@@ -1634,35 +1634,147 @@ class ControlPanel:
         self._swatch(c, "颜色", "click_emoji_color", CLICK_EMOJI_COLORS)
         self._slider(c, "不透明度", "click_emoji_opacity", 0.2, 1.0, 0.01,
                      "{:.0%}")
-        self._hint(c, "点一下鼠标就在光标处炸开一簇：「扩散」是飞出去的速度，"
-                      "「重力」调大往下飘、负数向上浮，最长 1.5 秒。"
-                      "选图案会自动配上它的惯用色。")
+        self._hint(c, "点一下就在光标处炸开一簇图案。")
         self._save_bar(c, "点击表情")
 
-        # 自定义素材单独一张卡：这两样都**不吃**上面那几个旋钮 —— 用文件夹
-        # 里的图当图案时「图案 / 颜色」根本不参与绘制，语音连画都不画。单独
-        # 放一块，用户一眼就知道是另一条路。
+        # 自定义素材单独一张卡：这些都不吃上面那几个旋钮 —— 用图片当图案时
+        # 「图案 / 颜色」根本不参与绘制，语音连画都不画。单独放一块，用户一眼
+        # 就知道是另一条路。
+        # 这里的每个控件行都用 `pady=6`（默认 8）：本页是全程序最长的一页，
+        # 页面自然高有硬上限（见「面板高度是有限预算」），五行省下的 20px 正是
+        # 加素材选择所必需的。2px 的差别肉眼看不出来，不会显得突兀。
         c2 = tk.Frame(p, bg=CARD)
         c2.pack(fill="x", padx=16, pady=(0, 8))
         self._choices(c2, "图案来源", "click_emoji_source",
-                      fx_effects.CLICK_SOURCES)
-        self._folder(c2, "图片文件夹", "click_emoji_custom_dir",
-                     status=self._img_status)
-        self._toggle(c2, "点击时播放语音", "click_voice_enabled")
+                      fx_effects.CLICK_SOURCES, norm=fx_effects.normalize_source,
+                      pady=6)
+        self._asset_row(c2)
+        self._choices(c2, "单次选择", "click_emoji_pick", fx_effects.CLICK_PICKS,
+                      pady=6)
+        self._toggle(c2, "点击时播放语音", "click_voice_enabled", pady=6)
         self._folder(c2, "语音文件夹", "click_voice_dir",
-                     status=self._voice_status)
-        self._hint(c2, "「自定义图片」从文件夹随机取图当粒子，读图在后台、"
-                       "读完前先用内置图案；语音上一段没播完时不响应新的点击。")
+                     status=self._voice_status, pady=6)
+        self._hint(c2, "「自选图片」可选一张或多张；GIF 会动起来。语音上一段"
+                       "没播完时，新的点击不响应。")
 
         self._preset_block(p, "点击表情")
         return p
 
-    def _img_status(self):
-        """图片文件夹的附加状态（每 200ms 由 _poll 刷一次）。"""
-        folder = str(self.app.cfg.get("click_emoji_custom_dir", "") or "")
-        if not folder:
-            return ""
-        return fx_effects.CLICK_IMAGE_POOL.state(folder)
+    def _asset_row(self, parent):
+        """图片素材行：一排按钮 + 一行状态，内容跟着「图案来源」走。
+
+        「选图片」「选文件夹」两个按钮**都常驻**，点哪个就把来源切到那一种 ——
+        比"先去上面改来源、再回来点按钮"少一步，也排除了"来源是文件夹却点了
+        选图片"这种自相矛盾的状态。当前来源对应的那个按钮会点亮。
+
+        状态行注册进 `_hints`（跟随窗口宽度折行）：文件夹路径可以很长，而 Tk
+        的 Label 既不换行也不缩。
+        """
+        app = self.app
+        f = tk.Frame(parent, bg=CARD)
+        f.pack(fill="x", padx=16, pady=6)
+        top = tk.Frame(f, bg=CARD)
+        top.pack(fill="x")
+        tk.Label(top, text="图片素材", bg=CARD, fg=TEXT,
+                 font=FONT_LABEL).pack(side="left")
+
+        btns = {}
+        # 倒着 pack 到右侧，视觉顺序才是「选图片 | 选文件夹 | 清除」
+        for txt in ("清除", "选文件夹", "选图片"):
+            b = tk.Button(top, text=txt, bd=0, relief="flat", bg=BTN, fg=SUB,
+                          font=FONT_SMALL, padx=8, cursor="hand2",
+                          activebackground=BTN_H, activeforeground=TEXT)
+            b.pack(side="right", padx=(6, 0))
+            b.bind("<Enter>", lambda e, w=b: w.config(bg=BTN_H, fg=TEXT))
+            # 离场时回去跑一遍 refresh：否则悬停一次就把"当前来源"的高亮抹掉
+            b.bind("<Leave>", lambda e: refresh())
+            btns[txt] = b
+
+        status = tk.Label(f, text="", bg=CARD, fg=SUB, font=FONT_SMALL,
+                          anchor="w", justify="left",
+                          wraplength=max(160, self.W - 192))
+        status.pack(fill="x", pady=(2, 0))
+        self._hints.append(status)
+
+        def _set_source(v):
+            app.set("click_emoji_source", v)
+            fx_effects.invalidate_media_cache()
+            c = self._ctrls.get("click_emoji_source")
+            if c is not None and c.get("kind") == "choices":
+                c["refresh"]()      # 让上面那排来源按钮立刻跟上
+
+        def refresh():
+            src_now = app.cfg.get("click_emoji_source")
+            kind, src = fx_effects.click_source_target(app.cfg)
+            if not kind:
+                txt = "当前用内置图案，不需要素材"
+            elif kind == "files":
+                n = len(fx_effects.list_image_files(src))
+                txt = ("已选 %d 张图片" % n) if n else "还没选图片"
+            else:
+                st = fx_effects.CLICK_IMAGE_POOL.state(
+                    kind, src, float(app.cfg.get("click_emoji_size", 22)))
+                txt = "%s   ·   %s" % (_short_path(src), st or "")
+            if status.cget("text") != txt:
+                status.config(text=txt)
+            for txt2, key in (("选图片", fx_effects.CLICK_SOURCE_FILES),
+                              ("选文件夹", fx_effects.CLICK_SOURCE_FOLDER)):
+                # 归一化后比较：旧配置里的「自定义图片」等价于文件夹
+                on = (fx_effects.normalize_source(src_now) == key)
+                if str(btns[txt2].cget("fg")) != (ACCENT if on else SUB):
+                    btns[txt2].config(fg=ACCENT if on else SUB)
+
+        def choose_files():
+            from tkinter import filedialog
+            kw = {"parent": self.root, "title": "选择图片",
+                  "filetypes": [("图片",
+                                 "*.png *.jpg *.jpeg *.bmp *.gif *.webp"),
+                                ("所有文件", "*.*")]}
+            cur = fx_effects.list_image_files(
+                app.cfg.get("click_emoji_files", ""))
+            if cur:
+                kw["initialdir"] = os.path.dirname(cur[0])
+            ps = filedialog.askopenfilenames(**kw)
+            if ps:
+                app.set("click_emoji_files", "\n".join(ps))
+                _set_source(fx_effects.CLICK_SOURCE_FILES)
+            refresh()
+
+        def choose_folder():
+            from tkinter import filedialog
+            kw = {"parent": self.root, "title": "选择图片文件夹"}
+            cur = str(app.cfg.get("click_emoji_custom_dir", "") or "")
+            if cur and os.path.isdir(cur):
+                kw["initialdir"] = cur
+            d = filedialog.askdirectory(**kw)
+            if d:
+                # normpath：对话框给的是正斜杠，存下来会与用户手输的路径
+                # 长得不一样（同一个目录两种写法）
+                app.set("click_emoji_custom_dir", os.path.normpath(d))
+                _set_source(fx_effects.CLICK_SOURCE_FOLDER)
+            refresh()
+
+        def clear():
+            kind, _ = fx_effects.click_source_target(app.cfg)
+            if kind == "files":
+                app.set("click_emoji_files", "")
+            elif kind == "folder":
+                app.set("click_emoji_custom_dir", "")
+            # 清掉列表缓存：否则"清除"之后状态栏还会显示 2 秒的旧张数，
+            # 看着就像按钮没生效
+            fx_effects.invalidate_media_cache()
+            refresh()
+
+        btns["选图片"].config(command=choose_files)
+        btns["选文件夹"].config(command=choose_folder)
+        btns["清除"].config(command=clear)
+        # 两个键共用这一行（来源决定它服务哪一个），都登记成 path 让
+        # `_sync_from_cfg` 能刷到它
+        for k in ("click_emoji_files", "click_emoji_custom_dir"):
+            self._ctrls[k] = {"kind": "path", "refresh": refresh,
+                              "label": status}
+        self._folders.append(refresh)
+        refresh()
 
     def _voice_status(self):
         folder = str(self.app.cfg.get("click_voice_dir", "") or "")
@@ -1967,12 +2079,16 @@ class ControlPanel:
                             "on": _on}
 
     # ------------------------------------------------------------ 控件原语
-    def _toggle(self, parent, label, key):
-        """通用开关行：名称 …… 开关（开/关）。"""
+    def _toggle(self, parent, label, key, pady=8):
+        """通用开关行：名称 …… 开关（开/关）。
+
+        `pady` 可收紧：控件多的页面靠它挤出十几像素（页面高度是有限预算，
+        见 MEMORY 里的「面板高度」一节）。
+        """
         app = self.app
         var = tk.BooleanVar(value=bool(app.cfg[key]))
         row = tk.Frame(parent, bg=CARD)
-        row.pack(fill="x", padx=16, pady=8)
+        row.pack(fill="x", padx=16, pady=pady)
         tk.Label(row, text=label, bg=CARD, fg=TEXT,
                  font=FONT_LABEL).pack(side="left")
 
@@ -2057,7 +2173,8 @@ class ControlPanel:
         refresh()
         self._swatches[key] = refresh
 
-    def _choices(self, parent, label, key, options, columns=None, on_change=None):
+    def _choices(self, parent, label, key, options, columns=None, on_change=None,
+                 norm=None, pady=8):
         """分段选择行：名称 …… 一排文字按钮（选中项用强调色描边 2px）。
 
         视觉语言与 `_swatch` 保持一致，只是把色块换成文字 —— "小猫 / 小狗"
@@ -2070,14 +2187,18 @@ class ControlPanel:
 
         `on_change(选项)` 在写入配置**之后**再调，供"选 A 顺带把 B 也设好"
         这种联动用（点击表情的图案 → 惯用色）。
+
+        `norm` 给定时用 `norm(值)` 比较选中态。旧配置里存着已被改名的取值
+        （如图源从「自定义图片」改成「图片文件夹」）时，不归一化就会**一个
+        选项都不高亮** —— 看着像界面坏了。
         """
         app = self.app
         f = tk.Frame(parent, bg=CARD)
-        f.pack(fill="x", padx=16, pady=8)
+        f.pack(fill="x", padx=16, pady=pady)
         btns = []
 
         def refresh():
-            cur = app.cfg[key]
+            cur = norm(app.cfg[key]) if norm is not None else app.cfg[key]
             for b, opt in zip(btns, options):
                 sel = (opt == cur)
                 b.config(relief="solid" if sel else "flat",
@@ -2162,7 +2283,7 @@ class ControlPanel:
         if gate is not None:
             self._sync_text(self._ctrls[key], app.cfg.get(key, ""))
 
-    def _folder(self, parent, label, key, status=None, on_change=None):
+    def _folder(self, parent, label, key, status=None, on_change=None, pady=8):
         """文件夹选择行：名称 | 路径（从尾部截断） | 选择 / 清除。
 
         路径一律**截尾显示** —— 用户认的是最后一级目录名，前面被省略号吃掉
@@ -2174,7 +2295,7 @@ class ControlPanel:
         """
         app = self.app
         f = tk.Frame(parent, bg=CARD)
-        f.pack(fill="x", padx=16, pady=8)
+        f.pack(fill="x", padx=16, pady=pady)
         top = tk.Frame(f, bg=CARD)
         top.pack(fill="x")
         tk.Label(top, text=label, bg=CARD, fg=TEXT,
@@ -2218,6 +2339,8 @@ class ControlPanel:
 
         def _set(v):
             app.set(key, v)
+            # 选/清文件夹之后要立刻反映，不能等列表缓存的 2 秒 TTL
+            fx_effects.invalidate_media_cache()
             refresh()
             if on_change is not None:
                 on_change(v)

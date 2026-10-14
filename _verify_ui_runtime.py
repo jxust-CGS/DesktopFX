@@ -4,7 +4,11 @@
 import queue
 import tkinter as tk
 import desktop_fx as d
+import fx_effects
 import fx_ui
+
+# 素材来源的三个选项名（用来在控件树里认出哪一个是选中的那个）
+fx_kinds_sources = set(fx_effects.CLICK_SOURCES)
 
 # 隔离 UI 状态文件。这两个脚本原来直接 os.remove(fx_ui._UI_STATE_PATH) 来
 # "清理测试痕迹"，而 ui_state.json 现在装的是**用户真实记住的窗口尺寸和上次
@@ -117,19 +121,67 @@ def main():
 
     # 2d2) 「点击表情」页的自定义素材块：来源 / 两个文件夹行 / 语音开关都注册
     #      了，文件夹行的状态文案跟着**后台**加载走（不跟就会像"选了没反应"）。
-    for k in ("click_emoji_source", "click_emoji_custom_dir",
-              "click_voice_enabled", "click_voice_dir"):
+    for k in ("click_emoji_source", "click_emoji_custom_dir", "click_emoji_files",
+              "click_emoji_pick", "click_voice_enabled", "click_voice_dir"):
         assert k in p._ctrls, f"点击表情页缺少控件 {k}"
     assert p._ctrls["click_emoji_source"]["kind"] == "choices", \
         p._ctrls["click_emoji_source"]["kind"]
+    assert p._ctrls["click_emoji_pick"]["kind"] == "choices"
     assert p._ctrls["click_voice_enabled"]["kind"] == "toggle"
-    for k in ("click_emoji_custom_dir", "click_voice_dir"):
+    for k in ("click_emoji_custom_dir", "click_emoji_files", "click_voice_dir"):
         assert p._ctrls[k]["kind"] == "path", (k, p._ctrls[k]["kind"])
         # 路径行必须跟着窗口宽度折行 —— 否则长路径会把页面顶到最小宽度之外
         assert p._ctrls[k]["label"] in p._hints, f"{k} 的路径行没注册折行宽度"
     p._ctrls["click_voice_enabled"]["on"](True)
     assert app.cfg["click_voice_enabled"] is True
     p._ctrls["click_voice_enabled"]["on"](False)
+
+    # 2d2b) 图片素材行：一行服务两种来源，文案跟着来源走
+    _st = p._ctrls["click_emoji_files"]["label"]
+    app.cfg["click_emoji_source"] = "内置图案"
+    p._ctrls["click_emoji_files"]["refresh"]()
+    assert "不需要素材" in _st.cget("text"), _st.cget("text")
+    _img = _tf.mkdtemp(prefix="fx_ui_asset_")
+    _p1 = _os2.path.join(_img, "a.png")
+    _p2 = _os2.path.join(_img, "b.gif")
+    for _f in (_p1, _p2):
+        with open(_f, "wb") as _fh:
+            _fh.write(b"\x00")
+    app.cfg["click_emoji_source"] = "自选图片"
+    app.cfg["click_emoji_files"] = _p1 + "\n" + _p2
+    p._ctrls["click_emoji_files"]["refresh"]()
+    assert "已选 2 张图片" in _st.cget("text"), _st.cget("text")
+    # 删掉一个之后要少一张（而不是整批作废）。列表带 2 秒 TTL，这里用显式
+    # 失效模拟"用户动作之后立刻生效" —— 界面上的选择/清除按钮就是这么做的，
+    # 否则刚点完"清除"还显示旧张数，看着像没生效。
+    _os2.remove(_p1)
+    fx_effects.invalidate_media_cache()
+    for _k in ("click_emoji_files", "click_emoji_custom_dir"):
+        # 两个键共用这一行，任一刷新都应给出同一份视图
+        p._ctrls[_k]["refresh"]()
+    assert "还没选图片" in _st.cget("text") or "已选 1 张" in _st.cget("text"), \
+        _st.cget("text")
+    # 旧配置里的「自定义图片」必须高亮到「图片文件夹」，而不是三个选项全灰
+    app.cfg["click_emoji_source"] = "自定义图片"
+    p._ctrls["click_emoji_source"]["refresh"]()
+    _sel = []
+
+    def _walk_btn(w):
+        for _c in w.winfo_children():
+            try:
+                if _c.winfo_class() == "Button" and \
+                        str(_c.cget("relief")) == "solid" and \
+                        str(_c.cget("text")) in fx_kinds_sources:
+                    _sel.append(str(_c.cget("text")))
+            except Exception:
+                pass
+            _walk_btn(_c)
+
+    _walk_btn(p._pages["点击表情"])
+    assert _sel == ["图片文件夹"], \
+        f"旧值「自定义图片」没有高亮到「图片文件夹」：{_sel}"
+    app.cfg["click_emoji_source"] = "内置图案"
+    app.cfg["click_emoji_files"] = ""
 
     # 2d3) 文件夹行的回填：非音频文件不算数，长目录名从**尾部**保留
     _aud = _tf.mkdtemp(prefix="fx_ui_voice_")
