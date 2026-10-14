@@ -3782,11 +3782,28 @@ _SHAPE_CACHE = {}
 _SHAPE_CACHE_MAX = 400          # 超了就整体清空（配置驱动，重建很便宜）
 
 # 彩带用一整套调色板而不是单色 —— 单色彩带看着像一堆纸片，多彩才有"彩带"感。
-# 这是唯一一个**忽略主色**的图案，UI 上会说明。
 _CONFETTI_COLORS = ("#FF5D73", "#FFC145", "#4ADE80", "#38BDF8", "#A78BFA",
                     "#FB7185", "#FDE68A", "#5EEAD4")
 
+# 「彩色」是一个**哨兵值**而不是颜色：选中它表示"逐粒子从调色板取色"，
+# 于是任何图案都能做多色（不只是彩带）。它不是合法 hex，所以下游必须先
+# 判断它、不能直接丢给 `hex_to_bgr`（那会静默回退成浅蓝）。
+COLOR_RAINBOW = "彩色"
+
 _SHAPE_NAMES = ("爱心", "星星", "彩带", "雪花", "气泡", "火焰", "花瓣", "音符")
+
+# 每个图案的惯用色。选图案时面板会自动套上对应的一条（见 fx_ui 的图案选择），
+# 省得每次都要自己去配颜色。彩带默认就是彩色 —— 它是这个特效的门面。
+_SHAPE_DEFAULT_COLORS = {
+    "爱心": "#FF5D73",
+    "星星": "#FFC145",
+    "彩带": COLOR_RAINBOW,
+    "雪花": "#FFFFFF",
+    "气泡": "#8FD8FF",
+    "火焰": "#FF8A3D",
+    "花瓣": "#FFA6C9",
+    "音符": "#A78BFA",
+}
 
 
 def _shape_sprite(shape, color_hex, size, rot_step=0, rot_steps=12):
@@ -3847,11 +3864,30 @@ def _build_shape(shape, color_hex, size, rot_step, rot_steps):
         poly(pts, fill)
         ell(0.5, 0.52, 0.10, 0.10, light)
     elif shape == "彩带":
-        # 一条斜向的缎带：主体矩形 + 两端的斜切口。颜色在生成调用处逐粒子给，
-        # 这里拿到的已经是该粒子的那一色。
-        poly([(0.22, 0.30), (0.78, 0.16), (0.80, 0.46), (0.24, 0.60)], fill)
-        poly([(0.24, 0.60), (0.80, 0.46), (0.76, 0.78), (0.20, 0.92)], dark)
-        line([(0.26, 0.34), (0.77, 0.20)], light, max(1, W * 0.02))
+        # 一条**弯曲**的飘带。之前是两段直线矩形拼的，方方正正像硬纸片 ——
+        # 纸屑和彩带的区别就在"卷"上。
+        # 做法：先取一条 S 形中心线，再沿每个点的法向往两侧平移出上下边界，
+        # 逐段围成四边形。宽度沿程收放 = 缎带在翻卷（被扭到侧面时变窄），
+        # 直线段做不到这一点。
+        NJ = 12
+        cpts, wid = [], []
+        for j in range(NJ + 1):
+            t = j / NJ
+            cpts.append((0.13 + 0.74 * t,
+                         0.50 + 0.26 * math.sin((t - 0.5) * math.pi * 1.5)))
+            # 中段被扭窄、两端舒展；系数不取 0 是为了任何一处都有可见宽度
+            wid.append(0.088 * (0.42 + 0.58 * abs(math.cos(t * math.pi))))
+        for j in range(NJ):
+            (ax, ay), (bx, by) = cpts[j], cpts[j + 1]
+            dx, dy = bx - ax, by - ay
+            m = math.hypot(dx, dy) or 1.0
+            nx, ny = -dy / m, dx / m
+            wa, wb = wid[j], wid[j + 1]
+            poly([(ax + nx * wa, ay + ny * wa), (bx + nx * wb, by + ny * wb),
+                  (bx - nx * wb, by - ny * wb), (ax - nx * wa, ay - ny * wa)],
+                 fill)
+        # 一道沿中心线的高光：缎带的丝面反射，也让"卷"的方向看得出来
+        line(cpts, light, max(1, int(W * 0.016)))
     elif shape == "雪花":
         # 六条主枝 + 每枝一对小叉。只画细线，雪花才是"结晶"而不是"六角星"
         wd = max(1, int(W * 0.055))
@@ -3900,11 +3936,14 @@ def _build_shape(shape, color_hex, size, rot_step, rot_steps):
     return np.ascontiguousarray(arr)
 
 
-def _text_sprite(text, font_name, size, color_hex, scale=1.0):
+def _text_sprite(text, font_name, size, color_hex, scale=1.0, angle=0.0):
     """把一行文字渲染成预乘 RGBA（带描边，保证在任何桌面底色上都读得清）。
 
     字号按 `scale` 直接**重新渲染**而不是缩放位图 —— 文字是矢量轮廓，重渲染
     比放大位图清楚得多，而且这里只在"弹出"的几个档位上各渲一次，成本可忽略。
+
+    `angle`：整体倾斜角度（度）。**先按 textbbox 精确裁剪、再 `expand=True`
+    旋转** —— 反过来（先旋转再裁）会把旋转后多出来的边角裁掉。
     """
     px = max(8, int(round(size * scale)))
     font = _font(font_name, px)
@@ -3924,34 +3963,53 @@ def _text_sprite(text, font_name, size, color_hex, scale=1.0):
     dr.text((pad - box[0], pad - box[1]), text, font=font, fill=rgb,
             stroke_width=max(1, px // 14), stroke_fill=(0, 0, 0, 190))
 
+    if angle:
+        img = img.rotate(angle, resample=_BICUBIC, expand=True)
+
     arr = np.asarray(img).astype(np.float32) * (1.0 / 255.0)
     arr[..., :3] *= arr[..., 3:4]
     return np.ascontiguousarray(arr)
 
 
+# 字体表：文件相对 `C:/Windows/Fonts`，找不到就逐级回退（见 `_font`）。
+# 刻意保留「微软雅黑 / 雅黑粗体 / 黑体」这类清晰的基础款，其余全换成有笔锋的
+# 花样款 —— 之前那几个（宋体 / 等线 / 楷体）太像正文，弹出来没有记忆点。
+# 只列**系统自带**的：华文 / 方正 / 微软这几家随 Windows 分发的都在，用户
+# 不用另外下载；"魏碑 / 方正黑体"这类不一定装的则不列（列了也只是静默回退
+# 成雅黑，面板上却多一个点不出效果的选项）。
 _FONT_FILES = {
     "微软雅黑": "msyh.ttc",
     "雅黑粗体": "msyhbd.ttc",
     "黑体": "simhei.ttf",
-    "宋体": "simsun.ttc",
-    "楷体": "simkai.ttf",
-    "等线": "Deng.ttf",
+    "幼圆": "SIMYOU.TTF",       # 圆润
+    "行楷": "STXINGKA.TTF",     # 手写连笔
+    "隶书": "SIMLI.TTF",        # 古风扁平
+    "琥珀": "STHUPO.TTF",       # 圆胖醒目
+    "彩云": "STCAIYUN.TTF",     # 空心描边，很花
+    "舒体": "FZSTK.TTF",        # 毛笔
 }
 _FONT_CACHE = {}
 
 
 def _font(name, px):
-    """按名字取字体。取不到就退回雅黑；雅黑也没有则让调用方去兜（返回默认）。"""
+    """按名字取字体。文件缺失/损坏就回退雅黑 —— 用户机器上不一定装全，
+    少一款字体不该让文字整个弹不出来。"""
     key = (name, px)
     hit = _FONT_CACHE.get(key)
     if hit is not None:
         return hit
-    fname = _FONT_FILES.get(name, _FONT_FILES["微软雅黑"])
-    try:
-        f = _PImageFont.truetype(fname, px)
-    except Exception:
-        f = _PImageFont.truetype(_FONT_FILES["微软雅黑"], px)
-    if len(_FONT_CACHE) > 120:
+    for cand in (_FONT_FILES.get(name), _FONT_FILES["微软雅黑"],
+                 "simhei.ttf", "simsun.ttc"):
+        if not cand:
+            continue
+        try:
+            f = _PImageFont.truetype(cand, px)
+            break
+        except Exception:
+            continue
+    else:
+        f = _PImageFont.load_default()
+    if len(_FONT_CACHE) > 160:
         _FONT_CACHE.clear()
     _FONT_CACHE[key] = f
     return f
@@ -4116,18 +4174,43 @@ class _BurstEngine:
 # 会显得很平。
 _TEXT_POP_STEPS = (0.55, 0.78, 0.95, 1.08, 1.00)
 _TEXT_CACHE = {}
-_TEXT_CACHE_MAX = 60
+_TEXT_CACHE_MAX = 400           # 多了"倾斜档"这一维，上限跟着放大
+
+# 倾斜角度档位（度）。做量化档而不是连续值，是为了让精灵缓存键有限 ——
+# 每次点击的角度是**固定的**（点击那一下定下来，之后不再变），所以 5° 的
+# 粒度只影响"这次看起来偏多少度"，不会有动画跳动。
+_TEXT_TILT_STEPS = (-30.0, -25.0, -20.0, -15.0, -10.0, -5.0, 0.0,
+                    5.0, 10.0, 15.0, 20.0, 25.0, 30.0)
+_TEXT_TILT_ZERO = 6             # 上表里 0.0 的下标
 
 
-def _text_sprites(text, font_name, size, color_hex):
-    """取一行文字的 5 档缩放精灵（预乘 RGBA 列表），带缓存。"""
-    key = (text, font_name, int(size), color_hex)
+def _tilt_choices(amount):
+    """按倾斜幅度（0~1）挑出允许的角度档下标。
+
+    幅度 0 → 只有 0°，1 → 全部 13 档。文字歪得太狠会读不出来，所以上限
+    就取表里的 ±30°。
+    """
+    if amount <= 0.0:
+        return (_TEXT_TILT_ZERO,)
+    lim = 30.0 * min(1.0, amount)
+    ids = tuple(i for i, d in enumerate(_TEXT_TILT_STEPS) if abs(d) <= lim + 1e-6)
+    return ids or (_TEXT_TILT_ZERO,)
+
+
+def _text_sprites(text, font_name, size, color_hex, tilt_idx=_TEXT_TILT_ZERO):
+    """取一行文字的 5 档缩放精灵（预乘 RGBA 列表），带缓存。
+
+    `tilt_idx` 是 `_TEXT_TILT_STEPS` 的下标：同一次点击的 5 档共用同一个
+    倾斜角，所以一档角度只多 5 个缓存条目。
+    """
+    key = (text, font_name, int(size), color_hex, int(tilt_idx))
     hit = _TEXT_CACHE.get(key)
     if hit is not None:
         return hit
     if len(_TEXT_CACHE) > _TEXT_CACHE_MAX:
         _TEXT_CACHE.clear()
-    out = [_text_sprite(text, font_name, int(size), color_hex, s)
+    ang = _TEXT_TILT_STEPS[int(tilt_idx) % len(_TEXT_TILT_STEPS)]
+    out = [_text_sprite(text, font_name, int(size), color_hex, s, ang)
            for s in _TEXT_POP_STEPS]
     _TEXT_CACHE[key] = out
     return out
@@ -4175,13 +4258,16 @@ class ClickEmojiField:
             shape = str(cfg.get("click_emoji_shape", _SHAPE_NAMES[0]))
             if shape not in _SHAPE_NAMES:
                 shape = _SHAPE_NAMES[0]
-            # 彩带忽略主色：单色彩带看着像一堆纸片，多彩才有"彩带"感。
-            # 这一点在面板上写明了，免得用户以为色块坏了。
-            if shape == "彩带":
+            # 颜色缺键时按**该图案的惯用色**兜底（爱心红、星星黄……），
+            # 而不是所有图案都退回同一个粉。
+            color = str(cfg.get("click_emoji_color",
+                                _SHAPE_DEFAULT_COLORS[shape]))
+            if color == COLOR_RAINBOW:
+                # 逐粒子从调色板取色。哨兵值必须在 hex_to_bgr 之前拦住 ——
+                # 它对非法串是"静默回退浅蓝"，不拦就成了"选了彩色却全蓝"。
                 colors = [_hex_rgb(c) for c in _CONFETTI_COLORS]
             else:
-                colors = [_hex_rgb(str(cfg.get("click_emoji_color",
-                                                "#FF6B8E")))]
+                colors = [_hex_rgb(color)]
             self.engine._shape = shape
             self.engine.spawn(
                 self._mx, self._my, shape, colors,
@@ -4257,9 +4343,16 @@ class ClickTextField:
         if clicked:
             texts = self.texts_of(cfg)
             if texts:
+                # 倾斜与横向漂移在**点击这一下**定下来，之后不再变 ——
+                # 每帧重随机会让文字疯狂抖动。
+                spin = float(np.clip(float(cfg.get("click_text_spin", 0.75)),
+                                     0.0, 1.0))
+                tilt = int(self.rng.choice(_tilt_choices(spin)))
+                drift = float(self.rng.uniform(-1.0, 1.0)) * 0.45
                 self.pops.append({
                     "x": float(self._mx), "y": float(self._my), "t": 0.0,
                     "life": life, "idx": self._next_idx % len(texts),
+                    "tilt": tilt, "drift": drift,
                 })
                 self._next_idx = (self._next_idx + 1) % len(texts)
             # 装饰：与文字同一个爆发点，整体偏上
@@ -4301,20 +4394,25 @@ class ClickTextField:
                     if pp["idx"] >= len(texts):
                         continue
                     steps = _text_sprites(texts[pp["idx"]], font_name,
-                                          size, color)
+                                          size, color, pp.get("tilt",
+                                                              _TEXT_TILT_ZERO))
                     u = pp["t"] / max(pp["life"], 1e-4)
                     # 选缩放档：弹出段走 5 档递进，之后固定最大档
                     si = min(len(steps) - 1,
                              int(pp["t"] / 0.055)) if pp["t"] < 0.22 else len(steps) - 1
                     spr = steps[max(0, si)]
-                    # 上飘用 ease-out：开头冲上去、末段慢下来，比匀速自然
+                    # 上飘用 ease-out：开头冲上去、末段慢下来，比匀速自然；
+                    # 再叠一点**点击时定好的**横向漂移，让几行字散开而不是
+                    # 叠在同一条竖线上。
                     ease = 1.0 - (1.0 - min(1.0, u)) ** 2
+                    dx = pp.get("drift", 0.0) * rise * ease
                     alpha = min(1.0, pp["t"] / 0.08) \
                         * min(1.0, (1.0 - u) / 0.35)
                     a = op * max(0.0, alpha)
                     if a <= 0.01:
                         continue
-                    self._blit(u32, w, h, spr, pp["x"], pp["y"] - rise * ease, a)
+                    self._blit(u32, w, h, spr, pp["x"] + dx,
+                               pp["y"] - rise * ease, a)
             except Exception:
                 # 只报一次：反复抛会耗光"连续失败"配额把整个渲染线程熔断，
                 # 一个文字效果画不出来不该让雨也停。
@@ -4323,11 +4421,19 @@ class ClickTextField:
         self.deco.draw(u32, w, h, op)
 
     def _blit(self, u32, w, h, img, cx, cy, a):
-        S = img.shape[0]
-        x0 = int(round(cx - S * 0.5))
-        y0 = int(round(cy - S * 0.5))
+        """把精灵以 (cx, cy) 为中心叠加到缓冲上。
+
+        ⚠️ **必须分别取高与宽**：文字精灵宽高不等（"太好了" 是 116×46），
+        拿 `shape[0]` 当正方形边长会只取到左边一个 46px 宽的方形区域 ——
+        横向被切掉大半（实测墨迹 104px 只落屏 41px），表现为"文字显示
+        不完整"。图案精灵（`_shape_sprite`）恰好是正方形，所以这个错误在
+        那边不会被发现。
+        """
+        sh, sw = img.shape[:2]
+        x0 = int(round(cx - sw * 0.5))
+        y0 = int(round(cy - sh * 0.5))
         gx0, gy0 = max(0, x0), max(0, y0)
-        gx1, gy1 = min(int(w), x0 + S), min(int(h), y0 + S)
+        gx1, gy1 = min(int(w), x0 + sw), min(int(h), y0 + sh)
         if gx1 <= gx0 or gy1 <= gy0:
             return
         sub = img[gy0 - y0:gy1 - y0, gx0 - x0:gx1 - x0]

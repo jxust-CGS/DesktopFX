@@ -50,7 +50,7 @@ def _tcfg(**over):
                click_text_color="#FFFFFF", click_text_size=34.0,
                click_text_font="微软雅黑", click_text_deco="彩带",
                click_text_rise=90.0, click_text_life=1.4,
-               click_text_opacity=1.0)
+               click_text_opacity=1.0, click_text_spin=0.75)
     cfg.update(over)
     return cfg
 
@@ -258,25 +258,42 @@ def test_wild_input_no_nan():
 
 
 def test_confetti_uses_palette():
-    """彩带忽略主色、用整套调色板 —— 这是它在界面上唯一特殊的地方。"""
+    """彩带的**默认**色是「彩色」（逐粒子取整套调色板）。
+
+    新语义下颜色由用户选：任何图案选「彩色」都多彩，选单色就单色 ——
+    所以这里测的是"彩带的默认色"，而不是"彩带强制多彩"（旧语义下它
+    会忽略主色，现在不会了）。
+    """
     f = ClickEmojiField(W, H)
-    cfg = _ecfg(click_emoji_shape="彩带", click_emoji_count=30.0,
-                click_emoji_color="#000000")
+    cfg = _ecfg(click_emoji_shape="彩带", click_emoji_count=30.0)
+    cfg.pop("click_emoji_color")            # 不给颜色 → 走图案的惯用色
     f.set_pointer(320.0, 240.0, 1)
     f.update(1.0 / 60.0, cfg)
     n = f.engine.count
     uniq = {tuple(int(v) for v in c) for c in f.engine.rgb[:n]}
     if len(uniq) < 3:
-        return False, f"彩带只有 {len(uniq)} 种颜色（应多彩）"
-    # 非彩带图案则整簇同一个颜色
+        return False, (f"彩带默认色只有 {len(uniq)} 种颜色"
+                       f"（惯用色应当是「彩色」）")
+    # 反过来：显式给单色就应该是单色（不再被忽略）
+    f3 = ClickEmojiField(W, H)
+    f3.set_pointer(320.0, 240.0, 1)
+    f3.update(1.0 / 60.0, _ecfg(click_emoji_shape="彩带",
+                               click_emoji_count=30.0,
+                               click_emoji_color="#000000"))
+    u3 = {tuple(int(v) for v in c) for c in f3.engine.rgb[:f3.engine.count]}
+    if len(u3) != 1:
+        return False, f"给彩带指定单色却出现 {len(u3)} 种颜色（主色被忽略了？）"
+    # 非彩带图案的默认色是单色
     f2 = ClickEmojiField(W, H)
     f2.set_pointer(320.0, 240.0, 1)
-    f2.update(1.0 / 60.0, _ecfg(click_emoji_shape="爱心",
-                                click_emoji_count=30.0))
+    cfg2 = _ecfg(click_emoji_shape="爱心", click_emoji_count=30.0)
+    cfg2.pop("click_emoji_color")
+    f2.update(1.0 / 60.0, cfg2)
     u2 = {tuple(int(v) for v in c) for c in f2.engine.rgb[:f2.engine.count]}
     if len(u2) != 1:
-        return False, f"单色图案却有 {len(u2)} 种颜色"
-    return True, f"彩带 {len(uniq)} 种颜色、单色图案 1 种（主色被正确忽略/采用）"
+        return False, f"爱心的默认色有 {len(u2)} 种颜色（应当是单色红）"
+    return True, (f"彩带默认 {len(uniq)} 种颜色；指定单色则 1 种；"
+                  f"爱心默认 1 种")
 
 
 def test_draws_into_buffer():
@@ -624,6 +641,256 @@ def test_negative_copy_instead_of_over():
                   f"（判据确实在测混合方式，而非底色本身）")
 
 
+# ------------------------------------------------- 文字不能被横向切掉
+def _text_footprint(field, cfg, text, font, size):
+    """返回 (精灵墨迹宽, 落屏墨迹宽, 落屏墨迹高, 精灵高)。"""
+    spr = F._text_sprites(text, font, size, cfg["click_text_color"])[-1]
+    a = spr[..., 3]
+    ys, xs = np.nonzero(a > 0.02)
+    spr_w = xs.max() - xs.min() + 1
+    spr_h = ys.max() - ys.min() + 1
+    buf = np.zeros(W * H, np.uint32)
+    field.draw(buf, W, H, cfg)
+    img = buf.reshape(H, W)
+    ys2, xs2 = np.nonzero(img > 0)
+    if xs2.size == 0:
+        return spr_w, 0, 0, spr_h
+    return spr_w, xs2.max() - xs2.min() + 1, ys2.max() - ys2.min() + 1, spr_h
+
+
+def test_text_not_clipped_horizontally():
+    """文字必须**整幅**落到屏上，不能被横向裁掉。
+
+    这条守着 `ClickTextField._blit` 曾经的一个真 bug：它拿 `img.shape[0]`
+    （高度）当正方形边长用，而文字精灵是**非正方形**的（"太好了" 是
+    116×46）—— 于是横向只取到 46px，墨迹 104px 只落屏 41px（切掉 61%），
+    用户看到的就是"文字显示不完整"。图案精灵恰好是正方形，所以在那边
+    一直没暴露。
+    """
+    cases = (("太好了", "微软雅黑", 34.0), ("好耶", "行楷", 40.0),
+             ("绝绝子", "琥珀", 30.0))
+    for text, font, size in cases:
+        cfg = _tcfg(click_text_list=text, click_text_font=font,
+                    click_text_size=size, click_text_deco="无",
+                    click_text_spin=0.0)
+        f = ClickTextField(W, H)
+        f.set_pointer(W * 0.5, H * 0.5, 1)
+        for _ in range(20):            # 推进到弹出完成（最后一档缩放）
+            f.update(1.0 / 60.0, cfg)
+        spr_w, scr_w, scr_h, spr_h = _text_footprint(f, cfg, text, font, size)
+        if scr_w < spr_w * 0.95:
+            return False, (f"{text}（{font}）：精灵墨迹宽 {spr_w}px，"
+                           f"落屏只有 {scr_w}px（切掉了 "
+                           f"{100 * (1 - scr_w / spr_w):.0f}%）")
+        if scr_h < spr_h * 0.95:
+            return False, (f"{text}（{font}）：纵向也被切了 "
+                           f"{spr_h}px -> {scr_h}px")
+    return True, "3 组文字都整幅落屏（宽高均 ≥ 精灵的 95%）"
+
+
+def test_text_clip_check_is_sensitive():
+    """负向对照：把 `_blit` 改回"拿 shape[0] 当边长"，上面那条必须变红。
+
+    没有它，`test_text_not_clipped_horizontally` 可能只是在测"我新写的
+    东西自洽"，而不是真的在拦这个 bug。
+    """
+    src = open(os.path.join(HERE, "fx_effects.py"), encoding="utf-8").read()
+    good = ("        sh, sw = img.shape[:2]\n"
+            "        x0 = int(round(cx - sw * 0.5))\n"
+            "        y0 = int(round(cy - sh * 0.5))\n"
+            "        gx0, gy0 = max(0, x0), max(0, y0)\n"
+            "        gx1, gy1 = min(int(w), x0 + sw), min(int(h), y0 + sh)\n")
+    bad = ("        sw = img.shape[0]\n"
+           "        sh = sw\n"
+           "        x0 = int(round(cx - sw * 0.5))\n"
+           "        y0 = int(round(cy - sh * 0.5))\n"
+           "        gx0, gy0 = max(0, x0), max(0, y0)\n"
+           "        gx1, gy1 = min(int(w), x0 + sw), min(int(h), y0 + sh)\n")
+    if src.count(good) != 1:
+        return False, f"定位不到 _blit 的宽高取值（找到 {src.count(good)} 处）"
+
+    import types
+    mod = types.ModuleType("fxeff_clip_copy")
+    mod.__dict__["__name__"] = "fxeff_clip_copy"
+    mod.__dict__["__file__"] = os.path.join(HERE, "fx_effects.py")
+    try:
+        exec(compile(src.replace(good, bad), "fx_effects_clip_copy.py", "exec"),
+             mod.__dict__)
+    except Exception as e:
+        return False, f"负向对照模块编译失败：{type(e).__name__}: {e}"
+
+    cfg = _tcfg(click_text_list="太好了", click_text_deco="无",
+                click_text_spin=0.0)
+    f = mod.ClickTextField(W, H)
+    f.set_pointer(W * 0.5, H * 0.5, 1)
+    for _ in range(20):
+        f.update(1.0 / 60.0, cfg)
+    spr_w, scr_w, _, _ = _text_footprint(f, cfg, "太好了", "微软雅黑", 34.0)
+    if scr_w >= spr_w * 0.95:
+        return False, (f"负向对照失效：改回 shape[0] 当边长后落屏仍有 "
+                       f"{scr_w}px（精灵 {spr_w}px）")
+    return True, (f"退回「拿高度当边长」后落屏只剩 {scr_w}px / {spr_w}px"
+                  f"（判据确实在拦横向裁剪）")
+
+
+# ------------------------------------------------- 图案默认色与「彩色」
+def test_shape_default_colors():
+    """每个图案都有惯用色，且**选图案会自动套上**。"""
+    import fx_ui
+    if dict(F._SHAPE_DEFAULT_COLORS) != dict(fx_ui.SHAPE_DEFAULT_COLORS):
+        return False, ("默认色表不一致："
+                       f"UI={fx_ui.SHAPE_DEFAULT_COLORS} / "
+                       f"实现={F._SHAPE_DEFAULT_COLORS}")
+    missing = [n for n in F._SHAPE_NAMES if n not in F._SHAPE_DEFAULT_COLORS]
+    if missing:
+        return False, f"这些图案没有惯用色：{missing}"
+
+    # 缺键时按图案兜底（预设只写图案、不写色时走这条路）
+    for shape, want in (("爱心", "#FF5D73"), ("星星", "#FFC145"),
+                        ("雪花", "#FFFFFF")):
+        f = ClickEmojiField(W, H)
+        cfg = _ecfg(click_emoji_shape=shape, click_emoji_count=8.0)
+        cfg.pop("click_emoji_color")
+        f.set_pointer(W * 0.5, H * 0.5, 1)
+        f.update(1.0 / 60.0, cfg)
+        got = f.engine.rgb[0]
+        exp = F._hex_rgb(want)
+        if not np.allclose(got, exp, atol=1.5):
+            return False, (f"{shape} 缺键时没兜到惯用色：拿到 "
+                           f"{tuple(int(v) for v in got)}，期望 {exp}")
+
+    # UI 侧：选图案会把颜色键一起改掉
+    class _Stub:
+        def __init__(self):
+            self.cfg = dict(d.DEFAULTS)
+            self.set_calls = []
+
+        def set(self, k, v):
+            self.cfg[k] = v
+            self.set_calls.append((k, v))
+
+    stub = _Stub()
+    panel = fx_ui.ControlPanel.__new__(fx_ui.ControlPanel)
+    panel.app = stub
+    fx_ui.ControlPanel._on_shape_change(panel, "星星")
+    if stub.cfg["click_emoji_color"] != "#FFC145":
+        return False, (f"选「星星」后颜色没跟着变："
+                       f"{stub.cfg['click_emoji_color']}")
+    return True, ("8 个图案的惯用色齐全且与 UI 一致；缺键按图案兜底；"
+                  "选图案会自动套色")
+
+
+def test_rainbow_is_per_particle():
+    """「彩色」= 逐粒子从调色板取色；单色时整簇同色。"""
+    import fx_ui
+    if fx_ui.CLICK_RAINBOW != F.COLOR_RAINBOW:
+        return False, (f"哨兵值不一致：UI={fx_ui.CLICK_RAINBOW!r} / "
+                       f"实现={F.COLOR_RAINBOW!r}")
+    if F.COLOR_RAINBOW not in fx_ui.CLICK_EMOJI_COLORS:
+        return False, "颜色表里没有「彩色」这一项，面板上选不到"
+
+    # 任何图案都能用彩色（不只是彩带）
+    for shape in ("爱心", "雪花", "彩带"):
+        f = ClickEmojiField(W, H)
+        cfg = _ecfg(click_emoji_shape=shape, click_emoji_count=24.0,
+                    click_emoji_color=F.COLOR_RAINBOW)
+        f.set_pointer(W * 0.5, H * 0.5, 1)
+        f.update(1.0 / 60.0, cfg)
+        uniq = len({tuple(int(v) for v in c)
+                    for c in f.engine.rgb[:f.engine.count]})
+        if uniq < 3:
+            return False, (f"{shape} 选「彩色」后只出现 {uniq} 种颜色 "
+                           f"（哨兵没被识别成彩色？）")
+    # 单色时反过来必须只有 1 种
+    f = ClickEmojiField(W, H)
+    f.set_pointer(W * 0.5, H * 0.5, 1)
+    f.update(1.0 / 60.0, _ecfg(click_emoji_count=24.0,
+                               click_emoji_color="#FF5D73"))
+    uniq = len({tuple(int(v) for v in c)
+                for c in f.engine.rgb[:f.engine.count]})
+    if uniq != 1:
+        return False, f"单色却出现 {uniq} 种颜色"
+    return True, "「彩色」逐粒子取色（3 种图案都验过），单色仍只有 1 种"
+
+
+def test_confetti_is_curved():
+    """彩带要是**弯的**飘带，不是直条。
+
+    判据取"各列墨迹中心的 y 极差"：直线段这个值是 0，弯曲才会拉开。
+    之前是两段直线矩形拼的，看着像硬纸片。
+    """
+    spr = F._shape_sprite("彩带", "#FFC145", 64, 0, 12)
+    a = spr[..., 3]
+    ys, xs = np.nonzero(a > 0.5)
+    if xs.size == 0:
+        return False, "彩带画不出东西"
+    centers = []
+    for x in range(int(xs.min()), int(xs.max()) + 1, 4):
+        col = np.nonzero(a[:, x] > 0.5)[0]
+        if col.size:
+            centers.append(float(col.mean()))
+    if len(centers) < 5:
+        return False, f"可采样的列太少（{len(centers)}）"
+    spread = max(centers) - min(centers)
+    if spread < 8.0:
+        return False, (f"各列墨迹中心的 y 极差只有 {spread:.1f}px（<8）"
+                       f"—— 彩带还是直的")
+    # 宽度也要沿程收放（"在翻卷"），否则只是一条弯棍
+    wid = []
+    for x in range(int(xs.min()), int(xs.max()) + 1, 4):
+        col = np.nonzero(a[:, x] > 0.5)[0]
+        if col.size:
+            wid.append(col.size)
+    ratio = (max(wid) / max(1, min(wid))) if wid else 0.0
+    if ratio < 1.4:
+        return False, f"彩带各处宽度几乎不变（{ratio:.2f} 倍），没有翻卷感"
+    return True, (f"彩带弯曲（各列中心 y 极差 {spread:.0f}px），"
+                  f"宽度沿程变化 {ratio:.1f} 倍")
+
+
+def test_text_tilt_random():
+    """文字每次点击随机倾斜；幅度为 0 时全部水平。"""
+    f = ClickTextField(W, H)
+    cfg = _tcfg(click_text_spin=1.0, click_text_deco="无")
+    angles, drifts = [], []
+    for _ in range(40):
+        f.set_pointer(W * 0.5, H * 0.5, 1)
+        f.update(1.0 / 60.0, cfg)
+        pp = f.pops[-1]
+        angles.append(F._TEXT_TILT_STEPS[pp["tilt"]])
+        drifts.append(pp["drift"])
+    if len(set(angles)) < 3:
+        return False, f"倾斜角只有 {sorted(set(angles))} 种，几乎不随机"
+    if min(angles) >= 0 or max(angles) <= 0:
+        return False, f"倾斜只朝一个方向：{sorted(set(angles))}"
+    if max(abs(a) for a in angles) > 30.0 + 1e-6:
+        return False, f"倾斜超过 ±30°：{max(angles)}"
+    if max(drifts) - min(drifts) < 0.5:
+        return False, "横向漂移几乎不变，几行文字会叠在同一条竖线上"
+    # 幅度 0 → 只有水平
+    f2 = ClickTextField(W, H)
+    cfg0 = _tcfg(click_text_spin=0.0, click_text_deco="无")
+    got = set()
+    for _ in range(20):
+        f2.set_pointer(W * 0.5, H * 0.5, 1)
+        f2.update(1.0 / 60.0, cfg0)
+        got.add(F._TEXT_TILT_STEPS[f2.pops[-1]["tilt"]])
+    if got != {0.0}:
+        return False, f"倾斜幅度 0 却出现了 {got}"
+    # 角度是**点击时定下来的**，同一次点击内不能每帧变
+    f3 = ClickTextField(W, H)
+    f3.set_pointer(W * 0.5, H * 0.5, 1)
+    f3.update(1.0 / 60.0, cfg)
+    t0 = f3.pops[-1]["tilt"]
+    for _ in range(30):
+        f3.update(1.0 / 60.0, cfg)
+        if f3.pops and f3.pops[-1]["tilt"] != t0:
+            return False, "同一次点击内倾斜角在变（每帧重随机会疯狂抖动）"
+    return True, (f"40 次点击出现 {len(set(angles))} 种倾斜角"
+                  f"（{min(angles):+.0f}°~{max(angles):+.0f}°），"
+                  f"幅度 0 时全水平，且同一次点击内角度固定")
+
+
 # ------------------------------------------------------------------ 驱动
 def main():
     tests = [
@@ -651,6 +918,12 @@ def main():
         test_registry_and_defaults,
         test_scene_wiring,
         test_negative_copy_instead_of_over,
+        test_text_not_clipped_horizontally,
+        test_text_clip_check_is_sensitive,
+        test_shape_default_colors,
+        test_rainbow_is_per_particle,
+        test_confetti_is_curved,
+        test_text_tilt_random,
     ]
     print("== 点击特效 + 分组 ==")
     bad = 0

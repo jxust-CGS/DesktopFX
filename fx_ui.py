@@ -70,11 +70,30 @@ PET_COLORS = ["#F2C27B", "#E9A0A8", "#B9CBE8", "#9FD8C0", "#F5F1E8", "#6B5A50"]
 #   CLICK_DECOS  <-> ClickTextField.update() 里的 deco 分支
 # 跨文件的一致性由 `_verify_click.py` 断言，不靠人记。
 CLICK_SHAPES = ["爱心", "星星", "彩带", "雪花", "气泡", "火焰", "花瓣", "音符"]
-CLICK_FONTS = ["微软雅黑", "雅黑粗体", "黑体", "宋体", "楷体", "等线"]
+# 9 款而不是更多：都是系统自带的花样款或清晰基础款，去掉的"华文楷体 /
+# 华文细黑 / 姚体"与留着的重复度太高，而字体网格每多一行就多占页面高度
+# （面板有"装得下最长页 + 留拖动余量"的硬约束）。
+CLICK_FONTS = ["微软雅黑", "雅黑粗体", "黑体", "幼圆", "行楷", "隶书",
+               "琥珀", "彩云", "舒体"]
 CLICK_DECOS = ["无", "彩带", "星光"]
-# 点击表情的主色（彩带图案会忽略主色，另外用一整套调色板）
-CLICK_EMOJI_COLORS = ["#FF6B8E", "#FFD166", "#5EEAD4", "#7FD1FF", "#C4A7FF",
-                      "#FFFFFF"]
+# 「彩色」= 逐粒子从调色板取色（不是颜色值，是个哨兵）。任何图案都能选它，
+# 彩带默认就用它。真正的取值定义在 fx_effects.COLOR_RAINBOW，一致性由
+# `_verify_click.py` 断言。
+CLICK_RAINBOW = "彩色"
+CLICK_EMOJI_COLORS = ["#FF5D73", "#FFC145", "#8FD8FF", "#FFFFFF", "#A78BFA",
+                      CLICK_RAINBOW]
+# 每个图案的惯用色：选图案时自动套上（在 `_on_shape_change` 里用）。
+# 与 fx_effects._SHAPE_DEFAULT_COLORS 的一致性由 `_verify_click.py` 断言。
+SHAPE_DEFAULT_COLORS = {
+    "爱心": "#FF5D73",
+    "星星": "#FFC145",
+    "彩带": CLICK_RAINBOW,
+    "雪花": "#FFFFFF",
+    "气泡": "#8FD8FF",
+    "火焰": "#FF8A3D",
+    "花瓣": "#FFA6C9",
+    "音符": "#A78BFA",
+}
 CLICK_TEXT_COLORS = ["#FFFFFF", "#FFE066", "#7FE7FF", "#FF9DB6", "#A8E6A0",
                      "#FFB38A"]
 
@@ -523,6 +542,10 @@ class ControlPanel:
     _CHROME = 42              # 标题栏高度：内容区 = 窗口高 − 它
     GRIP = 6                  # 边缘缩放手柄厚度
     GRIP_CORNER = 12          # 角落缩放手柄边长
+    # 预设按钮每行几格。4 而不是 3：预设多的页（点击文字 10 个）从 4 行降到
+    # 3 行，一页省约 42px —— 而"默认窗口要装得下最长页并且还留得出拖动余量"
+    # 是个硬约束（见 `_verify_ui_resize`），页面高度是有限预算。
+    PRESET_COLS = 4
 
     def __init__(self, app):
         self.app = app
@@ -1297,8 +1320,9 @@ class ControlPanel:
             self._show_preset_section(page_key)
             for i, name in enumerate(names):
                 cell = self._make_preset_cell(pf, name)
-                cell.grid(row=i // 3, column=i % 3, padx=4, pady=4, sticky="ew")
-                pf.grid_columnconfigure(i % 3, weight=1)
+                cell.grid(row=i // self.PRESET_COLS, column=i % self.PRESET_COLS,
+                          padx=4, pady=3, sticky="ew")
+                pf.grid_columnconfigure(i % self.PRESET_COLS, weight=1)
                 cells[name] = cell
         else:
             self._hide_preset_section(page_key)
@@ -1312,7 +1336,7 @@ class ControlPanel:
         cell.grid_columnconfigure(0, weight=1)
 
         b = tk.Button(cell, text=name, bg=CARD2, fg=TEXT, bd=0, relief="flat",
-                      font=FONT_SMALL, padx=4, pady=4, cursor="hand2",
+                      font=FONT_SMALL, padx=4, pady=2, cursor="hand2",
                       activebackground=BTN_H,
                       command=lambda n=name: self._preset(n))
         b.grid(row=0, column=0, sticky="ew")
@@ -1344,8 +1368,9 @@ class ControlPanel:
             return
         cell = self._make_preset_cell(pf, name)
         i = len(cells)
-        cell.grid(row=i // 3, column=i % 3, padx=4, pady=4, sticky="ew")
-        pf.grid_columnconfigure(i % 3, weight=1)
+        cell.grid(row=i // self.PRESET_COLS, column=i % self.PRESET_COLS,
+                  padx=4, pady=3, sticky="ew")
+        pf.grid_columnconfigure(i % self.PRESET_COLS, weight=1)
         cells[name] = cell
         # 从无到有时把分区与标题也亮出来
         self._show_preset_section(page)
@@ -1415,8 +1440,10 @@ class ControlPanel:
         if pf is not None:
             names = list(cells.keys())
             for i, n in enumerate(names):
-                cells[n].grid(row=i // 3, column=i % 3, padx=4, pady=4, sticky="ew")
-                pf.grid_columnconfigure(i % 3, weight=1)
+                cells[n].grid(row=i // self.PRESET_COLS,
+                              column=i % self.PRESET_COLS,
+                              padx=4, pady=3, sticky="ew")
+                pf.grid_columnconfigure(i % self.PRESET_COLS, weight=1)
         # 不 flush：scrollregion 由 inner 的 <Configure> 自愈。
         if not cells:
             self._hide_preset_section(page)
@@ -1565,6 +1592,16 @@ class ControlPanel:
         self._preset_block(p, "宠物跟随")
         return p
 
+    def _on_shape_change(self, shape):
+        """选了图案就把主色换成它的惯用色（爱心红 / 星星黄 / 雪花白……）。
+
+        只在**用户点图案**时触发 —— 预设、启动加载都不走这里，所以预设里
+        写好的配色不会被覆盖。选完图案再自己调色即可。
+        """
+        col = SHAPE_DEFAULT_COLORS.get(shape)
+        if col:
+            self.app.set("click_emoji_color", col)
+
     def _page_click_emoji(self, parent):
         p = tk.Frame(parent, bg=BG)
         self._page_head(p, "点击表情")
@@ -1572,22 +1609,27 @@ class ControlPanel:
         c.pack(fill="x", padx=16, pady=(0, 8))
         self._toggle(c, "启用点击表情", "click_emoji_enabled")
         # 8 个图案排单行会把页面撑破最小宽度（内容区只有 400px），折成 4 列
-        self._choices(c, "图案", "click_emoji_shape", CLICK_SHAPES, columns=4)
+        self._choices(c, "图案", "click_emoji_shape", CLICK_SHAPES, columns=4,
+                      on_change=self._on_shape_change)
         self._slider(c, "数量", "click_emoji_count", 2, 40, 1, "{:.0f} 个")
         self._slider(c, "大小", "click_emoji_size", 8, 64, 1, "{:.0f} 像素")
-        self._slider(c, "扩散", "click_emoji_spread", 20, 300, 5, "{:.0f}")
-        self._slider(c, "重力", "click_emoji_gravity", -0.5, 1.5, 0.05, "{:.2f}")
-        self._slider(c, "持续时间", "click_emoji_life", 0.4, 3.0, 0.1, "{:.1f} 秒")
+        self._slider(c, "扩散", "click_emoji_spread", 100, 600, 10, "{:.0f}")
+        self._slider(c, "重力", "click_emoji_gravity", -2.0, 2.0, 0.1, "{:+.1f}")
+        self._slider(c, "持续时间", "click_emoji_life", 0.2, 1.5, 0.05,
+                     "{:.2f} 秒")
         self._toggle(c, "粒子自旋", "click_emoji_rotate")
-        self._swatch(c, "主色", "click_emoji_color", CLICK_EMOJI_COLORS)
+        self._swatch(c, "颜色", "click_emoji_color", CLICK_EMOJI_COLORS)
         self._slider(c, "不透明度", "click_emoji_opacity", 0.2, 1.0, 0.01,
                      "{:.0%}")
-        self._hint(c, "点一下鼠标，就在光标位置炸开一簇图案："
+        self._hint(c, "点一下鼠标，就在光标位置炸开一簇图案。"
                       "「扩散」是它们飞出去的速度，「重力」调大像彩纸往下飘、"
-                      "调成负数则向上浮（泡泡那类）。")
+                      "调成负数则向上浮（泡泡那类），"
+                      "「持续时间」最长 1.5 秒。")
         self._hint(c, "「数量」最多 40 个，连点几下会自然叠起来。"
-                      "「彩带」图案会忽略下面的主色，改用一整套彩色 —— "
-                      "单色彩带看着像一堆纸片，不像彩带。")
+                      "选图案时会自动配上它的惯用色（爱心红、星星黄、雪花白"
+                      "……），选完再自己调也行。")
+        self._hint(c, "颜色里的「彩色」是逐颗从一整套调色板取色 —— "
+                      "任何图案都能用，彩带的默认就是它。")
         self._hint(c, "图案全部由代码绘制，不依赖图片文件或系统字体。")
         self._save_bar(c, "点击表情")
         self._preset_block(p, "点击表情")
@@ -1600,23 +1642,25 @@ class ControlPanel:
         c.pack(fill="x", padx=16, pady=(0, 8))
         self._toggle(c, "启用点击文字", "click_text_enabled")
         self._textbox(c, "文字（一行一个，点击时轮换取下一个）",
-                      "click_text_list")
-        self._choices(c, "字体", "click_text_font", CLICK_FONTS, columns=3)
+                      "click_text_list", height=2)
+        # 9 款字体排 5 列 = 2 行（3 列要 3 行，多 34px）。名字最长 4 个字，
+        # 5 列在最小窗口宽度下也放得下（内容区 400px / 5 ≈ 80px）。
+        self._choices(c, "字体", "click_text_font", CLICK_FONTS, columns=5)
         self._slider(c, "字号", "click_text_size", 14, 90, 1, "{:.0f} 像素")
         self._swatch(c, "颜色", "click_text_color", CLICK_TEXT_COLORS)
         self._choices(c, "装饰", "click_text_deco", CLICK_DECOS)
         self._slider(c, "上飘高度", "click_text_rise", 0, 260, 5, "{:.0f} 像素")
+        self._slider(c, "倾斜幅度", "click_text_spin", 0.0, 1.0, 0.05, "{:.0%}")
         self._slider(c, "持续时间", "click_text_life", 0.4, 3.0, 0.1, "{:.1f} 秒")
         self._slider(c, "不透明度", "click_text_opacity", 0.2, 1.0, 0.01,
                      "{:.0%}")
-        self._hint(c, "点一下鼠标，在光标处弹出一行字并向上飘走。"
-                      "文字框里可以写多行，点一次换下一个（轮换而不是随机，"
-                      "这样能一眼确认每条都生效了）。")
-        self._hint(c, "字带一圈半透明描边，白字落在浅色桌面上也不会糊掉。"
-                      "「装饰」会在文字旁边一起撒彩带或星光。")
-        self._hint(c, "它和「点击表情」默认互斥 —— 同时炸图案又弹文字会糊成"
-                      "一团；想让两个一起用，去「其它设置 → 特效多开」打开"
-                      "「鼠标特效允许多开」。")
+        self._hint(c, "点一下鼠标，在光标处弹出一行字并向上飘走。文字框可以写"
+                      "多行，点一次换下一个。字带半透明描边，浅色桌面上也读"
+                      "得清；「装饰」会在旁边撒彩带或星光。")
+        self._hint(c, "「倾斜幅度」是每次点击随机歪斜的角度，连点时文字朝不同"
+                      "方向散开；字体取系统已装的花样款，没装的自动回退雅黑。")
+        self._hint(c, "它与「点击表情」默认互斥，想同时用就去「其它设置 → "
+                      "特效多开」。")
         self._save_bar(c, "点击文字")
         self._preset_block(p, "点击文字")
         return p
@@ -1910,11 +1954,13 @@ class ControlPanel:
         def refresh():
             cur = str(app.cfg[key]).lower()
             for b, c in zip(btns, colors):
-                sel = c.lower() == cur
-                # 选中项用强调色描边 2px，不用系统亮色边框
+                sel = str(c).lower() == cur
+                named = not str(c).startswith("#")
+                # 选中项用强调色描边 2px，不用系统亮色边框。命名项（文字按钮）
+                # 未选中时用次级字色，否则它会比色块还抢眼。
                 b.config(relief="solid" if sel else "flat",
                          bd=2 if sel else 0,
-                         fg=ACCENT if sel else TEXT)
+                         fg=ACCENT if sel else (SUB if named else TEXT))
 
         # 预设色块之外再给两个入口：取色（吸管，抓屏幕上任意一点）与
         # 调色（系统调色板，任意 RGB）。放在最右，色块顺势左移。
@@ -1929,16 +1975,25 @@ class ControlPanel:
             bb.bind("<Leave>", lambda e, w=bb: w.config(bg=BTN, fg=SUB))
 
         for c in colors:
-            b = tk.Button(f, bg=c, width=2, height=1, bd=0, relief="flat",
-                          cursor="hand2",
-                          activebackground=c,
+            # 不是 hex 的项当"命名选项"渲染成文字按钮（如「彩色」）——
+            # 它没有单一颜色可当色块，硬填一个底色反而误导。
+            named = not str(c).startswith("#")
+            b = tk.Button(f, bg=BTN if named else c, width=3 if named else 2,
+                          height=1, bd=0, relief="flat", cursor="hand2",
+                          text=c if named else "", fg=SUB if named else TEXT,
+                          font=FONT_SMALL if named else FONT_LABEL,
+                          activebackground=BTN_H if named else c,
+                          activeforeground=TEXT,
                           command=lambda cc=c: (app.set(key, cc), refresh()))
             b.pack(side="right", padx=3)
+            if named:
+                b.bind("<Enter>", lambda e, w=b: w.config(bg=BTN_H, fg=TEXT))
+                b.bind("<Leave>", lambda e, w=b: w.config(bg=BTN, fg=SUB))
             btns.append(b)
         refresh()
         self._swatches[key] = refresh
 
-    def _choices(self, parent, label, key, options, columns=None):
+    def _choices(self, parent, label, key, options, columns=None, on_change=None):
         """分段选择行：名称 …… 一排文字按钮（选中项用强调色描边 2px）。
 
         视觉语言与 `_swatch` 保持一致，只是把色块换成文字 —— "小猫 / 小狗"
@@ -1948,6 +2003,9 @@ class ControlPanel:
         选项多的时候必须折行：8 个图案排在单行会把页面撑到 538px，而窗口最小
         宽度只给内容区留 400px —— 撑破之后 Tk 既不换行也不缩，只会把右边的
         选项直接裁掉。
+
+        `on_change(选项)` 在写入配置**之后**再调，供"选 A 顺带把 B 也设好"
+        这种联动用（点击表情的图案 → 惯用色）。
         """
         app = self.app
         f = tk.Frame(parent, bg=CARD)
@@ -1962,6 +2020,13 @@ class ControlPanel:
                          bd=2 if sel else 0,
                          fg=ACCENT if sel else TEXT)
 
+        def pick(opt):
+            app.set(key, opt)
+            if on_change is not None:
+                on_change(opt)
+            # refresh 放最后：on_change 可能改了本控件显示的键，得让它反映出来
+            refresh()
+
         if columns:
             tk.Label(f, text=label, bg=CARD, fg=TEXT, font=FONT_LABEL,
                      anchor="w").grid(row=0, column=0, columnspan=columns,
@@ -1973,7 +2038,7 @@ class ControlPanel:
                 b = tk.Button(f, text=opt, bd=0, relief="flat", bg=BTN, fg=TEXT,
                               font=FONT_LABEL, cursor="hand2",
                               activebackground=BTN_H, activeforeground=TEXT,
-                              command=lambda o=opt: (app.set(key, o), refresh()))
+                              command=lambda o=opt: pick(o))
                 b.grid(row=1 + r, column=c, sticky="ew", padx=3, pady=3)
                 b.bind("<Enter>", lambda e, w=b: w.config(bg=BTN_H))
                 b.bind("<Leave>", lambda e, w=b: w.config(bg=BTN))
@@ -1986,7 +2051,7 @@ class ControlPanel:
                 b = tk.Button(f, text=opt, bd=0, relief="flat", bg=BTN, fg=TEXT,
                               font=FONT_LABEL, padx=10, cursor="hand2",
                               activebackground=BTN_H, activeforeground=TEXT,
-                              command=lambda o=opt: (app.set(key, o), refresh()))
+                              command=lambda o=opt: pick(o))
                 b.pack(side="right", padx=3)
                 b.bind("<Enter>", lambda e, w=b: w.config(bg=BTN_H))
                 b.bind("<Leave>", lambda e, w=b: w.config(bg=BTN))
