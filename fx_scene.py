@@ -312,9 +312,11 @@ class Scene:
         # ---------------- 宠物跟随（画在最后 = 鼠标层最上）
         # 宠物是这一层的主体，压在涟漪与水波之上才看得清；水波那次 solo 整片
         # 直写发生在本段**之前**，所以不会把宠物抹掉。
-        # 指针每帧都喂（特效关着也喂）：重新启用时 _seat() 要按当前光标把队伍
-        # 摆出来，喂不到就会先出现在很久以前的位置。
-        self.pets.set_pointer(float(self.mouse.mx), float(self.mouse.my))
+        # 指针与点击每帧都喂（特效关着也喂）：重新启用时 _seat() 要按当前光标
+        # 把队伍摆出来，喂不到就会先出现在很久以前的位置。点击给它喂的是
+        # `mouse.clicked`（1=左键 2=右键 0=无），宠物用它决定要不要弹表情。
+        self.pets.set_pointer(float(self.mouse.mx), float(self.mouse.my),
+                              int(self.mouse.clicked))
         if cfg.get("pet_enabled", False):
             self.pets.update(dt, cfg)
             self.pets.draw(buf_ms, w, h, cfg)

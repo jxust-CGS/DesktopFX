@@ -1495,14 +1495,20 @@ class ControlPanel:
         c.pack(fill="x", padx=16, pady=(0, 8))
         self._toggle(c, "启用宠物跟随", "pet_enabled")
         self._choices(c, "种类", "pet_kind", PET_KINDS)
-        self._slider(c, "数量", "pet_count", 1, 3, 1, "{:.0f} 只")
+        self._slider(c, "数量", "pet_count", 1, 10, 1, "{:.0f} 只")
         self._slider(c, "大小", "pet_size", 24, 120, 2, "{:.0f} 像素")
         self._slider(c, "跟随紧密度", "pet_follow", 0.05, 1.0, 0.01, "{:.0%}")
+        self._slider(c, "静止后消失", "pet_idle_fade", 0.0, 6.0, 0.1,
+                     "{:.1f} 秒")
         self._swatch(c, "毛色", "pet_color", PET_COLORS)
         self._slider(c, "不透明度", "pet_opacity", 0.2, 1.0, 0.01, "{:.0%}")
+        self._toggle(c, "点击时弹出表情", "pet_expr")
         self._hint(c, "小猫小狗沿着鼠标划过的路线跟上来：第一只追光标，"
-                      "其余排成一列跟在它身后（间距跟着体型走）。停下时它们会"
-                      "自己收拢站定，走得越快晃动越明显。")
+                      "其余排成一列跟在它身后（间距跟着体型走），最多 10 只。"
+                      "它们会甩着尾巴走、偶尔眨眼，停下时也会轻轻晃。")
+        self._hint(c, "「静止后消失」是光标停住多久后它们淡出，一动就回来"
+                      "（填 0 表示一直跟着不消失）；「点击时弹出表情」会在"
+                      "点击时让带头那只弹出一个爱心 / 星星 / 音符 / 闪光。")
         self._hint(c, "转身带一点迟滞，所以鼠标原地画圈时它们不会左右乱跳；"
                       "「跟随紧密度」调低会更像慢悠悠地追，调高就紧咬着不放。")
         self._hint(c, "形象是用代码画出来的，不依赖任何图片文件。"

@@ -35,9 +35,15 @@ W, H = 480, 360
 
 
 def _cfg(**over):
+    """基线配置。**默认关掉静止渐隐**（`pet_idle_fade=0`）。
+
+    物理类用例要的是"宠物稳定跟到位"，而渐隐会在光标停住 1.6 秒后把它们冻住
+    （隐去时物理不再推进）—— 混在一起会让用例变成在测两件事。渐隐本身有专门
+    的用例，各测各的。
+    """
     cfg = dict(pet_enabled=True, pet_kind="小猫", pet_count=2.0,
                pet_size=56.0, pet_follow=0.55, pet_color="#F2C27B",
-               pet_opacity=1.0)
+               pet_opacity=1.0, pet_idle_fade=0.0, pet_expr=True)
     cfg.update(over)
     return cfg
 
@@ -376,7 +382,260 @@ def test_layer_activity_includes_pets():
     return True, "宠物在场时鼠标层报有内容，全屏层不受影响"
 
 
-# ---------------------------------------------------------- 6. 注册表
+# ---------------------------------------------------------- 5. 动画帧
+def _frames(kind="小猫", size=64.0):
+    p = PetField(W, H)
+    p._ensure_sprite(dict(pet_kind=kind, pet_color="#F2C27B", pet_size=size))
+    return p
+
+
+def _spread(frames, y0f, y1f, x0f=0.0, x1f=1.0):
+    """一组帧在指定区域内的"平均逐像素标准差" —— 用来量化动画幅度。"""
+    S = frames.shape[1]
+    sub = frames[:, int(S * y0f):int(S * y1f), int(S * x0f):int(S * x1f)]
+    return float(sub.std(axis=0).mean())
+
+
+def test_frames_exist_and_differ():
+    """走路/静止帧数正确，且帧与帧之间必须真的不一样。"""
+    p = _frames()
+    if p._frames_walk.shape[0] != PetField._WALK_FRAMES:
+        return False, f"走路帧数 {p._frames_walk.shape[0]}"
+    if p._frames_idle.shape[0] != PetField._IDLE_FRAMES:
+        return False, f"静止帧数 {p._frames_idle.shape[0]}"
+    for name, f in (("走路", p._frames_walk), ("静止", p._frames_idle)):
+        if float(f[0].std()) <= 0.0:
+            return False, f"{name}帧是空白的"
+        same = all(float(np.abs(f[k] - f[0]).max()) == 0.0
+                   for k in range(1, len(f)))
+        if same:
+            return False, f"{name}循环里每一帧完全相同 —— 动画没生效"
+    return True, (f"走路 {p._frames_walk.shape[0]} 帧 / 静止 "
+                  f"{p._frames_idle.shape[0]} 帧，帧间均有差异")
+
+
+def test_legs_move_only_when_walking():
+    """腿只在走路帧里动；静止帧的腿必须站定，只有尾巴在摆。
+
+    这是"走路/静止两套帧序列"存在的全部意义。判据取**下半身（腿）**与
+    **左上（尾巴）**两个区域的动画幅度做对比，而不是"帧之间有没有差异"——
+    后者静止帧也满足（尾巴在摆）。
+    """
+    p = _frames()
+    legs = (0.72, 1.0)
+    tail = (0.28, 0.80, 0.0, 0.30)
+    w_legs = _spread(p._frames_walk, *legs)
+    i_legs = _spread(p._frames_idle, *legs)
+    if w_legs <= i_legs * 1.5:
+        return False, (f"走路帧腿部幅度 {w_legs:.4f} 并不明显大于静止帧 "
+                       f"{i_legs:.4f} —— 走路时腿没动起来")
+    if abs(i_legs) > 1e-6 and i_legs > w_legs * 0.5:
+        return False, f"静止帧腿部幅度 {i_legs:.4f} 过大（腿不该在走）"
+    w_tail = _spread(p._frames_walk, *tail)
+    i_tail = _spread(p._frames_idle, *tail)
+    if i_tail <= 1e-6:
+        return False, "静止帧尾巴完全没摆（静止时应该轻轻晃）"
+    return True, (f"腿部幅度 走路 {w_legs:.4f} vs 静止 {i_legs:.4f}"
+                  f"（{w_legs / max(i_legs, 1e-9):.1f} 倍）；"
+                  f"静止帧尾巴仍在摆 {i_tail:.4f}")
+
+
+def test_gait_offsets_desynchronize():
+    """每只宠物的走路相位必须有偏移，否则 10 只会像列队操一样同步摆尾。"""
+    p = _frames()
+    offs = p._gait_off[:PetField.MAX_PETS]
+    if float(offs.std()) < 0.5:
+        return False, f"各只的相位偏移几乎相同（std={float(offs.std()):.3f}）"
+    # 同一时刻两只宠物的选帧不该总是一样
+    idxs = {p._frame_index(i, PetField._WALK_FRAMES)
+            for i in range(PetField.MAX_PETS)}
+    if len(idxs) < 3:
+        return False, f"10 只同一时刻只落在 {len(idxs)} 种帧上（太整齐）"
+    return True, (f"相位偏移 std={float(offs.std()):.2f}，"
+                  f"同一时刻分散在 {len(idxs)} 种帧上")
+
+
+def test_blink_overlay_is_cropped():
+    """闭眼覆盖层要裁到眼部，且位置落在上半部的中间区域。"""
+    for kind in PetField.KINDS:
+        p = _frames(kind)
+        if p._blink is None:
+            return False, f"{kind}: 没有生成眨眼覆盖层"
+        img, dx, dy = p._blink
+        S = p._frames_walk.shape[1]
+        area = img.shape[0] * img.shape[1]
+        if area > 0.25 * S * S:
+            return False, (f"{kind}: 覆盖层占整图 "
+                           f"{100.0 * area / (S * S):.0f}%（没裁到眼睛）")
+        # 眼睛归一化坐标 y≈0.37~0.39 → 落在上半部；x≈0.5~0.85 → 中偏右
+        cy = (dy + img.shape[0] * 0.5) / S
+        if not (0.24 <= cy <= 0.52):
+            return False, f"{kind}: 覆盖层中心 y={cy:.2f}，不在眼部高度"
+    return True, "两种形象的闭眼覆盖层都裁到眼部（仅占整图约 6%）"
+
+
+# ---------------------------------------------------------- 6. 静止渐隐
+def _run(p, cfg, fps, secs, target, click=0, feed=True):
+    for k in range(max(1, int(fps * secs))):
+        if feed:
+            p.set_pointer(target[0], target[1],
+                          click if k == 0 else 0)
+        p.update(1.0 / fps, cfg)
+
+
+def test_idle_fade_hides_then_wakes():
+    """光标停住超过阈值 → 渐隐并停止上屏；一动 → 淡入并在光标处重新落位。"""
+    p = PetField(W, H)
+    cfg = _cfg(pet_idle_fade=1.0, pet_count=3.0)
+    _run(p, cfg, 60, 0.3, (200.0, 200.0))          # 先落位
+    if not p.active():
+        return False, "刚落位就被判成不可见"
+    _run(p, cfg, 60, 0.4, (200.0, 200.0))          # 累计静止 0.7 秒，未到阈值
+    if p._fade <= 0.01:
+        return False, (f"静止 {p._idle:.2f} 秒（阈值 1.0 秒）就淡光了 —— "
+                       f"阈值没生效")
+    _run(p, cfg, 60, 1.0, (200.0, 200.0))          # 越过阈值
+    if p._fade > 0.01 or p.active():
+        return False, (f"静止 {p._idle:.2f} 秒后仍可见（fade={p._fade:.2f}, "
+                       f"active={p.active()}）")
+    if not p._hidden:
+        return False, "淡光后没有进入 hidden 状态"
+
+    # 一动就回来，而且要**落在光标处**而不是从老位置跑过来
+    p.set_pointer(700.0, 420.0)
+    p.update(1.0 / 60.0, cfg)
+    if p._hidden or p._fade <= 0.0:
+        return False, "移动后没有立刻淡入"
+    d0 = ((float(p.px[0]) - 700.0) ** 2 + (float(p.py[0]) - 420.0) ** 2) ** 0.5
+    if d0 > 8.0:
+        return False, f"唤醒后第一只离光标 {d0:.0f} 像素（应从光标处出现）"
+    _run(p, cfg, 60, 0.6, (700.0, 420.0))
+    if p._fade < 0.99:
+        return False, f"唤醒 0.6 秒后仍未完全淡入（fade={p._fade:.2f}）"
+    return True, "静止 1.4 秒后淡光且停止上屏；一动立刻在光标处淡入复原"
+
+
+def test_idle_fade_zero_never_hides():
+    """填 0 = 一直跟着，不该因为静止就消失。"""
+    p = PetField(W, H)
+    cfg = _cfg(pet_idle_fade=0.0)
+    _run(p, cfg, 60, 5.0, (300.0, 300.0))
+    if p._fade < 0.99 or p._hidden:
+        return False, f"阈值填 0 却仍然消失了（fade={p._fade:.2f}）"
+    return True, "阈值 0 时静止 5 秒仍全程可见"
+
+
+def test_click_wakes_hidden_pets():
+    """光标不动时点一下，宠物该回来 —— 点击也算交互。"""
+    p = PetField(W, H)
+    cfg = _cfg(pet_idle_fade=0.8)
+    _run(p, cfg, 60, 2.0, (400.0, 400.0))
+    if not p._hidden:
+        return False, "前提不成立：静止 2 秒后没有隐去"
+    p.set_pointer(400.0, 400.0, 1)          # 原地点击（位置没变）
+    p.update(1.0 / 60.0, cfg)
+    if p._hidden:
+        return False, "原地点击没有把宠物叫回来"
+    if p._expr_t <= 0.0:
+        return False, "点击没有触发表情"
+    return True, "隐去状态下原地点击能唤醒，并同时触发表情"
+
+
+# ---------------------------------------------------------- 7. 点击表情
+def test_click_expression_lifecycle():
+    """点击 → 弹表情（出现在头顶上方）→ 到时自动消失。"""
+    p = PetField(W, H)
+    cfg = _cfg(pet_count=1.0)
+    _run(p, cfg, 60, 0.5, (W * 0.5, H * 0.5))
+    p.set_pointer(W * 0.5, H * 0.5, 1)
+    p.update(1.0 / 60.0, cfg)
+    if p._expr_t <= 0.0:
+        return False, "点击后没有进入表情状态"
+    if not (0 <= p._expr_idx < len(PetField.EXPR_KINDS)):
+        return False, f"表情序号越界：{p._expr_idx}"
+
+    buf = np.full(W * H, BG_BRIGHT, np.uint32)
+    p.draw(buf, W, H, cfg)
+    with_expr = int((buf != BG_BRIGHT).sum())
+    p._expr_t = 0.0
+    buf2 = np.full(W * H, BG_BRIGHT, np.uint32)
+    p.draw(buf2, W, H, cfg)
+    without = int((buf2 != BG_BRIGHT).sum())
+    if with_expr <= without:
+        return False, f"表情帧没有多画任何像素（{with_expr} vs {without}）"
+
+    # 表情必须画在**宠物上方**：取两者的差异像素，平均 y 要更靠上。
+    # 缓冲区是扁平的，行号 = 扁平下标 // 宽度，也就是 y。
+    diff = (buf != buf2)
+    ys = np.nonzero(diff)[0] // W
+    if ys.size == 0:
+        return False, "找不到表情新增的像素"
+    body_ys = np.nonzero(buf2 != BG_BRIGHT)[0] // W
+    if ys.mean() >= body_ys.mean():
+        return False, (f"表情平均 y={ys.mean():.0f} 不低于宠物本体 "
+                       f"{body_ys.mean():.0f} —— 没有弹在头顶")
+
+    # 到时消失
+    for _ in range(int((PetField._EXPR_LIFE + 0.2) * 60)):
+        p.update(1.0 / 60.0, cfg)
+    if p._expr_t > 0.0:
+        return False, "表情过了寿命仍没消失"
+    return True, (f"点击弹表情（' {PetField.EXPR_KINDS[p._expr_idx]} '），"
+                  f"头顶新增 {with_expr - without} 像素，"
+                  f"{PetField._EXPR_LIFE} 秒后自动消失")
+
+
+def test_expression_can_be_disabled():
+    p = PetField(W, H)
+    cfg = _cfg(pet_expr=False)
+    _run(p, cfg, 60, 0.4, (W * 0.5, H * 0.5))
+    p.set_pointer(W * 0.5, H * 0.5, 1)
+    p.update(1.0 / 60.0, cfg)
+    if p._expr_t > 0.0:
+        return False, "关掉开关后点击仍然弹了表情"
+    return True, "开关关闭时点击不弹表情"
+
+
+# ---------------------------------------------------------- 8. 十只同屏
+def test_ten_pets_ok():
+    """10 只（上限）同屏：不产生 NaN、落屏像素量级合理、成本可接受。"""
+    import time as _t
+    p = PetField(1920, 1200)
+    cfg = _cfg(pet_count=float(PetField.MAX_PETS), pet_follow=0.7)
+    buf = np.zeros(1920 * 1200, np.uint32)
+    for k in range(120):
+        p.set_pointer(700.0 + 200.0 * (k % 2), 500.0)
+        p.update(1.0 / 60.0, cfg)
+        p.draw(buf, 1920, 1200, cfg)
+        buf[:] = 0
+    if p._n != PetField.MAX_PETS:
+        return False, f"实际只带了 {p._n} 只"
+    vals = np.concatenate([p.px, p.py, p.vx, p.vy])
+    if not np.isfinite(vals).all():
+        return False, "10 只时出现 NaN / Inf"
+    p.draw(buf, 1920, 1200, cfg)
+    n_px = int((buf > 0).sum())
+    if n_px <= 0:
+        return False, "10 只一只都没画出来"
+    if n_px > 1920 * 1200 * 0.05:
+        return False, f"落屏 {n_px} 像素（超过 5% 屏幕），画得太满"
+
+    # 计时只作参考：本机约 1.8ms/帧，这里放宽到 8ms 只为拦住数量级退化
+    t0 = _t.perf_counter()
+    for k in range(120):
+        p.set_pointer(700.0 + 200.0 * (k % 2), 500.0)
+        p.update(1.0 / 60.0, cfg)
+        buf[:] = 0
+        p.draw(buf, 1920, 1200, cfg)
+    ms = (_t.perf_counter() - t0) / 120 * 1000.0
+    if ms > 8.0:
+        return False, f"10 只每帧 {ms:.2f}ms（超出 8ms 上限）"
+    return True, (f"10 只同屏：无 NaN，落屏 {n_px} 像素"
+                  f"（占屏 {100.0 * n_px / (1920 * 1200):.1f}%），"
+                  f"每帧 {ms:.2f}ms")
+
+
+# ---------------------------------------------------------- 9. 注册表
 def test_registry():
     import fx_kinds
     info = fx_kinds.EFFECTS.get("宠物跟随")
@@ -397,10 +656,11 @@ def test_registry():
         if bad:
             return False, f"预设 {n} 含未登记的键：{bad}"
     for k in ("pet_enabled", "pet_kind", "pet_count", "pet_size",
-              "pet_follow", "pet_color", "pet_opacity"):
+              "pet_follow", "pet_color", "pet_opacity",
+              "pet_idle_fade", "pet_expr"):
         if k not in d.DEFAULTS:
             return False, f"DEFAULTS 缺 {k}"
-    return True, "分类/分层/启停键/导航/预设 六处登记齐全"
+    return True, "分类/分层/启停键/导航/预设 六处登记齐全（9 个 pet_ 键）"
 
 
 def test_kind_and_values_sane():
@@ -417,9 +677,15 @@ def test_kind_and_values_sane():
     p = PetField(W, H)
     p._ensure_sprite(dict(pet_kind="不存在", pet_color="#F2C27B",
                           pet_size=48.0))
-    if p._sprite is None:
+    if p._frames_walk is None:
         return False, "未知种类没有兜底，精灵构建失败"
-    return True, "默认值与钳制区间自洽；未知种类兜到默认形象"
+    for k in ("pet_idle_fade", "pet_expr"):
+        if k not in d.DEFAULTS:
+            return False, f"DEFAULTS 缺 {k}"
+    if PetField.MAX_PETS != 10:
+        return False, f"数量上限是 {PetField.MAX_PETS}，期望 10"
+    return True, ("默认值与钳制区间自洽；未知种类兜到默认形象；"
+                  f"数量上限 {PetField.MAX_PETS} 只")
 
 
 # ------------------------------------------------- 7. 负向对照（判据灵敏性）
@@ -494,6 +760,16 @@ def main():
         test_face_flips_on_sustained_move,
         test_sprite_geometry,
         test_sprite_has_feathered_edge,
+        test_frames_exist_and_differ,
+        test_legs_move_only_when_walking,
+        test_gait_offsets_desynchronize,
+        test_blink_overlay_is_cropped,
+        test_idle_fade_hides_then_wakes,
+        test_idle_fade_zero_never_hides,
+        test_click_wakes_hidden_pets,
+        test_click_expression_lifecycle,
+        test_expression_can_be_disabled,
+        test_ten_pets_ok,
         test_blend_depends_on_destination,
         test_blend_covers_sprite_area,
         test_opacity_zero_draws_nothing,

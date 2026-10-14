@@ -9,6 +9,7 @@ RGB 需预乘 alpha），整层再由 Windows 以 per-pixel alpha 合成到桌�
 import colorsys
 import ctypes
 import ctypes.wintypes as wt
+import math
 
 import numpy as np
 
@@ -3008,13 +3009,39 @@ class CursorTrailField:
 
 
 # ------------------------------------------------------------------ 宠物跟随
+# ------------------------------------------------------------------ 宠物跟随
+def _pet_rot_rel(pts, ang):
+    """把相对坐标点绕原点旋转 ang —— 用于尾巴摆动。
+
+    放在模块级而不是 PetField 的 staticmethod 里：形象绘制函数是 static 的，
+    拿不到 self，用模块级函数调用比 `PetField._xxx` 回指类名更直接。
+    """
+    ca, sa = math.cos(ang), math.sin(ang)
+    return [(x * ca - y * sa, x * sa + y * ca) for x, y in pts]
+
+
+def _pet_leg(base_pt, foot_pt, step, lift_dir=1.0):
+    """按步幅算出"抬起的那条腿"的折线端点。
+
+    抬起 = 脚往行进方向偏移、同时离地一点点。两条腿用相反的 lift_dir 传进来，
+    就得到交替迈步的效果（后腿往前时前腿往后）。
+    """
+    bx, by = base_pt
+    fx, fy = foot_pt
+    lift = max(0.0, step * lift_dir)
+    return [(bx, by), (fx + step * 0.062 * lift_dir, fy - lift * 0.050)]
+
+
 class PetField:
     """宠物跟随：小猫 / 小狗沿着鼠标轨迹跟在后面跑。
 
-    三处值得说的设计：
+    几处值得说的设计：
 
-    * **精灵预渲染**：卡通形象用 PIL 在 3× 画布上画一次、LANCZOS 缩到目标
-      尺寸，存成**预乘** RGBA 数组；之后每帧只做贴图，成本与形象复杂度无关。
+    * **帧序列预渲染**：卡通形象用 PIL 在 3× 画布上画好、LANCZOS 缩到目标尺寸，
+      存成**预乘** RGBA 数组。走路 6 帧（尾巴摆动 + 前后腿交替）、静止 4 帧
+      （只摆尾巴、腿站定），另加一张**裁剪过的闭眼覆盖层**做眨眼。
+      帧序列而不是"每帧现算骨架"：之后每帧只做贴图，成本与形象复杂度无关；
+      而宠物最多 10 只同屏，每只还现算一遍骨骼就太重了。
       画布取 `max(64, 显示尺寸)` 再缩下来 —— 小体型时降采样比直接画 24px 干净。
       形状一律由代码绘制，不引入图片资源，也就不牵扯第三方形象授权。
 
@@ -3026,12 +3053,18 @@ class PetField:
     * **朝向迟滞**：按水平速度左右翻转，带速度阈值 + 需连续保持一小段时间。
       没有迟滞的话，鼠标原地画小圈会让宠物每帧左右横跳。
 
+    * **静止渐隐**：光标停住一小会儿就淡出，一动立刻淡入并在光标身后重新落位。
+      渐隐而不是"啪"地消失，是因为后者在余光里像闪断。
+
+    * **点击表情**：点击时领头那只头顶弹出一个可爱图标，带回弹缩放 + 上飘 + 淡出。
+      图标同样是代码画的（爱心 / 星星 / 音符 / 闪光）。
+
     与其它特效共用 resize/update/draw 的接口约定，另加 `set_pointer()` ——
-    目标点来自外部鼠标，由 Scene 每帧喂进来。
+    目标点与点击事件来自外部鼠标，由 Scene 每帧喂进来。
     """
 
     KINDS = ("小猫", "小狗")
-    MAX_PETS = 3
+    MAX_PETS = 10
 
     # 触发转向的最小水平速度与需保持的时间。阈值给得偏高：宠物慢慢挪动时
     # 应该保持原朝向"侧着身子走"，而不是跟着微小抖动转身。
@@ -3039,6 +3072,23 @@ class PetField:
     _FLIP_HOLD = 0.07           # 秒
     _SPRITE_MIN = 64            # 精灵分辨率下限
     _SS = 3                     # 精灵超采样倍数
+    _WALK_FRAMES = 6            # 走路循环帧数（尾巴摆动 + 前后腿交替）
+    _IDLE_FRAMES = 4            # 静止循环帧数（只摆尾巴）
+    _STEP_SIZE = 8              # 精灵尺寸按此量化后再缓存（拖滑块时少重建几次）
+
+    # 静止多久开始渐隐 / 淡入淡出各用多久（秒）
+    _FADE_IN = 0.26
+    _FADE_OUT = 0.42
+    # 走路动画的判定速度：低于它就走"静止帧"（腿站定、只摆尾）
+    _WALK_SPEED = 26.0
+
+    # 点击表情
+    EXPR_KINDS = ("爱心", "星星", "音符", "闪光")
+    _EXPR_LIFE = 1.25           # 一次表情从弹出到消失的总时长
+    _EXPR_POP = 0.20            # 弹出（回弹）阶段时长
+    _EXPR_FADE = 0.32           # 收尾淡出时长
+    _BLINK_TIME = 0.11          # 单次眨眼时长
+    _BLINK_GAP = (2.2, 6.0)     # 两次眨眼的间隔范围（随机）
 
     def __init__(self, w, h, seed=53):
         self.rng = np.random.default_rng(seed)
@@ -3052,19 +3102,51 @@ class PetField:
         self.vy = np.zeros(self.MAX_PETS, np.float32)
         self._face = np.ones(self.MAX_PETS, np.float32)     # +1 朝右 / -1 朝左
         self._hold = np.zeros(self.MAX_PETS, np.float32)
+        # 每只的走路相位错开一点，否则 10 只会像列队操一样整齐划一
+        self._gait_off = self.rng.uniform(0.0, 6.283, self.MAX_PETS)
+        # 眨眼：剩余时长 + 距离下次眨眼的倒计时
+        self._blink_t = np.zeros(self.MAX_PETS, np.float32)
+        self._blink_next = self.rng.uniform(self._BLINK_GAP[0],
+                                            self._BLINK_GAP[1], self.MAX_PETS)
         self._n = 0                 # 当前宠物数
         self._placed = False
-        self._phase = 0.0           # 步行相位（驱动力上下浮动）
+        self._phase = 0.0           # 步行相位（驱动帧序号与上下浮动）
         self._speed = 0.0
-        self._sprite = None
+        # 静止渐隐
+        self._idle = 0.0            # 光标静止了多久
+        self._fade = 1.0            # 当前不透明度倍率
+        self._hidden = False        # 已完全隐去（此时冻结物理，等唤醒重新落位）
+        # 输入：由 set_pointer 每帧置位，update 消费后清掉
+        self._moved = False
+        self._clicked = 0
+        # 点击表情
+        self._expr_idx = 0
+        self._expr_t = 0.0
+        self._expr_pet = 0
+        # 预渲染资源
+        self._frames_walk = None
+        self._frames_idle = None
+        self._blink = None          # (img, dx, dy) 裁剪后的闭眼覆盖层
+        self._expr = None           # (E, Es, Es, 4) 表情图标
         self._sprite_key = None
         self._failed = False        # 精灵构建失败过就不要再每帧重试
 
     # ------------------------------------------------------------ 外部接口
-    def set_pointer(self, x, y):
-        """Scene 每帧喂当前光标位置（覆盖层坐标系）。"""
-        self._mx = float(x)
-        self._my = float(y)
+    def set_pointer(self, x, y, clicked=0):
+        """Scene 每帧喂当前光标位置与点击事件（覆盖层坐标系）。
+
+        `clicked`：1=左键 2=右键 0=无。位移与点击都在这里记成"待消费"标志，
+        由 `update()` 统一处理 —— 一帧里指针可能被喂多次（Scene 里聚光灯 /
+        颜料盘 / 宠物各要一次），不能在喂的时候直接改状态。
+        """
+        x = float(x)
+        y = float(y)
+        # 位移阈值 1px：DPI 缩放下光标可能报出亚像素抖动，不该被当成"在动"
+        if abs(x - self._mx) + abs(y - self._my) > 1.0:
+            self._moved = True
+        self._mx, self._my = x, y
+        if clicked:
+            self._clicked = int(clicked)
 
     def resize(self, w, h):
         self.w, self.h = w, h
@@ -3076,10 +3158,22 @@ class PetField:
         self.vx[:] = 0.0
         self.vy[:] = 0.0
         self._hold[:] = 0.0
+        self._blink_t[:] = 0.0
+        self._fade = 1.0
+        self._hidden = False
+        self._idle = 0.0
+        self._expr_t = 0.0
 
     def active(self):
-        """这一帧有没有宠物要画（给"空层跳过"用的保守信号）。"""
-        return bool(self._placed and self._n > 0 and self._sprite is not None)
+        """这一帧有没有宠物要画（给"空层跳过"用的保守信号）。
+
+        完全隐去时返回 False，让鼠标层这一帧可以被跳过 —— 这是"静止就消失"
+        顺带省下来的开销，也是它必须准确的原因：报 False 报错了，隐身中的
+        宠物会被冻在屏幕上再也回不来。
+        """
+        return bool(self._placed and self._n > 0
+                    and self._frames_walk is not None
+                    and self._fade > 0.01)
 
     # ------------------------------------------------------------ 每帧
     def update(self, dt, cfg):
@@ -3093,6 +3187,8 @@ class PetField:
         size = float(np.clip(float(cfg.get("pet_size", 56.0)), 16.0, 160.0))
         follow = float(np.clip(float(cfg.get("pet_follow", 0.55)), 0.0, 1.0))
         spacing = size * 0.82       # 队列间距跟着体型走
+        # 0 = 不消失（一直跟着）
+        idle_fade = max(0.0, float(cfg.get("pet_idle_fade", 1.6)))
 
         try:
             self._ensure_sprite(cfg)
@@ -3103,12 +3199,57 @@ class PetField:
             self._failed = True
             raise
 
+        moved = self._moved
+        self._moved = False
+        clicked = self._clicked
+        self._clicked = 0
+
+        # ---------------- 静止计时与唤醒
+        # 点击也算"有交互"：光标不动时点一下，宠物该回来给个表情，
+        # 而不是继续隐身。
+        if moved or clicked:
+            self._idle = 0.0
+            if self._hidden:
+                # 重新出现时**直接落在光标身后**，而不是从隐身前的老位置
+                # 冲过来 —— 那会像被甩出去一样。
+                self._hidden = False
+                self._seat(n, spacing)
+                self._n = n
+                self._placed = True
+                self._fade = 0.0
+        else:
+            self._idle += dt
+
         # 首次出现 / 改数量：把队伍直接铺在光标身后。否则它们会从 (0,0)
         # 排队跑过来，像被甩出去一样。
         if not self._placed or n != self._n:
             self._seat(n, spacing)
             self._n = n
             self._placed = True
+
+        # ---------------- 点出表情
+        if clicked and cfg.get("pet_expr", True) and n > 0:
+            self._expr_idx = int(self.rng.integers(0, len(self.EXPR_KINDS)))
+            self._expr_t = self._EXPR_LIFE
+            self._expr_pet = 0          # 领头那只来表现，最显眼
+        if self._expr_t > 0.0:
+            self._expr_t = max(0.0, self._expr_t - dt)
+
+        # ---------------- 渐隐 / 淡入
+        want = 0.0 if (idle_fade > 0.0 and self._idle >= idle_fade) else 1.0
+        if self._fade < want:
+            self._fade = min(want, self._fade + dt / self._FADE_IN)
+        elif self._fade > want:
+            self._fade = max(want, self._fade - dt / self._FADE_OUT)
+        if want == 0.0 and self._fade <= 0.01:
+            # 完全隐去后冻结物理：看不见的东西不必算，等唤醒时重新落位
+            self._hidden = True
+            self._speed = 0.0
+            return
+
+        # 隐去期间不推进物理（唤醒时会 _seat 重排）
+        if self._hidden:
+            return
 
         # 刚度：follow=0 时松垮（慢悠悠），follow=1 时紧咬不放。
         # 阻尼取临界值 c = 2√k 并略微过阻尼（×1.03）—— 欠阻尼的宠物会在
@@ -3155,10 +3296,31 @@ class PetField:
             else:
                 self._hold[i] = 0.0
 
+        # ---------------- 眨眼：每只各走各的节奏
+        for i in range(n):
+            if self._blink_t[i] > 0.0:
+                self._blink_t[i] -= dt
+            else:
+                self._blink_next[i] -= dt
+                if self._blink_next[i] <= 0.0:
+                    self._blink_t[i] = self._BLINK_TIME
+                    self._blink_next[i] = float(self.rng.uniform(
+                        self._BLINK_GAP[0], self._BLINK_GAP[1]))
+
         # 步行相位：走得快摆得快，同时留一个"慢悠悠踱步"的下限
         spd = (float(self.vx[0]) ** 2 + float(self.vy[0]) ** 2) ** 0.5
         self._speed = spd
         self._phase += dt * (2.4 + spd / 70.0)
+
+    # ------------------------------------------------------------ 动画选帧
+    def _frame_index(self, i, nf):
+        """第 i 只宠物当前该用第几帧。
+
+        每只带一个固定的相位偏移（`_gait_off`），否则 10 只会像列队操一样
+        整齐划一地摆尾巴 —— 一眼就能看出是同一张图在动。
+        """
+        ph = self._phase * 1.15 + float(self._gait_off[i])
+        return int(ph) % nf
 
     def _seat(self, n, spacing):
         """把 n 只宠物沿当前朝向铺在光标身后（首次出现 / 改数量时调用）。"""
@@ -3173,32 +3335,89 @@ class PetField:
     def draw(self, u32, w, h, cfg):
         if not self.active():
             return
-        op = float(np.clip(float(cfg.get("pet_opacity", 1.0)), 0.0, 1.0))
+        op = (float(np.clip(float(cfg.get("pet_opacity", 1.0)), 0.0, 1.0))
+              * self._fade)
         if op <= 0.004:
             return
-        base = self._sprite
-        S = base.shape[0]
+        moving = self._speed > self._WALK_SPEED
+        frames = self._frames_walk if moving else self._frames_idle
+        nf = frames.shape[0]
+        S = frames.shape[1]
         # 完全平移的宠物看着像贴纸；加一点上下浮动，幅度随速度增长
         amp = S * 0.030
         gait = 0.30 + 0.70 * min(1.0, self._speed / 260.0)
-        for i in range(self._n):
-            yb = float(np.sin(self._phase + i * 1.1)) * amp * gait
-            img = base[:, ::-1] if self._face[i] < 0.0 else base
-            self._blit(u32, w, h, img, float(self.px[i]),
-                       float(self.py[i]) + yb, op)
 
-    def _blit(self, u32, w, h, img, cx, cy, op):
-        """把预乘 RGBA 精灵以 (cx, cy) 为中心**叠加**到缓冲上。
+        for i in range(self._n):
+            cx = float(self.px[i])
+            cy = float(self.py[i]) + float(np.sin(
+                self._phase + float(self._gait_off[i]))) * amp * gait
+            flip = self._face[i] < 0.0
+            img = frames[self._frame_index(i, nf)]
+            if flip:
+                img = img[:, ::-1]
+            self._blit(u32, w, h, img, cx, cy, op)
+
+            # 眨眼：把裁剪过的闭眼覆盖层贴回**同一位置**。
+            # 覆盖层按精灵坐标裁剪过，所以翻转时它的横向偏移也要跟着镜像。
+            if self._blink_t[i] > 0.0 and self._blink is not None:
+                bimg, bdx, bdy = self._blink
+                if flip:
+                    bdx = S - bdx - bimg.shape[1]
+                self._blit(u32, w, h, bimg,
+                           cx - S * 0.5 + bdx + bimg.shape[1] * 0.5,
+                           cy - S * 0.5 + bdy + bimg.shape[0] * 0.5,
+                           op, center=True)
+
+            # 点击表情：领头那只头顶弹出图标
+            if self._expr_t > 0.0 and i == self._expr_pet:
+                self._draw_expr(u32, w, h, cx, cy, S, op, flip)
+
+    def _draw_expr(self, u32, w, h, cx, cy, S, op, flip):
+        """把当前表情画在宠物头顶：回弹弹出 → 轻轻上飘 → 淡出。"""
+        if self._expr is None or len(self._expr) == 0:
+            return
+        t = self._EXPR_LIFE - self._expr_t          # 已经过去多久
+        # 弹出阶段：从 0.3 冲到约 1.0，中段用 sin 给一个回弹过冲。
+        # 过冲而不是线性放大到 1，是"啵"地弹出来那种手感的关键。
+        if t < self._EXPR_POP:
+            u = t / self._EXPR_POP
+            sc = 0.30 + 0.70 * (u ** 0.5) + 0.22 * math.sin(math.pi * u)
+        else:
+            sc = 1.0
+        # 收尾淡出
+        left = self._EXPR_LIFE - t
+        a = 1.0 if left >= self._EXPR_FADE else max(0.0, left / self._EXPR_FADE)
+        if a <= 0.01:
+            return
+        # 整体缓缓上飘，像漫画里的气泡
+        rise = -min(1.0, t / self._EXPR_LIFE) * S * 0.20
+        eimg = self._expr[self._expr_idx]
+        if flip:
+            eimg = eimg[:, ::-1]
+        self._blit(u32, w, h, eimg, cx, cy - S * 0.92 + rise,
+                   op * a, scale=sc)
+
+    def _blit(self, u32, w, h, img, cx, cy, op, scale=1.0, center=True):
+        """把预乘 RGBA 精灵**叠加**到缓冲上（默认以 (cx, cy) 为中心）。
 
         这里做真正的 over 混合，而不是本文件其它特效惯用的"非零覆盖"：
         宠物有羽化边缘，覆盖写法会把半透明边缘像素写成"实心但偏暗"，叠在
         涟漪 / 水面上就是一圈脏边。
         缓冲是预乘格式，所以 over 就是 `dst = src + dst·(1 − src_a)`，不必
         再除 alpha。混合只作用在精灵包围盒上（几十像素见方），开销可忽略。
+
+        `scale` 走最近邻缩放：只给点击表情的"弹出"用（每帧至多一张小图），
+        不值得为它开一条双线性路径。`center=False` 时 (cx, cy) 是左上角 ——
+        闭眼覆盖层已经裁剪过，用左上角定位比换算中心更直接。
         """
+        if scale != 1.0:
+            s0 = img.shape[0]
+            ns = max(1, int(round(s0 * scale)))
+            idx = np.minimum((np.arange(ns) * s0) // ns, s0 - 1)
+            img = img[np.ix_(idx, idx)]
         S = img.shape[0]
-        x0 = int(round(cx - S * 0.5))
-        y0 = int(round(cy - S * 0.5))
+        x0 = int(round(cx - S * 0.5)) if center else int(round(cx))
+        y0 = int(round(cy - S * 0.5)) if center else int(round(cy))
         # 与屏幕求交（宠物可以走出屏幕边缘，裁掉即可）
         gx0, gy0 = max(0, x0), max(0, y0)
         gx1, gy1 = min(int(w), x0 + S), min(int(h), y0 + S)
@@ -3232,7 +3451,13 @@ class PetField:
 
     # ------------------------------------------------------------ 精灵
     def _ensure_sprite(self, cfg):
-        """按 (种类, 颜色, 尺寸) 重建精灵；三者任一变化才重建。"""
+        """按 (种类, 颜色, 尺寸) 重建整套预渲染资源；三者任一变化才重建。
+
+        尺寸**先量化到 `_STEP_SIZE` 的整数倍**再当缓存键：面板滑块是 2px 一档，
+        直接拿精确尺寸当键的话，拖动滑块会触发几十次全量重建（每次要画 10 帧
+        + 覆盖层 + 4 个表情），拖动就会卡。量化后最多十几次，而 8px 的尺寸差
+        在观感上看不出来。
+        """
         if _PImage is None:
             raise RuntimeError("宠物跟随需要 Pillow 来绘制卡通形象，"
                                "当前环境没有可用的 PIL")
@@ -3240,15 +3465,147 @@ class PetField:
         if kind not in self.KINDS:
             kind = self.KINDS[0]
         color = str(cfg.get("pet_color", "#F2C27B"))
-        size = int(np.clip(round(float(cfg.get("pet_size", 56.0))), 16, 160))
+        raw = int(np.clip(round(float(cfg.get("pet_size", 56.0))), 16, 160))
+        size = max(self._SPRITE_MIN,
+                   int(round(raw / self._STEP_SIZE)) * self._STEP_SIZE)
         key = (kind, color, size)
         if key == self._sprite_key:
             return
-        self._sprite = self._build_sprite(kind, color, size)
+        self._frames_walk = self._build_frames(kind, color, size, walk=True)
+        self._frames_idle = self._build_frames(kind, color, size, walk=False)
+        self._blink = self._build_blink(kind, color, size)
+        self._expr = self._build_expr(size)
         self._sprite_key = key
 
-    def _build_sprite(self, kind, color_hex, size):
-        """把卡通形象画进 (size, size, 4) 的**预乘** RGBA 数组。"""
+    def _build_frames(self, kind, color_hex, size, walk):
+        """生成一组动画帧，返回 (F, size, size, 4) 的预乘 RGBA 数组。
+
+        走路帧：尾巴大幅摆动 + 前后腿交替抬起；静止帧：尾巴轻轻晃、腿站定。
+        帧数刻意取得少（6 / 4）—— 每帧都是一张完整位图，帧数直接乘进内存与
+        重建耗时；而宠物在屏幕上只有几十像素，4~6 帧的循环已经足够连贯。
+        """
+        f = self._WALK_FRAMES if walk else self._IDLE_FRAMES
+        out = []
+        for k in range(f):
+            ang = 2.0 * math.pi * k / f
+            if walk:
+                anim = dict(tail=0.46 * math.sin(ang + 0.6),
+                            step=math.sin(ang),
+                            ear=0.14 * math.sin(2.0 * ang))
+            else:
+                # 静止时腿不动，只让尾巴慢摆、偶尔抖一下耳朵
+                anim = dict(tail=0.22 * math.sin(ang),
+                            step=0.0,
+                            ear=0.26 * math.sin(2.0 * ang))
+            out.append(self._build_sprite(kind, color_hex, size, anim))
+        return np.stack(out, axis=0)
+
+    def _build_blink(self, kind, color_hex, size):
+        """生成闭眼覆盖层并**裁剪到眼部包围盒**，返回 (img, dx, dy)。
+
+        裁剪是必要的：不裁的话每次眨眼都要在一整张 size×size 上做一遍 over
+        混合，成本与贴整只宠物相同；裁完只剩眼睛那一条，开销可以忽略。
+        """
+        S = max(self._SPRITE_MIN, int(size))
+        W = S * self._SS
+        img = _PImage.new("RGBA", (W, W), (0, 0, 0, 0))
+        dr = _PDraw.Draw(img)
+        bgr = hex_to_bgr(color_hex)
+        base = (int(bgr[2]), int(bgr[1]), int(bgr[0]))
+        dark = tuple(max(0, int(v * 0.34)) for v in base) + (255,)
+        lw = max(1, int(round(W * 0.013)))
+
+        # 与形象绘制里同一组眼位（改了那边记得同步这里）
+        eyes = ((0.582, 0.376), (0.778, 0.370)) if kind == "小猫" \
+            else ((0.596, 0.380), (0.762, 0.373))
+        for ex, ey in eyes:
+            dr.line([(ex - 0.046) * W, ey * W, ex * W, (ey + 0.012) * W,
+                     (ex + 0.046) * W, ey * W],
+                    fill=dark, width=max(1, int(lw * 1.5)), joint="curve")
+
+        arr = img.resize((int(size), int(size)), _LANCZOS)
+        a = np.asarray(arr).astype(np.float32)[..., 3]
+        ys, xs = np.nonzero(a > 0.02)
+        if xs.size == 0:
+            return None
+        dy0, dy1 = int(ys.min()), int(ys.max()) + 1
+        dx0, dx1 = int(xs.min()), int(xs.max()) + 1
+        crop = np.asarray(arr.crop((dx0, dy0, dx1, dy1))).astype(np.float32)
+        crop *= (1.0 / 255.0)
+        crop[..., :3] *= crop[..., 3:4]         # 直通 alpha -> 预乘
+        return np.ascontiguousarray(crop), dx0, dy0
+
+    def _build_expr(self, size):
+        """生成 4 个点击表情图标，尺寸随宠物体型走。"""
+        es = max(28, int(size * 0.82))
+        return np.stack([self._expr_icon(i, es)
+                         for i in range(len(self.EXPR_KINDS))], axis=0)
+
+    def _expr_icon(self, idx, size):
+        """画一个表情图标。形状与配色都是代码写的，不依赖字体或图片。"""
+        W = size * self._SS
+        img = _PImage.new("RGBA", (W, W), (0, 0, 0, 0))
+        dr = _PDraw.Draw(img)
+
+        def poly(pts, fill):
+            dr.polygon([(x * W, y * W) for x, y in pts], fill=fill)
+
+        def ell(cx, cy, rx, ry, fill):
+            dr.ellipse([(cx - rx) * W, (cy - ry) * W,
+                        (cx + rx) * W, (cy + ry) * W], fill=fill)
+
+        def line(pts, fill, wd):
+            dr.line([(x * W, y * W) for x, y in pts], fill=fill,
+                    width=max(1, int(wd)), joint="curve")
+
+        kind = self.EXPR_KINDS[idx]
+        if kind == "爱心":
+            # 两个圆瓣 + 一个倒三角，拼出心形
+            c = (255, 96, 138, 255)
+            ell(0.355, 0.365, 0.205, 0.205, c)
+            ell(0.645, 0.365, 0.205, 0.205, c)
+            poly([(0.155, 0.435), (0.845, 0.435), (0.500, 0.880)], c)
+            # 左上角一点高光，不然整块颜色太平
+            ell(0.305, 0.310, 0.062, 0.048, (255, 255, 255, 200))
+        elif kind == "星星":
+            c = (255, 209, 102, 255)
+            pts = []
+            for j in range(10):
+                rr = 0.44 if j % 2 == 0 else 0.185
+                aa = -math.pi / 2 + j * math.pi / 5
+                pts.append((0.5 + rr * math.cos(aa), 0.5 + rr * math.sin(aa)))
+            poly(pts, c)
+            ell(0.5, 0.47, 0.075, 0.075, (255, 250, 225, 220))
+        elif kind == "音符":
+            c = (127, 231, 255, 255)
+            ell(0.335, 0.735, 0.185, 0.135, c)      # 符头
+            line([(0.505, 0.720), (0.505, 0.215)], c, max(2, W * 0.045))
+            # 符尾：向右下甩出的一小段弧
+            line([(0.505, 0.215), (0.700, 0.290), (0.760, 0.430)],
+                 c, max(2, W * 0.042))
+        else:   # 闪光
+            c = (255, 250, 235, 255)
+            pts = []
+            for j in range(8):
+                rr = 0.46 if j % 2 == 0 else 0.115
+                aa = -math.pi / 2 + j * math.pi / 4
+                pts.append((0.5 + rr * math.cos(aa), 0.5 + rr * math.sin(aa)))
+            poly(pts, c)
+            ell(0.5, 0.5, 0.075, 0.075, (255, 232, 150, 255))
+
+        img = img.resize((int(size), int(size)), _LANCZOS)
+        arr = np.asarray(img).astype(np.float32) * (1.0 / 255.0)
+        arr[..., :3] *= arr[..., 3:4]
+        return np.ascontiguousarray(arr)
+
+    def _build_sprite(self, kind, color_hex, size, anim=None):
+        """把卡通形象画进 (size, size, 4) 的**预乘** RGBA 数组。
+
+        `anim` 提供 tail / step / ear 三个动画量（尾巴摆角、步幅、耳朵抽动），
+        缺省即中立姿势 —— 单帧入口（`_shot_pet.py` / `_ascii_pet.py` 仍在用）
+        不必关心动画参数。
+        """
+        anim = anim or {"tail": 0.0, "step": 0.0, "ear": 0.0}
         S = max(self._SPRITE_MIN, int(size))
         W = S * self._SS
         img = _PImage.new("RGBA", (W, W), (0, 0, 0, 0))
@@ -3278,7 +3635,7 @@ class PetField:
             dr.line([(x * W, y * W) for x, y in pts], fill=fill,
                     width=max(1, int(wd)), joint="curve")
 
-        args = (ell, cir, poly, line, body, dark, mid, light, white, lw)
+        args = (ell, cir, poly, line, body, dark, mid, light, white, lw, anim)
         if kind == "小狗":
             self._draw_dog(*args)
         else:
@@ -3290,7 +3647,8 @@ class PetField:
         return np.ascontiguousarray(arr)
 
     @staticmethod
-    def _draw_cat(ell, cir, poly, line, body, dark, mid, light, white, lw):
+    def _draw_cat(ell, cir, poly, line, body, dark, mid, light, white, lw,
+                  anim):
         """小猫（侧面朝右，Q 版大头小身）。
 
         画序 = 从后往前（尾巴 -> 后腿 -> 身体 -> 前腿 -> 耳 -> 头 -> 五官），
@@ -3299,19 +3657,35 @@ class PetField:
 
         不画胡须：96px 的精灵上它只有 1px 宽，LANCZOS 缩完糊成一片灰，
         反倒显脏；猫的特征交给耳形与三角鼻去表达。
+
+        动画：尾巴绕根部旋转 `anim["tail"]` 弧度；前后腿按 `anim["step"]`
+        交替抬起；耳朵尖随 `anim["ear"]` 轻微抽动。
         """
-        # 尾巴：从身后向上翘
-        line([(0.13, 0.72), (0.05, 0.60), (0.04, 0.45), (0.13, 0.36)],
-             mid, lw * 3.0)
-        line([(0.26, 0.82), (0.23, 0.92)], mid, lw * 3.4)          # 后腿
+        tail = float(anim.get("tail", 0.0))
+        step = float(anim.get("step", 0.0))
+        ear = float(anim.get("ear", 0.0))
+
+        # 尾巴：绕根部旋转，摆动幅度由动画量给
+        pivot = (0.24, 0.70)
+        rel = [(-0.05, 0.06), (-0.13, -0.04), (-0.16, -0.19), (-0.08, -0.31)]
+        pts = [(pivot[0] + x, pivot[1] + y) for x, y in _pet_rot_rel(rel, tail)]
+        line(pts, mid, lw * 3.0)
+
+        # 后腿 / 前腿：交替迈步
+        line(_pet_leg((0.26, 0.82), (0.23, 0.92), step, 1.0), mid, lw * 3.4)
         ell(0.40, 0.68, 0.30, 0.19, body, dark, lw)                # 身体
-        line([(0.58, 0.82), (0.60, 0.92)], body, lw * 3.4)         # 前腿
+        line(_pet_leg((0.58, 0.82), (0.60, 0.92), step, -1.0),
+             body, lw * 3.4)
         ell(0.52, 0.74, 0.115, 0.075, light)                       # 胸口
-        # 耳朵（底边在头内，头会压住耳根）
-        poly([(0.50, 0.30), (0.52, 0.05), (0.68, 0.20)], body)
-        poly([(0.72, 0.20), (0.88, 0.05), (0.90, 0.30)], body)
-        poly([(0.545, 0.265), (0.557, 0.115), (0.655, 0.205)], light)
-        poly([(0.752, 0.207), (0.845, 0.115), (0.858, 0.272)], light)
+        # 耳朵（底边在头内，头会压住耳根）；tip 随 ear 微动
+        poly([(0.50, 0.30), (0.52 + ear * 0.03, 0.05 - ear * 0.02),
+              (0.68, 0.20)], body)
+        poly([(0.72, 0.20), (0.88 - ear * 0.03, 0.05 - ear * 0.02),
+              (0.90, 0.30)], body)
+        poly([(0.545, 0.265), (0.557 + ear * 0.02, 0.115 - ear * 0.02),
+              (0.655, 0.205)], light)
+        poly([(0.752, 0.207), (0.845 - ear * 0.02, 0.115 - ear * 0.02),
+              (0.858, 0.272)], light)
         cir(0.68, 0.40, 0.24, body, dark, lw)                      # 头
         ell(0.582, 0.376, 0.047, 0.058, dark)                      # 眼
         ell(0.778, 0.370, 0.047, 0.058, dark)
@@ -3322,16 +3696,26 @@ class PetField:
         line([(0.680, 0.501), (0.715, 0.533)], mid, lw)
 
     @staticmethod
-    def _draw_dog(ell, cir, poly, line, body, dark, mid, light, white, lw):
-        """小狗（侧面朝右，垂耳 + 突出的口鼻）。"""
-        line([(0.14, 0.72), (0.06, 0.62), (0.07, 0.50)], mid, lw * 3.0)  # 尾
-        line([(0.26, 0.83), (0.23, 0.93)], mid, lw * 3.4)                 # 后腿
+    def _draw_dog(ell, cir, poly, line, body, dark, mid, light, white, lw,
+                  anim):
+        """小狗（侧面朝右，垂耳 + 突出的口鼻）。动画量含义同小猫。"""
+        tail = float(anim.get("tail", 0.0))
+        step = float(anim.get("step", 0.0))
+        ear = float(anim.get("ear", 0.0))
+
+        pivot = (0.22, 0.68)
+        rel = [(-0.08, -0.02), (-0.15, -0.13), (-0.12, -0.25)]
+        pts = [(pivot[0] + x, pivot[1] + y) for x, y in _pet_rot_rel(rel, tail)]
+        line(pts, mid, lw * 3.0)                                   # 尾
+
+        line(_pet_leg((0.26, 0.83), (0.23, 0.93), step, 1.0), mid, lw * 3.4)
         ell(0.40, 0.69, 0.30, 0.185, body, dark, lw)                      # 身体
-        line([(0.58, 0.83), (0.60, 0.93)], body, lw * 3.4)                # 前腿
+        line(_pet_leg((0.58, 0.83), (0.60, 0.93), step, -1.0),
+             body, lw * 3.4)
         ell(0.52, 0.75, 0.115, 0.075, light)                              # 胸口
-        # 垂耳同样先画：头压住耳根，只让两侧垂下来
-        ell(0.520, 0.500, 0.085, 0.190, mid, dark, lw)
-        ell(0.860, 0.480, 0.085, 0.190, mid, dark, lw)
+        # 垂耳同样先画：头压住耳根，只让两侧垂下来；下缘随 ear 摆动
+        ell(0.520, 0.500 + ear * 0.022, 0.085, 0.190, mid, dark, lw)
+        ell(0.860, 0.480 - ear * 0.022, 0.085, 0.190, mid, dark, lw)
         cir(0.68, 0.40, 0.235, body, dark, lw)                            # 头
         ell(0.760, 0.505, 0.116, 0.090, light)                            # 口鼻
         ell(0.808, 0.472, 0.050, 0.038, dark)                             # 鼻头
