@@ -31,8 +31,15 @@ from PIL import Image
 import desktop_fx as d
 from fx_effects import MeteorField
 
-HERE = Path(__file__).resolve().parent
-OUT = HERE / "docs" / "images" / "meteor-full-screen.png"
+# 本脚本住在 tools/ 子目录里：`sys.path[0]` 与 `__file__` 的父目录都不再是项目根。
+# 向上找到含 desktop_fx.py 的目录（= 项目根）当基准，import 与输出路径才成立。
+ROOT = Path(__file__).resolve().parent
+while not (ROOT / "desktop_fx.py").exists() and ROOT.parent != ROOT:
+    ROOT = ROOT.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+OUT = ROOT / "docs" / "images" / "meteor-full-screen.png"
 W, H = 1920, 1200
 SECS = float(os.environ.get("SHOT_SECS", "45"))
 FPS = 60.0
@@ -46,10 +53,10 @@ def _load_head_meteor():
     一个谁也不是的中间版本（窗口水波那边就吃过这个亏）。
     """
     src = subprocess.run(["git", "show", "HEAD:fx_effects.py"],
-                         cwd=HERE, capture_output=True, text=True, check=True).stdout
+                         cwd=ROOT, capture_output=True, text=True, check=True).stdout
     tmp = Path(tempfile.mkdtemp(prefix="fxhead_")) / "fx_effects_head.py"
     tmp.write_text(src, encoding="utf-8")
-    sys.path.insert(0, str(HERE))
+    sys.path.insert(0, str(ROOT))
     spec = importlib.util.spec_from_file_location("fx_effects_head", tmp)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)

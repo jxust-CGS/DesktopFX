@@ -20,6 +20,15 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+import sys
+
+# 本脚本住在 tools/ 子目录里：`sys.path[0]` 与 `__file__` 的父目录都不再是项目根。
+# 向上找到含 desktop_fx.py 的目录（= 项目根）当基准，import 与输出路径才成立。
+ROOT = Path(__file__).resolve().parent
+while not (ROOT / "desktop_fx.py").exists() and ROOT.parent != ROOT:
+    ROOT = ROOT.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 from fx_effects import WaterRippleField
 from _verify_window_ripple import _old_band
 
@@ -28,7 +37,7 @@ BAND = WaterRippleField._PUSH_W_DEF
 AMP = WaterRippleField._PUSH_AMP
 V_REF = WaterRippleField._PUSH_V_REF
 X, Y0, Y1, WW = 480.0, 200.0, 420.0, 300.0
-OUT = Path(__file__).resolve().parent / "docs" / "images" / "water-push-outward.png"
+OUT = ROOT / "docs" / "images" / "water-push-outward.png"
 
 
 def run(use_new, steps=45, v=900.0, dt=1.0 / 60.0):

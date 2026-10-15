@@ -16,8 +16,13 @@ import tempfile
 import time
 from pathlib import Path
 
+# 本脚本住在 tools/ 子目录里：`sys.path[0]` 与 `__file__` 的父目录都不再是项目根。
+# 向上找到含 desktop_fx.py 的目录（= 项目根）当基准，import 与输出路径才成立。
 ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(ROOT))
+while not (ROOT / "desktop_fx.py").exists() and ROOT.parent != ROOT:
+    ROOT = ROOT.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import desktop_fx as d          # noqa: E402
 import fx_ui                    # noqa: E402

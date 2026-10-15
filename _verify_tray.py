@@ -337,7 +337,7 @@ def test_tray_icon_loads():
     import os
     import fx_tray
     print("== test_tray_icon_loads ==")
-    ico = os.path.join(fx_tray.APP_DIR, "tray_icon.ico")
+    ico = os.path.join(fx_tray.APP_DIR, "assets", "tray_icon.ico")
     assert os.path.exists(ico), f"缺少托盘图标文件: {ico}"
     print(f"  tray_icon.ico: {os.path.getsize(ico)} bytes")
 

@@ -25,8 +25,16 @@ _patch_*.patch
 _*_compare.png
 
 # 开发期截图 / 预览产物（可由脚本重新生成，不入库）
+# 这些脚本住在 tools/ 下，但输出**故意仍落在项目根**（与搬家前一致，
+# 免得调试产物散进产品目录）；所以模式都按根目录名写。
 _diag_A.png
 _diag_B.png
 _diag_screen.png
 _diag_diff.png
 _icon_preview_*.png
+_ui_screenshot.png
+_snow_frame.png
+shot.png
+preview.png
+_longrun_config.json
+_longrun_presets.json

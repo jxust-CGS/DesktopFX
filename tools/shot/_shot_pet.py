@@ -19,9 +19,13 @@ import sys
 
 import numpy as np
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-if HERE not in sys.path:
-    sys.path.insert(0, HERE)
+# 本脚本住在 tools/ 子目录里：`sys.path[0]` 与 `__file__` 的父目录都不再是项目根。
+# 向上找到含 desktop_fx.py 的目录（= 项目根）当基准，import 与输出路径才成立。
+ROOT = os.path.dirname(os.path.abspath(__file__))
+while not os.path.exists(os.path.join(ROOT, "desktop_fx.py")) and os.path.dirname(ROOT) != ROOT:
+    ROOT = os.path.dirname(ROOT)
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
 from PIL import Image, ImageDraw
 
@@ -116,7 +120,7 @@ def main():
     label("虚线以上 = 浅色桌面，以下 = 深色桌面", 40, 466, LABEL_D)
     d.line([(0, 300), (W, 300)], fill=DIVIDER, width=1)
 
-    out = os.path.join(HERE, "docs", "images", "pet-preview.png")
+    out = os.path.join(ROOT, "docs", "images", "pet-preview.png")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     canvas.convert("RGB").save(out)
     print(f"已输出 {out}  ({W}x{H})")

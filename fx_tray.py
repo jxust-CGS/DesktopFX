@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""系统托盘图标（纯 ctypes 原生；默认使用 WorkBuddy 品牌图标 tray_icon.png，
+"""系统托盘图标（纯 ctypes 原生；默认使用 WorkBuddy 品牌图标 assets/tray_icon.png，
 缺失时回退到自绘云雨图标，PIL 可选）。"""
 import ctypes
 import ctypes.wintypes as wt
@@ -99,12 +99,12 @@ class NOTIFYICONDATAW(ctypes.Structure):
 
 # ------------------------------------------------------------------ 图标
 def _icon_rgba(size=32):
-    """加载 WorkBuddy 品牌图标（tray_icon.png），缩放为指定尺寸，返回 BGRA 像素
+    """加载 WorkBuddy 品牌图标（assets/tray_icon.png），缩放为指定尺寸，返回 BGRA 像素
     （DIB 要求的字节序），供 build_icon 转 HICON、_verify_icon_preview 落盘预览。
 
     文件缺失 / 损坏 / 无 PIL 时回退到自绘云雨图标，保证托盘永远有图标。
     """
-    path = res_path("tray_icon.png")
+    path = res_path(os.path.join("assets", "tray_icon.png"))
     try:
         from PIL import Image
         im = Image.open(path).convert("RGBA").resize((size, size), Image.LANCZOS)
@@ -148,14 +148,14 @@ def _cloud_glyph_rgba(size=32):
 
 
 def _load_ico_icon():
-    """从 tray_icon.ico 用系统 API 加载图标。
+    """从 assets/tray_icon.ico 用系统 API 加载图标。
 
     这是托盘图标的**首选路径**：.ico 内含 16/32/48/64/128/256 多档尺寸，
     Windows 会按托盘实际大小和高 DPI 缩放自动挑最清晰的一档。相比手搓
     DIBSection + CreateIconIndirect，它不依赖 GDI 创建 DC/DIB 能否成功，
     在受限会话里也稳得多。失败返回 None，由 build_icon 回退。
     """
-    path = res_path("tray_icon.ico")
+    path = res_path(os.path.join("assets", "tray_icon.ico"))
     if not os.path.exists(path):
         return None
     try:
