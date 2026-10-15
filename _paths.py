@@ -32,7 +32,7 @@ def res_path(name):
     return os.path.join(app_root(), name)
 
 
-def atomic_write_json(path, obj, indent=2):
+def atomic_write_json(path, obj, indent=2, sync=True):
     """原子写 JSON：先写同目录临时文件，fsync 落盘，再 os.replace 覆盖目标。
 
     为什么非它不可：`open(path, "w")` 是**先 truncate 再逐块写**，中途断电或
@@ -45,6 +45,13 @@ def atomic_write_json(path, obj, indent=2):
     同一文件系统内 `os.replace` 是原子的：读者要么看到完整的新文件，要么看到
     完整的旧文件，不存在"半截"这个中间态。
 
+    `sync=False` 跳过 fsync：`os.replace` 仍保证原子性（读者要么看到完整的
+    新文件、要么看到完整的旧文件，不会看到半截），丢的只是"最后一点数据还
+    没落盘"—— 断电时可能回退到上一版本。适合**每次交互都会写**的偏好文件
+    （ui_state.json：窗口尺寸 / 上次停留页），fsync 在机械盘上一次 6ms 起，
+    高频写会把交互卡住。config.json / presets_user.json 涉及用户调了半天的
+    参数，照旧 sync=True。
+
     临时文件必须建在**同一目录**：跨卷的 `os.replace` 会退化成非原子的
     拷贝+删除，那样就白做了。
     """
@@ -54,7 +61,8 @@ def atomic_write_json(path, obj, indent=2):
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(obj, f, ensure_ascii=False, indent=indent)
             f.flush()
-            os.fsync(f.fileno())   # 数据真正落到盘上，replace 才是有意义的最后一步
+            if sync:
+                os.fsync(f.fileno())   # 数据真正落到盘上，replace 才是有意义的最后一步
         os.replace(tmp, path)
     except BaseException:
         # 失败时别把临时文件留在用户目录里（它长得就像一个 json，

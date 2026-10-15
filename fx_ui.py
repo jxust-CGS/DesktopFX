@@ -157,6 +157,19 @@ def _short_path(path, n=30):
     return "…" + p[-(n - 1):]
 
 
+def _clamp_xy(x, y, w, h, rect):
+    """把 w×h 的矩形左上角夹进 rect=(l, t, r, b) 内，返回 (x, y)。
+
+    **rect 的四边允许是负数** —— 多屏机器的虚拟桌面原点常常不在 (0,0)
+    （副屏在主屏左侧时原点是 (-1920, 0)）。夹取边界一律用调用方给的 rect，
+    不要在函数里再拿主屏尺寸兜底，那正是"面板在副屏、提示弹回主屏"的根因。
+    """
+    l, t, r, b = rect
+    x = min(max(l, x), max(l, r - w))
+    y = min(max(t, y), max(t, b - h))
+    return int(x), int(y)
+
+
 def _render_aa(bg, w, h, paint, ss=_AA_SS):
     """离屏 ss 倍分辨率绘制 → LANCZOS 缩小 → PhotoImage（抗锯齿）。
 
@@ -193,6 +206,7 @@ class _Slider(tk.Canvas):
         self.var = variable
         self.command = command
         self._req_w = int(width)   # 请求宽度；勿用 _w（tkinter 内部 Tcl 路径）
+        self._bake_key = None   # 上次烘焙的 (宽, 取值, 底色)，同键不重烘焙
         self._xpad = self.RADIUS + 3
         self._drag = False
         self._img = None  # 持有 PhotoImage 引用，防止被 GC
@@ -223,14 +237,21 @@ class _Slider(tk.Canvas):
         return max(self.lo, min(self.hi, raw))
 
     def _redraw(self):
-        self.delete("all")
         w = max(self.winfo_width(), self._req_w, self._xpad * 2 + 8)
         h = self.HEIGHT
-        cy = h // 2
         v = float(self.var.get())
+        bg = self.cget("bg")
+        # 切页会把每个滑块重新 <Configure> 一遍（宽、取值、底色都没变）——
+        # 不判缓存的话每次切页都白烘焙十几张 PIL 抗锯齿图，还把上屏绘图摊成
+        # "从上往下一点点刷出来"。同键就一个控件都不碰。
+        key = (w, round(v, 6), bg)
+        if key == self._bake_key:
+            return
+        self._bake_key = key
+        self.delete("all")
+        cy = h // 2
         ratio = (max(self.lo, min(self.hi, v)) - self.lo) / (self.hi - self.lo)
         x = self._xpad + ratio * (w - 2 * self._xpad)
-        bg = self.cget("bg")
         ss = _AA_SS
 
         if _AA:
@@ -458,6 +479,8 @@ class _NavIcon(tk.Canvas):
         self.repaint()
 
     def set_color(self, c):
+        if c == self.color:
+            return      # 切页时 15 个图标里 13 个颜色没变，别白烘焙
         self.color = c
         self.repaint()
 
@@ -769,8 +792,8 @@ class ControlPanel:
         vy = self.root.winfo_vrooty()
         vw = self.root.winfo_vrootwidth()
         vh = self.root.winfo_vrootheight()
-        return (min(max(int(x), vx), max(vx, vx + vw - w)),
-                min(max(int(y), vy), max(vy, vy + vh - h)))
+        return _clamp_xy(int(x), int(y), int(w), int(h),
+                        (vx, vy, vx + vw, vy + vh))
 
     def _apply_geometry(self, w, h):
         """把窗口改成 w×h（夹取到合法范围）。
@@ -1308,8 +1331,50 @@ class ControlPanel:
             when = (lambda g=group: self._nav_groups[g]["open"])
         else:
             when = None
-        self._nav_entries.append({"w": b, "when": when,
+        self._nav_entries.append({"w": b, "when": when, "group": group,
                                   "opts": dict(fill="x")})
+
+    def _repack_nav_group(self, group):
+        """只重排**某一个分组**的条目（折叠/展开用）。
+
+        为什么不走整栏 `_repack(self._nav_entries)`：那会把侧栏每个 Frame 先
+        pack_forget 再逐个 pack —— 整栏控件全部重排一遍，用户看到的就是"点一下
+        折叠，整个左边刷了一次"。折叠只需要让本组的子项消失/回来，别的组一个都
+        不该碰。
+
+        顺序问题：pack 的顺序即视觉顺序，子项重新 pack 会排到栏尾。所以不能直接
+        pack，要 pack 到**组后第一个可见条目之前**（`before=`），别的控件自始至终
+        不被触碰，顺序也还原。
+        """
+        idx = [k for k, e in enumerate(self._nav_entries)
+               if e.get("group") == group]
+        if not idx:
+            return
+        i0, i1 = idx[0], idx[-1] + 1
+        for e in self._nav_entries[i0:i1]:
+            try:
+                e["w"].pack_forget()
+            except Exception:
+                pass
+        # 组后第一个仍处于 pack 状态的条目 = 重排锚点；整组后面都空着才追加到栏尾
+        before = None
+        for e in self._nav_entries[i1:]:
+            try:
+                if e["w"].winfo_manager() == "pack":
+                    before = e["w"]
+                    break
+            except Exception:
+                pass
+        for e in self._nav_entries[i0:i1]:
+            if e["when"] is not None and not e["when"]():
+                continue
+            try:
+                if before is not None:
+                    e["w"].pack(before=before, **e["opts"])
+                else:
+                    e["w"].pack(**e["opts"])
+            except Exception:
+                pass
 
     def _toggle_nav_group(self, name):
         """折叠/展开一个分组，并把状态落盘（重启后还记得）。"""
@@ -1324,8 +1389,11 @@ class ControlPanel:
             self._nav_collapsed.add(name)
         self._ui["nav_collapsed"] = sorted(self._nav_collapsed)
         self._save_ui_state()
-        self._repack(self._nav_entries)
+        self._repack_nav_group(name)
         self._sync_nav_scroll()
+        # 折叠/展开同样要一次画完：子项消失后保留下来的项会整体上移，
+        # 逐条重绘就是「闪一下」。
+        self._flush_ui()
 
     def _on_nav_wheel(self, e):
         """侧栏滚轮：只认来自侧栏子树的滚轮事件。
@@ -1445,11 +1513,15 @@ class ControlPanel:
         tw, th = int(w.winfo_reqwidth()), int(w.winfo_reqheight())
         x = int(widget.winfo_rootx()) + 8
         y = int(widget.winfo_rooty()) + int(widget.winfo_height()) + 4
-        # 夹回屏幕内：副屏/多屏下右上角可能没空间，别让提示飞出可见区域
-        sw = int(self.root.winfo_screenwidth())
-        sh = int(self.root.winfo_screenheight())
-        x = min(max(0, x), max(0, sw - tw))
-        y = min(max(0, y), max(0, sh - th))
+        # 夹回可见区域：**必须按虚拟桌面夹，不能按主屏** —— 副屏在主屏左侧时
+        # 虚拟原点是负的，用主屏尺寸夹（max(0, …)）会把负坐标的提示整个弹到
+        # 主屏上去，用户看到的就是"窗口在副屏、提示还留在主屏"。winfo_vroot*
+        # 与 winfo_rootx 是同一套坐标系，可以直接比（同 _clamp_pos）。
+        vx = int(self.root.winfo_vrootx())
+        vy = int(self.root.winfo_vrooty())
+        vw = int(self.root.winfo_vrootwidth())
+        vh = int(self.root.winfo_vrootheight())
+        x, y = _clamp_xy(x, y, tw, th, (vx, vy, vx + vw, vy + vh))
         w.geometry(f"+{x}+{y}")
         w.deiconify()
         self._tip_adopt()
@@ -1650,7 +1722,7 @@ class ControlPanel:
         self._layout_grips(w, h)      # 最大化时会自己把手柄收掉
         for b in self._win_btns:
             b.set_maximized(self._maximized)
-        self.root.update_idletasks()
+        self._flush_ui()
         self._sync_scroll()
 
     def _sync_scroll(self):
@@ -1689,13 +1761,11 @@ class ControlPanel:
         """
         if getattr(self, "_maximized", False):
             return
-        # 堆叠 pack 全部页面，单次 flush 即可测量每页自然高度（canvas window item
-        # 的尺寸只在布局 pass 里算出，但 10 页只需一次 flush，不必逐页 pack+flush
-        # —— 旧实现每页一次、共 10 次，是 23 次刷新里的大头）。flush 时窗口处于
-        # withdraw 状态，不会上屏。
-        for f in self._pages.values():
-            f.pack()
-        self.root.update_idletasks()
+        # 各页自然高度**不用先 pack 再 flush**：`winfo_reqheight()` 对从未
+        # pack 过的页面同样准（实测 14 页与 pack 全页后逐一比对完全一致）。
+        # 而"pack 全部 + 一次全树 flush"要 1 秒以上 —— 那是构造期最大的单笔
+        # 开销：把 1100 个控件排一遍又马上收起来，纯粹为了量高度。省掉后构造
+        # 从 ~1.4s 降到 ~0.4s（量测：tools/_meas_switch.py）。
         hs = {n: int(f.winfo_reqheight()) for n, f in self._pages.items()}
         content = max(hs.values()) if hs else 0
         self._content_h = content
@@ -1709,15 +1779,46 @@ class ControlPanel:
         if (w != self.W or h != self.H
                 or int(self.root.winfo_height()) != h):
             self._apply_geometry(w, h)
-            self.root.update_idletasks()     # 落实最终尺寸（构造期仍在 withdraw，
-                                            # 仅写 geometry，不触发可视上屏）
-        # 恢复当前页（pack fill + 复位滚动）；滚动区交给 <Configure> 绑定自愈，
-        # 此处不再 flush。
-        self._show_page(self._active)
+            # 落实最终尺寸。构造期窗口还没上屏，这里只写 geometry、不触发
+            # 可视上屏（_flush_ui 会按映射状态自己选 update / update_idletasks）。
+            self._flush_ui()
+        # 当前页在 _build 末尾就已 pack 好，这里只把滚动复位到顶部并重算滚动区
+        # （窗口尺寸变了，旧区域可能装不下新视口）。不再调 _show_page：那会顺带
+        # 重刷一遍侧栏 15 个图标的烘焙、再写一次 last_page，纯属白干。
+        self._canvas.yview_moveto(0)
+        self._sync_scroll()
         # 「窗口尺寸」卡片里的数值必须反映**真实**尺寸。构造期它是按 H_DEF
         # (742) 建的，自适应之后 H 变成按内容算出的值（例如 916）—— 不在这里
         # 同步，标签就永远停在 742，和窗口实际高度对不上。
         self._sync_size_rows()
+
+    def _flush_ui(self):
+        """立刻把挂起的界面工作做完：几何 + 重绘，一次性画完。
+
+        已上屏时用 `root.update()` 而不是 `update_idletasks()`：后者只管几何
+        和空闲重绘，页面里几十个控件映射产生的 Expose 事件会留在事件队列里被
+        **一条一条**处理 —— 观感就是「右边的设置从上到下刷出来」。update() 把
+        Expose 一并处理掉，处理器返回时整页就是画好的。
+
+        未上屏（构造期）走 update_idletasks：没什么可画的，别白等；启动无闪烁
+        测试也正是靠数它来断言「构造期刷新全部发生在隐藏期」。
+
+        update() 会递归处理事件 → `_in_flush` 重入保护：连点两个导航项时，内层
+        _show_page 跳过自己的 flush，由外层收尾，不会套娃。
+        """
+        try:
+            if self.root.winfo_ismapped():
+                if getattr(self, "_in_flush", False):
+                    return
+                self._in_flush = True
+                try:
+                    self.root.update()
+                finally:
+                    self._in_flush = False
+            else:
+                self.root.update_idletasks()
+        except Exception:
+            pass
 
     def _show_page(self, name):
         self._tip_hide()
@@ -1739,7 +1840,7 @@ class ControlPanel:
             self._nav_collapsed.discard(g)
             self._ui["nav_collapsed"] = sorted(self._nav_collapsed)
             self._save_ui_state()
-            self._repack(self._nav_entries)
+            self._repack_nav_group(g)
         for n, info in self._nav.items():
             if n == name:
                 info["frame"].config(bg=NAV_ACTIVE)
@@ -1753,10 +1854,11 @@ class ControlPanel:
                 info["line"].config(bg=SIDEBAR_BG)
                 info["icon"].config(bg=SIDEBAR_BG)
                 info["icon"].set_color(SUB)
-        # 切页后强制 canvas 局部布局一次，让滚动区（scrollregion）立即基于新页
-        # 内容算准——滚轮处理是同步读滚动区的，若等事件循环自愈，切页当帧滚轮
-        # 会读到旧区域。只 flush canvas 子树（不是整窗），开销极小、不会重映射窗口。
-        self._canvas.update_idletasks()
+        # 切页后强制一次布局 + 重绘（见 _flush_ui）：滚动区（scrollregion）要
+        # 立即基于新页内容算准 —— 滚轮处理是同步读滚动区的，若等事件循环自愈，
+        # 切页当帧滚轮会读到旧区域。同时把整页一次画完，避免逐条 Expose 造成
+        # 的「从上到下渲染」观感。
+        self._flush_ui()
         self._canvas.yview_moveto(0)
         self._sync_scroll()
 
@@ -1786,7 +1888,13 @@ class ControlPanel:
             # 原子写：写坏了读取端会静默回到默认尺寸 + 默认页面（这里
             # except: pass 连 error.log 都不留），用户看不出发生过什么。
             # indent=None —— ui_state.json 本来就是紧凑无缩进的。
-            atomic_write_json(_UI_STATE_PATH, dict(self._ui), indent=None)
+            # sync=False：ui_state 只是界面偏好（窗口尺寸 / 上次停留页），
+            # 每次切页都会写一次；fsync 在机械盘或网盘目录上一次 6ms 起，
+            # 切页能明显感到卡。os.replace 仍保证原子（读者不会看到半截
+            # JSON），丢的只是"最后一次偏好没落盘"—— 重启回默认而已。
+            # config.json / presets_user.json 不在此列，照旧 fsync。
+            atomic_write_json(_UI_STATE_PATH, dict(self._ui), indent=None,
+                              sync=False)
         except Exception:
             pass
 
