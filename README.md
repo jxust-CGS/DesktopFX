@@ -261,7 +261,32 @@ python tests/_verify_launcher.py # 双击全链路验证（含路径存在性、
 
 ## 系统托盘
 
-托盘图标使用 **WorkBuddy 品牌图标**（`assets/tray_icon.ico`），加载不到时自动回退到自绘云雨图标。
+托盘图标使用 `assets/tray_icon.ico`，加载不到时自动回退到自绘云雨图标。
+
+想换成自己的图标：
+
+```bash
+# 1) 准备一张方形图（≥512px，单一主体，纯色背景最好）
+# 2) 生成资源 —— --drop-bg 抠掉实底；不带 --apply 时只体检不写盘
+python tools/_make_icon.py 新图标.png --drop-bg
+python tools/_make_icon.py 新图标.png --drop-bg --apply   # 会先备份原文件
+
+# 3) 看预览（左=浅色任务栏 / 右=深色任务栏，16/32/48/64px 各一档）
+#    C://...//DesktopFX//_icon_new_preview.png/n
+# 4) 重启程序（托盘图标在启动时加载），然后回归
+python tests/_verify_icon_preview.py
+python tests/_verify_tray.py
+```
+
+工具会自动：裁切居中 → 归一化 256×256（留白 6%）→ 生成 16/32/48/64/128/256 六档 `.ico`，
+并**体检两个最容易翻车的点**：
+
+- **浅色与深色任务栏上都要看得清** —— 把图标分别合成到浅/深底色上量对比度（阈值 35/255）。
+  只看透明背景上的 PNG 是看不出这个问题的。不达标时 `--apply` 会拒绝写盘。
+- **小尺寸下不能太单薄** —— 16/32/48px 的可见像素占比要 > 15%。
+
+> 换图标后要同步改三处文案（它们写着旧品牌）：`fx_tray.py` 顶部与 `_icon_rgba` 的
+> docstring、本 README 的文件结构段。
 
 > 托盘图标走 `LoadImageW` 从 `.ico` 加载，内含 16/32/48/64/128/256 六档尺寸，
 > Windows 按托盘实际大小和高 DPI 缩放自动挑最清晰的一档。**不要**改成手搓
@@ -313,6 +338,7 @@ DesktopFX/
 │
 ├── tools/               # 开发脚本 —— 与产品代码分开放：它们不进 exe，也不该和产品模块抢同一层（子目录脚本靠文件头那段「向上找 desktop_fx.py」的垫片定位项目根）
 │   ├── _ascii_pet.py        # 把精灵按**亮度**打成 ASCII —— 无图形环境时用它检查形象比例（按 alpha 打只会看到一坨实心字符，五官全被淹没）
+│   ├── _make_icon.py        # 图标生成器：方形图 -> 256 的 PNG + 六档 ico，并体检「浅/深色任务栏上看得清吗」（见上文「系统托盘」）
 │   ├── _make_launcher.py    # 启动器生成器（保 ASCII + CRLF，改 bat 走这里）
 │   ├── _meas_pages.py       # 逐页量自然高/宽 + 各来源组合下的页高（面板高度是有限预算，加控件前先量）
 │   ├── _mkcrlf.py           # 把启动器规范成 CRLF + ASCII（改完 bat 必跑）

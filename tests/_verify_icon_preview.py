@@ -90,17 +90,61 @@ def test_alpha_channel_valid():
     print("  [OK] alpha 通道范围正常")
 
 
+MIN_SATURATION = 0.15
+
+
+def _saturation(px):
+    """可见像素的平均 HSV 饱和度：0 = 纯灰，1 = 最鲜艳。"""
+    m = px[:, :, 3] > 16
+    rgb = px[:, :, :3][m].astype(np.float32)
+    mx, mn = rgb.max(axis=1), rgb.min(axis=1)
+    return float(np.where(mx > 0, (mx - mn) / np.maximum(mx, 1e-6), 0).mean())
+
+
 def test_color_not_gray():
+    """画面要有颜色，不是一团灰。
+
+    ⚠️ 这条原来写死了「绿通道占主导」—— 那是在验 **WorkBuddy 品牌青绿**。
+    图标改成可替换之后那种绑定就**过时**了：任何非青绿配色的新图标都会让它
+    变红，而它其实什么都没测到（一张纯灰图只要偏绿也能过）。
+    现在按函数名该有的意思测：量 HSV 饱和度。
+    实测标定 —— 品牌青绿 0.61 / 换肤测试图（靛蓝）0.65 / 回退自绘云雨 0.32 /
+    去色灰度版 0.00；取 0.15 拦得住灰度，又容得下低饱和的柔和配色。
+    真正"在任务栏上看不看得清"由 `tools/_make_icon.py` 的浅/深底对比度负责，
+    这里只管通道顺序串没串、图有没有上色。
+    """
     print("== test_color_not_gray ==")
     px = _bgra_to_rgba(_icon_rgba(32))
-    rgb = px[:, :, :3].astype(np.float32)
-    # 非透明区域的平均色应为 WorkBuddy 品牌青绿色（绿通道占主导）
     mask = px[:, :, 3] > 16
     assert mask.any(), "没有非透明像素"
-    avg = rgb[mask].mean(axis=0)
-    print(f"  非透明区域平均 RGB: ({avg[0]:.1f}, {avg[1]:.1f}, {avg[2]:.1f})")
-    assert avg[1] >= avg[0] and avg[1] >= avg[2], "图标应偏青绿色而非灰/红"
-    print("  [OK] 图标颜色符合 WorkBuddy 品牌青绿色")
+    rgb = px[:, :, :3][mask].astype(np.float32)
+    avg_r, avg_g, avg_b = (int(round(rgb[:, i].mean())) for i in range(3))
+    dominant = ("红" if avg_r >= avg_g and avg_r >= avg_b
+                else "绿" if avg_g >= avg_b else "蓝")
+    sat = _saturation(px)
+    print(f"  非透明区平均 RGB: ({avg_r}, {avg_g}, {avg_b})  主导通道：{dominant}")
+    print(f"  平均饱和度 {sat:.3f}（要求 > {MIN_SATURATION}）")
+    assert sat > MIN_SATURATION, (
+        f"图标接近灰度（饱和度 {sat:.3f}）—— 通道顺序串了？还是图本身没上色？")
+    print("  [OK] 图标有颜色而非灰度图")
+
+
+def test_gray_would_be_caught():
+    """负向对照：把图标去色，上面那条必须变红。
+
+    没有它，`test_color_not_gray` 可能只是在测"我新写的判据自洽"。
+    """
+    print("== test_gray_would_be_caught（负向对照）==")
+    px = _bgra_to_rgba(_icon_rgba(32)).astype(np.float32)
+    lum = 0.299 * px[:, :, 0] + 0.587 * px[:, :, 1] + 0.114 * px[:, :, 2]
+    gray = px.copy()
+    gray[:, :, 0] = gray[:, :, 1] = gray[:, :, 2] = lum
+    sat = _saturation(gray)
+    print(f"  去色后饱和度 {sat:.3f}")
+    assert sat <= MIN_SATURATION, (
+        f"负向对照失效：去色后饱和度 {sat:.3f} 仍被判为有色 —— 判据没在测颜色")
+    print("  [OK] 灰度图确实会被判出来（判据有效）")
+
 
 
 def test_preview_saved():
@@ -119,7 +163,8 @@ def main():
     print("== tray icon pixel verification ==")
     print()
     for fn in (test_icon_not_blank, test_alpha_channel_valid,
-               test_color_not_gray, test_preview_saved):
+               test_color_not_gray, test_gray_would_be_caught,
+               test_preview_saved):
         fn()
         print()
     print("== ICON PREVIEW VERIFIED ==")
