@@ -22,6 +22,7 @@ import json
 import os
 import queue
 import tempfile
+import time
 import types
 
 import desktop_fx as d
@@ -148,6 +149,31 @@ def _geo(p):
             int(p.W), int(p.H))
 
 
+def _settle(p, want_xy=None, timeout=3.0):
+    """等到窗口的**实际位置**稳定下来（可选：等到等于 want_xy）。
+
+    为什么需要：`_rz_begin` 记的是 `winfo_x()`，`_rz_motion` 据此算"对边钉住"。
+    若这个读数发生在上一次 `geometry()` 真正被 WM 落实之前，钉住的就是一个
+    已经不存在的旧位置 —— 表现为"尺寸照长、位置不动"，右下角跟着长，
+    断言报 `(r0,b0) -> (r0+dx, b0+dy)`。
+
+    这条断言历史上就"时红时绿"（满负载跑整套时更容易碰上）。**不变量本身没
+    错，脆的是读数时机** —— 所以在这里等，而不是放宽判据。
+    """
+    t0 = time.time()
+    last = None
+    while time.time() - t0 < timeout:
+        p.root.update()
+        cur = (int(p.root.winfo_x()), int(p.root.winfo_y()))
+        if want_xy is not None and cur == tuple(want_xy):
+            return cur
+        if cur == last:
+            return cur          # 连续两轮没动 = 稳了
+        last = cur
+        time.sleep(0.02)
+    return last
+
+
 def _read_state():
     try:
         with open(_STATE, "r", encoding="utf-8") as f:
@@ -227,12 +253,20 @@ def main():
     print("\n4) 拖左上角时右下角必须钉住")
     # **先把窗口摆到离屏幕边缘足够远的地方。** 拖左上角会让窗口往左上移，
     # 起点若就贴着屏幕边，`_clamp_pos` 会把位置夹住不动、而尺寸照长 ——
-    # 右下角于是"跟着长"，看着像没钉住。窗口初始位置由屏幕尺寸算出来，
-    # 不摆正的话这条断言**时红时绿**（实测同一份代码跑两次结果不同）。
+    # 右下角于是"跟着长"，看着像没钉住。
     vx, vy = p.root.winfo_vrootx(), p.root.winfo_vrooty()
-    p.root.geometry("+%d+%d" % (vx + 240, vy + 200))
-    p.root.update()
-    x0, y0, w0, h0 = _geo(p)
+    want = (vx + 240, vy + 200)
+    p.root.geometry("+%d+%d" % want)
+    # **必须等位置真的落实**再读锚点：`_rz_begin` 记的是 `winfo_x()`，读到的
+    # 若是旧位置，"对边钉住"就会钉在一个已经不存在的点上 —— 尺寸照长、位置
+    # 不动，右下角跟着长（实测报 `(r0,b0) -> (r0+40, b0+30)`）。
+    got = _settle(p, want)
+    # 锚点取**实际位置**（与 `_rz_begin` 读的是同一个来源），尺寸取 p.W/p.H
+    x0, y0 = got
+    w0, h0 = p.W, p.H
+    check(got == want,
+          f"窗口已摆到 ({want[0]},{want[1]})（实测 {got}）—— "
+          "位置没落实就读锚点会让后面的钉住断言时红时绿")
     check(x0 - vx >= 40 and y0 - vy >= 30,
           f"拖拽起点离屏幕边缘足够远（左 {x0 - vx} / 上 {y0 - vy}）")
     r0, b0 = x0 + w0, y0 + h0
@@ -314,10 +348,8 @@ def main():
     check("win_h" not in saved, f"自适应后 ui_state 里没有 win_h：{saved}")
     check(saved.get("win_w") == p.W,
           f"自适应高度不改宽度：{saved.get('win_w')} == {p.W}")
-    check(p.H == p._clamp_h(max(p.H_MIN, p._content_h + p._chrome
-                                + p._fab_clear())),
-          f"自适应高度 {p.H} = 内容 {p._content_h} + chrome {p._chrome}"
-          f" + 操作条让位 {p._fab_clear()}")
+    check(p.H == p._clamp_h(max(p.H_MIN, p._content_h + p._chrome)),
+          f"自适应高度 {p.H} = 内容 {p._content_h} + chrome {p._chrome}")
     sr = p._size_rows["win_h"]
     check(int(sr["var"].get()) == p.H and sr["label"].cget("text") == f"{p.H} 像素",
           f"自适应后「窗口高度」显示 {sr['label'].cget('text')!r}"
@@ -367,8 +399,7 @@ def main():
     fx_ui._UI_STATE_PATH = fresh
     p3 = fx_ui.ControlPanel(_StubApp())
     p3.root.update()
-    expect_h = p3._clamp_h(max(p3.H_MIN, p3._content_h + p3._chrome
-                               + p3._fab_clear()))
+    expect_h = p3._clamp_h(max(p3.H_MIN, p3._content_h + p3._chrome))
     check(p3.W == p3.W_DEF, f"默认宽度 {p3.W}（期望 {p3.W_DEF}）")
     check(p3.H == expect_h,
           f"默认高度按内容自适应 {p3.H}（期望 {expect_h}）")

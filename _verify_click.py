@@ -1234,7 +1234,7 @@ def test_scene_voice_wiring():
     calls = []
 
     class _Spy:
-        def play_path(self, p):
+        def play_path(self, p, overlap=False):
             calls.append(p)
             return True
 
@@ -2000,19 +2000,28 @@ def test_sfx_source_normalize_and_target():
                   "文件不存在返回空表")
 
 
-def test_click_sfx_triggers_and_dedups():
-    """`ClickSfx` 只在点到时触发，且**一次点击只响一声**（播放器忙则丢弃）。"""
+def test_click_sfx_triggers_and_overlaps():
+    """`ClickSfx` 只在点到时触发，且**明确要求 overlap=True**（允许叠着播）。
+
+    判据是"传给播放器的那个标志"，不是"播放器忙的时候丢弃了" —— 那是语音
+    的规则。音效这边改成允许重叠之后，这里要守的是"别哪天又退回串行"：
+    连点时串行听起来像卡顿，不是用户要的手感。
+    """
     played = []
 
     class _Player:
-        def __init__(self):
-            self.busy = False
+        """模拟真实播放器：有条数有限的设备池，占满了就返回 False。"""
 
-        def play_path(self, p):
-            if self.busy:
+        def __init__(self):
+            self.overlaps = []
+            self.cap = 4          # 假装设备条数有限
+
+        def play_path(self, p, overlap=False):
+            self.overlaps.append(overlap)
+            if self.cap <= 0:
                 return False
             played.append(p)
-            self.busy = True
+            self.cap -= 1
             return True
 
     pl = _Player()
@@ -2021,21 +2030,105 @@ def test_click_sfx_triggers_and_dedups():
                click_sfx_builtin="")
     if sfx.active() is not False:
         return False, "active() 必须恒 False（它不上屏，否则鼠标层每帧白提交）"
-    if not sfx.trigger(cfg):
-        return False, "第一次触发应当成功"
-    if sfx.trigger(cfg):
-        return False, "播放器还忙着却又播了第二声（重叠了）"
-    if len(played) != 1:
-        return False, f"实际播了 {len(played)} 次"
+    # 连点 5 次：前 4 次占满设备，第 5 次该被丢弃 —— 但**每一次**都得传
+    # overlap=True，否则真实播放器会按"忙则丢弃"处理，重叠根本没发生。
+    cap = pl.cap
+    got = [sfx.trigger(cfg) for _ in range(cap + 1)]
+    if not all(pl.overlaps):
+        return False, f"有触发没带 overlap=True：{pl.overlaps}"
+    if got != [True] * cap + [False]:
+        return False, f"设备占满前后的返回值不对：{got}"
+    if len(played) != cap:
+        return False, f"实际播了 {len(played)} 次（设备 {cap} 条）"
     if not os.path.isfile(played[0]) or not played[0].endswith(
             (".wav", ".mp3", ".wma", ".m4a")):
         return False, f"播的不是音频文件：{played[0]!r}"
-    pl.busy = False
     # 换成"文件不存在"的来源：不该播，也不该抛
     if sfx.trigger(dict(cfg, click_sfx_source=F.SFX_SOURCE_FILE,
                         click_sfx_file="")):
         return False, "来源没配到东西时不该播"
-    return True, "忙时丢弃不重叠；来源没配到时静默跳过，不抛异常"
+    return True, ("每次触发都带 overlap=True（可重叠）；设备占满后丢弃不排队；"
+                  "来源没配到时静默跳过，不抛异常")
+
+
+def test_sfx_voices_use_separate_aliases():
+    """音效的每一条并发播放必须**各占一条 MCI 别名**。
+
+    这是"允许重叠"能不能成立的技术前提：共用一条别名时，第二个 `open` 会把
+    第一条正在播的顶掉 —— 听到的是一串被截断的"咔"，而不是叠起来的连击。
+    判据直接查发出去的 open 命令里出现了几个不同别名。
+    """
+    cmds = []
+    playing = [True]
+
+    def fake(cmd):
+        cmds.append(cmd)
+        if cmd.startswith("status"):
+            return 0, "playing" if playing[0] else "stopped"
+        return 0, ""
+
+    orig = F._mci_send
+    F._mci_send = fake
+    try:
+        vp = F.VoicePlayer()
+        n = min(4, F._SFX_VOICES)
+        for _ in range(n):
+            vp.play_path("C:/x/a.wav", overlap=True)
+        # 语音那条独占设备**不能**被音效占用
+        vp.play_path("C:/x/a.wav")
+    finally:
+        F._mci_send = orig
+
+    aliases = [c.rsplit("alias ", 1)[1] for c in cmds if c.startswith("open ")]
+    uniq = set(aliases)
+    if len(aliases) != n + 1:
+        return False, f"期望 {n + 1} 次 open，实际 {len(aliases)} 次"
+    if len(uniq) != n + 1:
+        return False, (f"{n + 1} 次并发只用了 {len(uniq)} 条别名 —— "
+                       f"共用别名会把前一条顶掉：{sorted(uniq)}")
+    if F._VOICE_ALIAS not in uniq:
+        return False, "语音那条独占别名没被用到"
+    for a in uniq:
+        if a.startswith(F._VOICE_ALIAS[:9]) and a != F._VOICE_ALIAS:
+            return False, f"音效用错了语音的别名空间：{a}"
+    return True, (f"{n} 条并发音效各占一条别名（{sorted(uniq)[:2]}…），"
+                  f"语音仍是独占的 {F._VOICE_ALIAS}")
+
+
+def test_sfx_voice_pool_is_bounded_and_released():
+    """别名池有上限，且**放完就还回来** —— 否则狂点几次之后音效永久哑掉。"""
+    playing = [True]
+
+    def fake(cmd):
+        if cmd.startswith("status"):
+            return 0, "playing" if playing[0] else "stopped"
+        return 0, ""
+
+    orig = F._mci_send
+    F._mci_send = fake
+    try:
+        vp = F.VoicePlayer()
+        # 超过池容量的连点：前 N 条起播，之后必须开始返回 False（不是无限开设备）
+        over = F._SFX_VOICES + 4
+        got = [vp.play_path("C:/x/a.wav", overlap=True) for _ in range(over)]
+        if got != [True] * F._SFX_VOICES + [False] * (over - F._SFX_VOICES):
+            return False, f"池没封顶：{got}"
+        if vp.voices_busy() != F._SFX_VOICES:
+            return False, (f"占用数 {vp.voices_busy()} != "
+                           f"{F._SFX_VOICES}")
+        # 全播完之后必须全部还回来，且还能再叠
+        playing[0] = False
+        t0 = time.time()
+        while time.time() - t0 < 8.0 and vp.voices_busy():
+            time.sleep(0.05)
+        if vp.voices_busy():
+            return False, f"播完之后仍占着 {vp.voices_busy()} 条（永远哑掉）"
+        if not vp.play_path("C:/x/a.wav", overlap=True):
+            return False, "释放之后仍然起不了播（池没还回来）"
+    finally:
+        F._mci_send = orig
+    return True, (f"池封顶在 {F._SFX_VOICES} 条（超出丢弃不排队）；"
+                  "播完全部归还，可再次起播")
 
 
 def test_scene_sfx_mouse_and_keyboard():
@@ -2046,7 +2139,7 @@ def test_scene_sfx_mouse_and_keyboard():
     calls = []
 
     class _Spy:
-        def play_path(self, p):
+        def play_path(self, p, overlap=False):
             calls.append(p)
             return True
 
@@ -2221,7 +2314,7 @@ def test_scene_plays_the_matched_audio():
     calls = []
 
     class _Spy:
-        def play_path(self, p):
+        def play_path(self, p, overlap=False):
             calls.append(("path", p))
             return True
 
@@ -2529,7 +2622,9 @@ def main():
         test_voice_match_only_with_folder_source,
         test_voice_config_migration,
         test_sfx_source_normalize_and_target,
-        test_click_sfx_triggers_and_dedups,
+        test_click_sfx_triggers_and_overlaps,
+        test_sfx_voices_use_separate_aliases,
+        test_sfx_voice_pool_is_bounded_and_released,
         test_scene_sfx_mouse_and_keyboard,
         test_sfx_independent_from_click_effects,
         test_sfx_never_reported_as_layer_content,

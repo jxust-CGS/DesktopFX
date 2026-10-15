@@ -644,59 +644,118 @@ def main():
     p._nav["真实水波"]["frame"].event_generate("<MouseWheel>", delta=-120)
     p.root.update()
     assert p._nav_cv.yview()[0] > _before, "侧栏滚轮应当生效"
-    # 滚到底后最后一项必须整个落在悬浮操作条**上方**（条子压在侧栏左下角，
-    # 不预留的话「其它设置」正好躲到它后面 —— 看得见标题点不着）
+    # 滚到底后「其它设置」要能整个露出来（右侧不再有悬浮条压着）
     for _ in range(40):
         p._nav["其它"]["frame"].event_generate("<MouseWheel>", delta=-120)
         p.root.update()
     _last = p._nav["其它"]["frame"]
     assert p._nav_cv.yview()[0] > 0.5, \
         f"侧栏滚不到底：yview={p._nav_cv.yview()}"
-    # 坐标系必须换算到**屏幕**：导航项在 canvas 里，winfo_y() 是相对 inner 的，
-    # 与 fab.winfo_y()（相对 root）不是一个坐标系，直接比会得到荒谬的差值。
-    _last_bottom = _last.winfo_rooty() + _last.winfo_height()
-    assert _last_bottom <= p._fab.winfo_rooty() + 1, \
-        (f"滚到底后最后一项仍被操作条压住：项底 {_last_bottom} > "
-         f"条顶 {p._fab.winfo_rooty()}")
     # 侧栏滚轮不能把内容区一起滚走（bind_all 上只挂了一个分派器）
     _cb = p._canvas.yview()[0]
     p._nav["真实水波"]["frame"].event_generate("<MouseWheel>", delta=-120)
     p.root.update()
     assert p._canvas.yview()[0] == _cb, "侧栏滚轮不应带动内容区"
 
-    # 悬浮操作条：最小尺寸下仍在窗口内、贴右下角、与内容区同宽、且不盖住缩放手柄
+    # 8d2) 悬浮操作条这一轮删掉了：属性与按钮都不该再存在
+    for gone in ("_fab", "_fab_clear", "_fab_layout", "pause_btn"):
+        assert not hasattr(p, gone), f"{gone} 还留着（悬浮条应当整个删掉）"
+
+    # 8d3) 标题栏窗控钮：最小化 / 最大化 / 关闭，与普通窗口一致
+    kinds = [b.kind for b in p._win_btns]
+    assert kinds == ["close", "max", "min"], \
+        f"窗控钮不齐（且顺序应为 关闭|最大化|最小化）：{kinds}"
+    for b in p._win_btns:
+        assert b.winfo_ismapped(), f"{b.kind} 按钮不可见"
+        assert b.winfo_width() > 20 and b.winfo_height() == p._chrome, \
+            f"{b.kind} 尺寸不像窗控钮：{b.winfo_width()}x{b.winfo_height()}"
+    # 三颗都要真的画了东西（空 Canvas = 用户看到"少了一颗按钮"）。
+    # 图元数按符号数：min 一条线、close 两条、max 未最大化时一个框（还原态
+    # 才是错开的两个框，图元更多）。只判 >=1 抓不到"画错成另一个符号"。
+    _expect = {"min": (1, "line"), "close": (2, "line"),
+               "max": (1, "rectangle")}
+    for b in p._win_btns:
+        b.repaint()
+        kinds = {b.type(i) for i in b.find_all()}
+        want_n, want_t = _expect[b.kind]
+        assert len(b.find_all()) == want_n and want_t in kinds, \
+            f"{b.kind} 的图元不对：{[(b.type(i)) for i in b.find_all()]}" \
+            f"（期望 {want_n} 个 {want_t}）"
+    # 最小化 = 收进托盘（withdraw），特效继续跑
+    p._win_btns[-1].event_generate("<ButtonPress-1>")
+    p.root.update()
+    assert p.root.state() == "withdrawn", \
+        f"最小化没有收进托盘：state={p.root.state()}"
+    p.show()
+    p.root.update()
+    assert p.root.state() == "normal", "show() 之后面板应当回到可见"
+    # 关闭同样是收进托盘（真正的退出入口在托盘右键菜单里）
+    p._win_btns[0].event_generate("<ButtonPress-1>")
+    p.root.update()
+    assert p.root.state() == "withdrawn", "关闭按钮应当收进托盘而不是退出"
+    p.show()
+    p.root.update()
+
+    # 最大化：铺满**主屏** -> 手柄收掉 -> 再点还原回原尺寸。
+    # 判据用主屏尺寸而不是虚拟桌面：多屏机上铺虚拟桌面会把窗口拉成横跨
+    # 两块屏的一条（3840 宽），页面被拉得极宽、卡片全挤在中间。
+    p._set_size(win_w=640, win_h=560)
+    p.root.update()
+    before = (p.W, p.H)
+    vw = int(p.root.winfo_vrootwidth())
+    sw = int(p.root.winfo_screenwidth())
+    sh = int(p.root.winfo_screenheight())
+    p._win_btns[1].event_generate("<ButtonPress-1>")   # max
+    p.root.update()
+    assert p._maximized is True, "点了最大化但状态没置上"
+    assert (p.W, p.H) == (sw, sh), \
+        f"最大化后 {p.W}x{p.H}，期望铺满主屏 {sw}x{sh}"
+    if vw > sw:
+        assert p.W < vw, \
+            f"最大化铺了虚拟桌面 {p.W}（本机虚拟屏 {vw}）—— 只该占主屏 {sw}"
+    assert (int(p.root.winfo_x()), int(p.root.winfo_y())) == (0, 0), \
+        f"最大化没贴在主屏左上角：{p.root.winfo_x()},{p.root.winfo_y()}"
+    assert int(p.root.winfo_width()) == sw, \
+        f"实际窗口宽 {p.root.winfo_width()} != {sw}"
+    assert all(g.winfo_manager() == "" for g in p._grip.values()), \
+        "最大化时缩放手柄应当收掉"
+    assert p._win_btns[1].maximized is True, "最大化钮应切成「还原」图标"
+    # 最大化状态下不能被自适应高度拽回去
+    p._fit_height()
+    p.root.update()
+    assert (p.W, p.H) == (sw, sh), \
+        f"最大化时被 _fit_height 改了尺寸：{p.W}x{p.H}"
+    p._win_btns[1].event_generate("<ButtonPress-1>")   # 还原
+    p.root.update()
+    assert p._maximized is False, "还原后状态没清"
+    assert (p.W, p.H) == before, \
+        f"还原后 {p.W}x{p.H}，期望回到 {before}"
+    assert all(g.winfo_manager() != "" for g in p._grip.values()), \
+        "还原后缩放手柄应当回来"
+
+    # 8d4) 暂停改挂在标题栏状态区上（悬浮条删掉后这是面板内唯一的暂停入口）
+    assert p.status.winfo_ismapped(), "状态区不可见"
+    assert str(p.status.cget("cursor")) == "hand2", \
+        "状态区应当可点（cursor 应为手型）"
+    _fg0 = str(p.status.cget("fg"))
+    p.status.event_generate("<ButtonPress-1>")
+    p.root.update()
+    assert p._paused is True, "点状态区没有暂停"
+    assert app.paused is True, "暂停没有传到 App"
+    assert str(p.status.cget("fg")) != _fg0, "暂停后状态区应当变色"
+    p.status.event_generate("<ButtonPress-1>")
+    p.root.update()
+    assert p._paused is False and app.paused is False, "再点一次应当恢复"
+    # 最小尺寸下窗控钮仍然都在窗口内
     p._set_size(win_w=p.W_MIN, win_h=p.H_MIN)
     p.root.update()
-    fx, fy = p._fab.winfo_x(), p._fab.winfo_y()
-    fw, fh = p._fab.winfo_width(), p._fab.winfo_height()
-    assert p._fab.winfo_manager() == "place", p._fab.winfo_manager()
-    assert p._fab.place_info().get("anchor") == "se", \
-        f"操作条应贴在右下角：{p._fab.place_info()}"
-    assert 0 <= fx and 0 <= fy and fx + fw <= p.W + 1 and fy + fh <= p.H + 1, \
-        f"操作条越界：{fx},{fy} {fw}x{fh} 窗口 {p.W}x{p.H}"
-    # 宽度 = 内容区（窗口 − 侧栏 120），且与实际内容区宽度一致
-    assert fw == p.W - 120, \
-        f"操作条宽 {fw} 与内容区 {p.W - 120} 不同宽（拖宽窗口后要跟着变）"
-    _cont = p._inner.master
-    assert abs(int(_cont.winfo_width()) - fw) <= 1, \
-        f"内容区宽 {_cont.winfo_width()} 与操作条 {fw} 不一致"
-    assert fy + fh <= p.H - p.GRIP + 1, \
-        f"操作条压住了底边手柄：底 {fy + fh} > {p.H - p.GRIP}"
-    assert fx + fw <= p.W - p.GRIP_CORNER + 1, \
-        f"操作条压住了右下角手柄：右 {fx + fw} > {p.W - p.GRIP_CORNER}"
-    # 两行布局：暂停独占一行，下面「隐藏到托盘 / 退出」并排
-    assert p.pause_btn.winfo_ismapped(), "暂停按钮应可见"
-    assert str(p.pause_btn.cget("state")) == "normal"
-    _fab_kids = [k for k in p._fab.winfo_children() if k.winfo_class() == "Frame"]
-    assert len(_fab_kids) == 1, f"第二行容器不对：{_fab_kids}"
-    assert int(_fab_kids[0].winfo_y()) > int(p.pause_btn.winfo_y()), \
-        "「隐藏到托盘 / 退出」那一行应当在暂停按钮**下面**"
-    # 拖宽窗口后宽度必须跟着内容区走
-    p._set_size(win_w=900, win_h=560)
-    p.root.update()
-    assert int(p._fab.winfo_width()) == 900 - 120, \
-        f"拖宽后操作条宽 {p._fab.winfo_width()}（应为 {900 - 120}）"
-    p._fit_height()
+    for b in p._win_btns:
+        assert b.winfo_rootx() >= p.root.winfo_rootx(), \
+            f"{b.kind} 按钮跑到窗口左边外面了"
+        assert b.winfo_rootx() + b.winfo_width() <= \
+            p.root.winfo_rootx() + p.W + 1, f"{b.kind} 按钮越出窗口右边"
+        assert b.winfo_rooty() >= p.root.winfo_rooty(), \
+            f"{b.kind} 按钮跑到窗口上边外面了"
     p.root.update_idletasks()
 
     # 8e) 「点击音效」页：来源三档的条件显隐 + 键都注册上了

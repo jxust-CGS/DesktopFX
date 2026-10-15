@@ -357,6 +357,93 @@ class _Toggle(tk.Canvas):
                          fill=knob_fill, outline="")
 
 
+class _WinBtn(tk.Canvas):
+    """标题栏右端的窗控钮（最小化 / 最大化 / 关闭），画成普通窗口那副样子。
+
+    **为什么用 Canvas 画而不用 Button + 文字**：符号 "— □ ×" 用字符画出来会
+    随字体缺字变豆腐块，而且粗细/基线对不齐（三颗按钮大小不一看着就是残的）。
+    Canvas 画线画框完全不依赖字体，也顺手把悬停底色一起接管（Button 的
+    activebackground 只在按住时生效，悬停要自己 bind）。
+
+    三种符号的画法：
+      * min  —— 一条横线（居中偏下）
+      * max  —— 一个方框；已最大化时改成**两个错开的方框**（还原）
+      * close—— 两条对角线
+    """
+
+    W = 44
+    H = 42                 # 与标题栏同高（chrome）
+
+    def __init__(self, parent, kind, command, hover):
+        super().__init__(parent, width=self.W, height=self.H, bg=SIDEBAR_BG,
+                         highlightthickness=0, bd=0, cursor="hand2")
+        self.kind = kind
+        self.command = command
+        self.hover = hover
+        self.maximized = False       # 由 _toggle_maximize 回写
+        self._hot = False
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<ButtonPress-1>", lambda e: self._press())
+        self.bind("<Configure>", lambda e: self.repaint())
+
+    # ---------------------------------------------------------- 交互
+    def _press(self):
+        self.command()
+        return "break"
+
+    def _on_enter(self, _e=None):
+        self._hot = True
+        self.repaint()
+
+    def _on_leave(self, _e=None):
+        self._hot = False
+        self.repaint()
+
+    def set_maximized(self, on):
+        if bool(on) != bool(self.maximized):
+            self.maximized = bool(on)
+            self.repaint()
+
+    # ---------------------------------------------------------- 绘制
+    def repaint(self):
+        """整块重画：先清掉所有图元，再按当前状态画一遍。"""
+        self.delete("all")
+        w = max(int(self.winfo_width()), self.W)
+        h = max(int(self.winfo_height()), self.H)
+        bg = self.hover if self._hot else SIDEBAR_BG
+        fg = WHITE if self._hot else SUB
+        self.configure(bg=bg)
+        cx, cy = w // 2, h // 2
+        k = self.kind
+
+        def line(x1, y1, x2, y2, width=1):
+            self.create_line(x1, y1, x2, y2, fill=fg, width=width)
+
+        if k == "min":
+            line(cx - 5, cy + 4, cx + 5, cy + 4, width=1)
+        elif k == "close":
+            d = 5
+            line(cx - d, cy - d, cx + d, cy + d, width=1)
+            line(cx + d, cy - d, cx - d, cy + d, width=1)
+        else:                                   # max / restore
+            if self.maximized:
+                # 还原：两个错开的方框（后面那个只画右上角两段，像叠在一起）
+                d = 5
+                self.create_rectangle(cx - d + 3, cy - d - 3, cx + d + 3,
+                                      cy + d - 3, outline=fg, width=1)
+                line(cx - d + 3, cy - d - 3, cx - d + 3, cy + d - 3)      # 左
+                line(cx - d + 3, cy - d - 3, cx + d + 3, cy - d - 3)      # 上
+                self.create_rectangle(cx - d - 3, cy - d + 3, cx + d - 3,
+                                      cy + d + 3, outline=fg, width=1)
+                line(cx + d - 3, cy + d + 3, cx - d - 3, cy + d + 3)      # 下
+                line(cx + d - 3, cy + d + 3, cx + d - 3, cy - d + 3)      # 右
+            else:
+                d = 5
+                self.create_rectangle(cx - d, cy - d, cx + d, cy + d,
+                                      outline=fg, width=1)
+
+
 class _NavIcon(tk.Canvas):
     """18x18 线性图标；PIL 超采样抗锯齿渲染（背景随 Canvas bg 融合）。"""
 
@@ -701,7 +788,6 @@ class ControlPanel:
         self.root.geometry(f"{w}x{h}+{x}+{y}")
         self._apply_wraplength(w)
         self._layout_grips(w, h)
-        self._fab_layout()
 
     # ------------------------------------------------------------ 拖拽缩放
     _GRIP_CURSOR = {
@@ -733,6 +819,12 @@ class ControlPanel:
 
     def _layout_grips(self, w, h):
         if not self._grip:
+            return
+        # 最大化（铺满虚拟桌面）时收掉全部手柄：这时拖边框改尺寸没有意义，
+        # 留着反而会让人以为窗口还能调。
+        if getattr(self, "_maximized", False):
+            for g in self._grip.values():
+                g.place_forget()
             return
         e, c = self.GRIP, self.GRIP_CORNER
         w, h = int(w), int(h)
@@ -781,7 +873,6 @@ class ControlPanel:
         self.root.geometry(f"{w}x{h}+{left}+{top}")
         self._apply_wraplength(w)
         self._layout_grips(w, h)
-        self._fab_layout()
 
     def _rz_end(self, _e):
         if not self._rz:
@@ -977,21 +1068,44 @@ class ControlPanel:
         bar.pack_propagate(False)
         tk.Label(bar, text="  桌面特效", bg=SIDEBAR_BG, fg=TEXT,
                  font=FONT_TITLE).pack(side="left")
+        # 状态区兼作**暂停开关**：点一下切换暂停/继续。原先它在右下角的悬浮条上，
+        # 那一块这一轮整个删掉了，得在这里留住这个能力（托盘菜单与 Ctrl+Alt+R
+        # 也在，但面板上点得到比去托盘右键顺手）。
+        self._paused = False
         self.status = tk.Label(bar, text="", bg=SIDEBAR_BG, fg=SUB,
-                               font=FONT_NUM)
+                               font=FONT_NUM, cursor="hand2")
         self.status.pack(side="left", padx=8)
+        self.status.bind("<ButtonPress-1>", lambda e: self._pause())
+        self.status.bind("<Enter>", lambda e: self._status_paint(True))
+        self.status.bind("<Leave>", lambda e: self._status_paint(False))
+        self._bind_tip(self.status, "点一下暂停 / 继续全部特效"
+                                   "（快捷键 Ctrl+Alt+R，效果一样）。")
 
-        for txt, cmd, hov in (("—", self.hide, BAR_HOVER),
-                              ("×", self.hide, DANGER)):
-            b = tk.Button(bar, text=txt, bg=SIDEBAR_BG, fg=SUB, bd=0, relief="flat",
-                          width=3, font=("Microsoft YaHei UI", 11),
-                          activebackground=hov, activeforeground=WHITE, command=cmd)
+        # ---- 标题栏右端的窗控钮：最小化 / 最大化 / 关闭 ----
+        # 与普通窗口一致（这是这一轮的明确要求）：最小化收进托盘，最大化在
+        # 「铺满工作区」与原尺寸之间切换，关闭**也是**收进托盘 —— 托盘图标
+        # 才是真正的退出入口（fx_tray 的右键菜单里有「退出」）。
+        #
+        # 为什么不用系统的边框按钮：本窗口是 overrideredirect（无系统边框，
+        # 圆角/阴影/置顶组都要自己管），系统按钮根本不存在。
+        self._maximized = False
+        self._restore_rect = None      # 最大化前的 (x, y, w, h)
+        self._win_btns = []
+        for kind, cmd, hov in (("close", self.hide, DANGER),
+                               ("max", self._toggle_maximize, BAR_HOVER),
+                               ("min", self.hide, BAR_HOVER)):
+            b = _WinBtn(bar, kind, cmd, hov)
             b.pack(side="right")
-            b.bind("<Enter>", lambda e, w=b, c=hov: w.config(bg=c))
-            b.bind("<Leave>", lambda e, w=b: w.config(bg=SIDEBAR_BG))
+            self._win_btns.append(b)
+            self._bind_tip(b, {"min": "最小化：收进托盘，特效继续运行。",
+                               "max": "最大化：在铺满工作区与原尺寸之间切换。",
+                               "close": "关闭面板：收进托盘（右键托盘图标可退出"
+                                        "程序）。"}[kind])
 
         bar.bind("<ButtonPress-1>", self._start_move)
         bar.bind("<B1-Motion>", self._do_move)
+        # 双击标题栏 = 最大化/还原（普通窗口的习惯动作）
+        bar.bind("<Double-Button-1>", lambda e: self._toggle_maximize())
 
         # 错误横幅：默认不 pack
         self.err_bar = tk.Label(root, text="", bg=ERROR_BG, fg=ERROR_FG,
@@ -1043,43 +1157,13 @@ class ControlPanel:
         self._nav_sep(nav_in)
         self._nav_item(nav_in, "其他设置", "其它", None)
 
-        # ---- 悬浮操作条：暂停 / 隐藏到托盘 / 退出 ----
-        # 这三个按钮原来在侧栏底部（pack 布局）：窗口一矮、特效项一多就被
-        # 挤得够不着。改成 place 贴在**窗口右下角**，再小的窗口也看得见。
-        # 布局保持原来那个两行的样子（暂停独占一行，下面「隐藏到托盘 |
-        # 退出」并排），宽度与右侧内容区**同宽**（= 窗口宽 − 侧栏 120），
-        # 于是它读起来是内容区的一条底栏，而不是浮在上面的一块贴纸。
-        # 位置抬离右下角 20px，把 12px 的角落缩放手柄整个让出来（被盖住
-        # 就没法从角落拖大窗口了）。
-        fab = tk.Frame(root, bg=CARD)
-        self._fab = fab
-        self._paused = False
-        self.pause_btn = tk.Button(fab, text="暂停", bg=BTN, fg=TEXT, bd=0,
-                                   relief="flat", font=FONT_LABEL, pady=6,
-                                   cursor="hand2",
-                                   activebackground=ACCENT_HOVER,
-                                   activeforeground=ON_ACCENT,
-                                   command=self._pause)
-        self.pause_btn.pack(fill="x", padx=6, pady=(6, 4))
-        self.pause_btn.bind("<Enter>", lambda e: self._paint_pause(True))
-        self.pause_btn.bind("<Leave>", lambda e: self._paint_pause(False))
-        self._bind_tip(self.pause_btn, "暂停或继续全部特效（Ctrl+Alt+R）。")
-        brow = tk.Frame(fab, bg=CARD)
-        brow.pack(fill="x", padx=6, pady=(0, 6))
-        for txt, cmd, bg, fg, hbg, hfg, tip in (
-                ("隐藏到托盘", self.hide, BTN, TEXT, BTN_H, TEXT,
-                 "收进托盘图标；右键那个图标可以再唤出面板。"),
-                ("退出", self._quit, DANGER_SOFT, DANGER_SOFT_FG, DANGER,
-                 WHITE, "退出程序，特效与面板一起关闭。")):
-            b = tk.Button(brow, text=txt, bg=bg, fg=fg, bd=0, relief="flat",
-                          font=FONT_LABEL, pady=6, cursor="hand2",
-                          activebackground=hbg, activeforeground=hfg,
-                          command=cmd)
-            b.pack(side="left", fill="x", expand=True, padx=3)
-            b.bind("<Enter>", lambda e, w=b, c=hbg, f=hfg: w.config(bg=c, fg=f))
-            b.bind("<Leave>", lambda e, w=b, c=bg, f=fg: w.config(bg=c, fg=f))
-            self._bind_tip(b, tip)
-        self._fab_layout()
+        # 暂停/隐藏到托盘/退出原先做成右下角的悬浮操作条，这一轮去掉了：
+        # 暂停挪到标题栏状态区（点一下切换，见 `_status_paint`），"隐藏到托盘"
+        # 与"最小化"合并成同一个动作，退出只留在托盘右键菜单里 —— 那是唯一
+        # 可靠的退出入口（面板被隐藏时它是唯一的路）。
+        #
+        # 少一块浮在内容上的东西，两处连带收益：内容区与侧栏都不用再为它预留
+        # 让位高度（`_fab_clear` 一并删掉），自适应窗高也少算一笔。
 
         # ---- 内容区（无滚动条，滚轮仍可上下滚动）----
         # 内容区留在 nav_cv 右边 = 宽 `W - 120`，悬浮操作条按这个宽度铺满
@@ -1288,11 +1372,7 @@ class ControlPanel:
             return False
 
     def _sync_nav_scroll(self):
-        """重算侧栏滚动区；装得下时收成视口高度，滚轮就彻底动不了。
-
-        装不下时底部多留一段 `_fab_clear()`：滚到底后最后一项能整个爬到
-        悬浮操作条上方。
-        """
+        """重算侧栏滚动区；装得下时收成视口高度，滚轮就彻底动不了。"""
         bb = self._nav_cv.bbox("all")
         if not bb:
             return
@@ -1302,8 +1382,7 @@ class ControlPanel:
             self._nav_cv.configure(scrollregion=(bb[0], top, bb[2], top + vh))
             self._nav_cv.yview_moveto(0)
         else:
-            self._nav_cv.configure(scrollregion=(bb[0], top, bb[2],
-                                                 bottom + self._fab_clear()))
+            self._nav_cv.configure(scrollregion=(bb[0], top, bb[2], bottom))
 
     # ------------------------------------------------------------ 悬浮提示
     def _bind_tip(self, widget, text):
@@ -1536,37 +1615,50 @@ class ControlPanel:
             return False
         return int(f.winfo_reqheight()) > self._view_h()
 
-    def _fab_layout(self):
-        """把悬浮操作条按当前窗口尺寸摆到右下角，宽度 = 内容区宽度。
+    # ------------------------------------------------------------ 最大化
+    def _work_area(self):
+        """最大化要铺满的矩形 (x, y, w, h) —— **主屏**，不是虚拟桌面。
 
-        宽度跟着窗口走（`place` 的 width 不像 pack 会自动拉伸），所以每次
-        改尺寸都要重摆一次 —— 否则拖宽窗口后那条子仍按旧宽摆着，右边空一截。
+        铺虚拟桌面在多屏机器上会把窗口拉成横跨两块屏的一条（3840 宽），
+        页面被拉得极宽、左右两大片空白，卡片全挤在中间 —— 那不是"最大化"
+        该有的样子。`winfo_screenwidth/height` 报的正是**主屏**尺寸，且 Tk 的
+        屏幕坐标原点 (0,0) 就是主屏左上角，所以 x/y 直接给 0。
         """
-        fab = getattr(self, "_fab", None)
-        if fab is None:
-            return
-        try:
-            fab.place(relx=1.0, rely=1.0, anchor="se", x=-16, y=-20,
-                      width=max(120, int(self.W) - 120))
-        except Exception:
-            pass
+        return (0, 0, int(self.root.winfo_screenwidth()),
+                int(self.root.winfo_screenheight()))
 
-    def _fab_clear(self):
-        """悬浮操作条占掉的窗口底部高度（条子本身 + 离底偏移 + 余量）。
-
-        窗口按内容自适应时要把这段算进去，否则条子会压在最后一行控件上
-        （预设按钮被盖住半个，点不着）；滚到底时也要留出让位。
-        """
-        try:
-            return int(self._fab.winfo_reqheight()) + 26
-        except Exception:
-            return 64
+    def _toggle_maximize(self):
+        """在「铺满**主屏**」与原尺寸之间切换。"""
+        if self._maximized:
+            r = self._restore_rect or self._center_xy(self.W_DEF, self.H_DEF)
+            self._maximized = False
+            self._restore_rect = None
+            x, y, w, h = r
+            w, h = self._clamp_w(w), self._clamp_h(h)
+        else:
+            # 先记下**当前**矩形再改：_clamp_w/_clamp_h 会把尺寸夹到
+            # `_SCREEN_FRAC`(0.92) 以内，所以必须存夹之前的值，否则还原时
+            # 窗口会莫名其妙小一圈。
+            self._restore_rect = (self.root.winfo_x(), self.root.winfo_y(),
+                                  self.W, self.H)
+            self._maximized = True
+            x, y, w, h = self._work_area()
+            self.W, self.H = w, h
+        self.root.geometry(f"{w}x{h}+{x}+{y}")
+        self.W, self.H = w, h
+        self._apply_wraplength(w)
+        self._layout_grips(w, h)      # 最大化时会自己把手柄收掉
+        for b in self._win_btns:
+            b.set_maximized(self._maximized)
+        self.root.update_idletasks()
+        self._sync_scroll()
 
     def _sync_scroll(self):
         """重算滚动区域。装得下时把区域收成**视口高度**，滚轮就彻底动不了。
 
-        装不下时底部多留一段 `_fab_clear()`：滚到底后最后一行能整个爬到
-        悬浮操作条上方，不会被它压住。
+        滚动区下沿就是内容本身的底边 —— 右下角那块悬浮操作条这一轮删掉了，
+        不再需要为它预留一段（顺带消掉了「页面明明装得下、底部却多出一条空白」
+        的观感问题）。
         """
         bb = self._canvas.bbox("all")
         if not bb:
@@ -1577,8 +1669,7 @@ class ControlPanel:
             self._canvas.configure(scrollregion=(bb[0], top, bb[2], top + vh))
             self._canvas.yview_moveto(0)
         else:
-            self._canvas.configure(scrollregion=(bb[0], top, bb[2],
-                                                 bottom + self._fab_clear()))
+            self._canvas.configure(scrollregion=(bb[0], top, bb[2], bottom))
 
     def _fit_height(self):
         """定下窗口尺寸：宽度用默认值或用户记忆值，高度**按内容自适应**。
@@ -1591,7 +1682,13 @@ class ControlPanel:
 
         **用户显式调过高度（win_h）时不再自适应** —— 那时候"装得下"是他的
         选择，装不下就滚动（滚轮路径已由 _need_scroll 守好）。
+
+        **最大化状态下整段跳过**：铺满虚拟桌面是用户当下的选择，自适应会把它
+        拽回内容高度，看着像"窗口自己缩回去了"。守卫必须在**算 h 之前**，
+        放错分支（比如只护 `else` 那条）就等于没护。
         """
+        if getattr(self, "_maximized", False):
+            return
         # 堆叠 pack 全部页面，单次 flush 即可测量每页自然高度（canvas window item
         # 的尺寸只在布局 pass 里算出，但 10 页只需一次 flush，不必逐页 pack+flush
         # —— 旧实现每页一次、共 10 次，是 23 次刷新里的大头）。flush 时窗口处于
@@ -1605,9 +1702,7 @@ class ControlPanel:
         if self._user_h:
             h = self._clamp_h(self._user_h)
         else:
-            # +fab_clear：给右下角的悬浮操作条留位，别让它压住最后一行控件
-            h = self._clamp_h(max(self.H_MIN,
-                                  content + self._chrome + self._fab_clear()))
+            h = self._clamp_h(max(self.H_MIN, content + self._chrome))
         w = self._clamp_w(self._user_w or self.W_DEF)
         # 不能只在 `w/h != self.W/self.H` 时才应用：窗口尺寸可能被外部改过
         # （测试里压矮造溢出、用户拖过了）而 W/H 没变 -> 就恢复不回来了。
@@ -3275,20 +3370,24 @@ class ControlPanel:
         self._sync_sfx_lock()
 
     def _pause(self):
-        p = self.app.toggle_pause()
-        self._paused = bool(p)
-        self._paint_pause(False)
+        self._paused = bool(self.app.toggle_pause())
+        self._status_paint(False)
 
-    def _paint_pause(self, hover):
-        """暂停/继续按钮状态着色。hover=True 为悬停预览色。"""
+    def _status_paint(self, hover):
+        """标题栏状态区：帧率 + 耗时，兼作暂停开关。hover=True 为悬停预览色。
+
+        文本由 `_poll` 每 200ms 刷一次，这里只管配色 —— 分开是因为文本刷新
+        频率高、配色变化频率低，混在一起会让 hover 效果被下一帧刷掉。
+        """
         paused = getattr(self, "_paused", False)
-        if hover:
-            self.pause_btn.config(bg=ACCENT_HOVER if paused else BTN_H,
-                                  fg=ON_ACCENT if paused else TEXT)
-        elif paused:
-            self.pause_btn.config(text="继续", bg=ACCENT_DARK, fg=ON_ACCENT)
-        else:
-            self.pause_btn.config(text="暂停", bg=BTN, fg=TEXT)
+        try:
+            if hover:
+                self.status.config(bg=BAR_HOVER,
+                                   fg=ACCENT_HOVER if paused else WHITE)
+            else:
+                self.status.config(bg=SIDEBAR_BG, fg=ACCENT if paused else SUB)
+        except Exception:
+            pass
 
     def _quit(self):
         self._quitting = True

@@ -4500,6 +4500,15 @@ CLICK_IMAGE_POOL = ClickImagePool()
 
 # ---------------------------------------------------------------- 点击语音
 _VOICE_ALIAS = "fxclickvoice"
+# 「点击音效」的别名池：MCI 的每个 alias 是一条**独立设备**，所以给音效单独
+# 一组、一个并发播放占一条 —— 共用一条的话第二个 open 会把第一条正在播的
+# 顶掉，听到的是一声被截断的"咔"。语音那边仍独占 _VOICE_ALIAS（长句叠起来
+# 没法听）。
+#
+# 池子有上限：狂点时开几十条设备会把媒体层拖垮（每条都占一个 wave 句柄）。
+# 满池之后新的点击**直接丢弃**、绝不排队 —— 排队等于把"哒"拖成滞后的长串。
+_SFX_VOICES = 6
+_SFX_ALIASES = tuple("fxclicksfx%d" % i for i in range(_SFX_VOICES))
 _AUDIO_TTL = 2.0                # 目录列表的缓存时长（秒）
 _AUDIO_CACHE = {}               # folder -> (monotonic, [路径...])
 
@@ -4607,17 +4616,26 @@ def _mci_send(cmd):
 
 
 class VoicePlayer:
-    """点击语音：随机播一段音频，**同一时刻只响一个**。
+    """点一下播一段音频（语音包与点击音效共用）。
 
     播放走 Windows 自带的 MCI（`winmm`）—— wav / mp3 / wma 都能放，不引
-    第三方库。整段播放跑在一条后台线程里，渲染线程只负责"占坑"：
+    第三方库。整段播放跑在一条后台线程里，渲染线程只负责"占坑"。
 
-    * 上一段还没放完时 `play_random()` **立刻返回 False**，一秒都不等。
-      排队等着放会让连点变成"越来越滞后的一串拖音"，听感像卡带，所以规则
-      是"忙就丢弃这一次点击"。这也是用户要的"上一段没放完不响应下一个"。
-    * 结束判定用 `status ... mode` 轮询，**不用 `play ... wait`**：后者在
+    **两种占坑策略**（`play_path(..., overlap=)` 选）：
+
+    * `overlap=False`（默认）：**同时只响一个**，独占 `_VOICE_ALIAS`。上一段
+      没放完时新的点击**立刻返回 False**、一秒都不等 —— 排队等着放会让连点
+      变成"越来越滞后的一串拖音"，听感像卡带；语音是长句，叠几句更没法听。
+    * `overlap=True`（「点击音效」用）：从 `_SFX_ALIASES` 借一条空闲设备，
+      **允许叠着播**。音效本来就一秒内的短促一声，连点时叠起来才有连击手感；
+      串行反而像卡顿。池满（`_SFX_VOICES` 条都在响）时丢弃，绝不排队。
+
+    两种策略共同的硬规则：
+
+    * 结束判定用 `status ... mode` **轮询**，**不用 `play ... wait`**：后者在
       某些设备上会直接挂住不返回，那条线程就永远消失在等待里。
     * 600 秒硬上限兜底 —— 设备抽风时 `status` 可能永远回 "playing"。
+    * **无论怎么结束（含设备抛异常）都释放占的坑**，否则这辈子只响一次。
     """
 
     MAX_SECONDS = 600.0
@@ -4625,13 +4643,22 @@ class VoicePlayer:
     def __init__(self):
         self._lock = threading.Lock()
         self._busy = False
+        # 空闲的音效别名。栈（pop 从尾部）而不是集合：优先复用最早放完的那条，
+        # 让同时在响的几条尽量散在不同设备上。
+        self._sfx_free = list(_SFX_ALIASES)
         self._rng = random.Random(0x51CE07)
         self._played = 0
         self._failed = 0
 
     # ---------------------------------------------------------- 渲染线程侧
     def playing(self):
+        """语音（独占那条设备）是否正在播。音效不计入 —— 它们本来就允许并发。"""
         return self._busy
+
+    def voices_busy(self):
+        """当前有几条音效设备被占着（0 = 还能叠新的）。"""
+        with self._lock:
+            return len(_SFX_ALIASES) - len(self._sfx_free)
 
     def play_random(self, folder):
         """随机播一个；正在播 -> 放弃这次（返回 False）。"""
@@ -4641,14 +4668,27 @@ class VoicePlayer:
         """随机挑一条（不播）。给"文字与音频统一"用。"""
         return pick_audio(folder, self._rng)
 
-    def play_path(self, path):
-        """播**指定**的这一条；正在播 -> 放弃这次（返回 False，不排队）。
+    def play_path(self, path, overlap=False):
+        """播**指定**的这一条，返回是否真的起了播。
+
+        `overlap=True` -> 从音效别名池借一条空闲设备，允许与正在响的**叠着播**；
+        `overlap=False` -> 独占语音设备，正在播就放弃这次（不排队）。
 
         与 `play_random` 拆开，是因为语音包的"统一"模式必须是**先挑后播**：
         文字已经按这条音频定下来了，播的就必须是同一条。
         """
         if not path:
             return False
+        path = str(path)
+        if overlap:
+            with self._lock:
+                if not self._sfx_free:      # 设备全占满：丢弃，不排队
+                    return False
+                alias = self._sfx_free.pop()
+                self._played += 1
+            threading.Thread(target=self._worker, args=(path, alias),
+                             name="VoiceSfx", daemon=True).start()
+            return True
         if self._busy:
             return False
         with self._lock:
@@ -4656,7 +4696,7 @@ class VoicePlayer:
                 return False
             self._busy = True
             self._played += 1
-        threading.Thread(target=self._worker, args=(str(path),),
+        threading.Thread(target=self._worker, args=(path, _VOICE_ALIAS),
                          name="VoicePlayer", daemon=True).start()
         return True
 
@@ -4665,33 +4705,43 @@ class VoicePlayer:
             return self._played, self._failed
 
     # ---------------------------------------------------------- 播放线程
-    def _worker(self, path):
+    def _worker(self, path, alias=_VOICE_ALIAS):
+        """在 `alias` 这条设备上放完 `path`，然后把它还回池子。
+
+        **每条线程只碰自己那条 alias** —— 这是并发能成立的前提：共用一条的话，
+        第二个 `open` 会把第一条正在播的顶掉（听到的是一声被截断的"咔"）。
+        """
         try:
             # 上一条如果因为异常没关干净，别名会占着媒体设备 -> 先清一次
-            _mci_send("close %s" % _VOICE_ALIAS)
+            _mci_send("close %s" % alias)
             ext = os.path.splitext(path)[1].lower()
             kind = "waveaudio" if ext == ".wav" else "mpegvideo"
             r, _ = _mci_send('open "%s" type %s alias %s'
-                             % (path, kind, _VOICE_ALIAS))
+                             % (path, kind, alias))
             if r:
                 with self._lock:
                     self._failed += 1
                 return
-            _mci_send("play %s" % _VOICE_ALIAS)
+            _mci_send("play %s" % alias)
             t0 = time.monotonic()
             while time.monotonic() - t0 < self.MAX_SECONDS:
                 time.sleep(0.1)
-                r, mode = _mci_send("status %s mode" % _VOICE_ALIAS)
+                r, mode = _mci_send("status %s mode" % alias)
                 if r or mode.strip().lower() != "playing":
                     break
         except Exception:
             pass
         finally:
             try:
-                _mci_send("close %s" % _VOICE_ALIAS)
+                _mci_send("close %s" % alias)
             finally:
+                # 无论怎么结束（含设备抛异常）都要还坑 —— 少了这一步就是
+                # "这个音效这辈子只响一次，之后永远占着设备"。
                 with self._lock:
-                    self._busy = False
+                    if alias == _VOICE_ALIAS:
+                        self._busy = False
+                    elif alias not in self._sfx_free:
+                        self._sfx_free.append(alias)
 
 
 # ---------------------------------------------------------------- 点击音效
@@ -4793,8 +4843,10 @@ class ClickSfx:
     做成独立的特效（独立分类、独立开关）而不是塞进「点击表情」页，是因为
     它跟画什么完全无关 —— 只想要声音、不要图案/文字是常见需求。
 
-    播放复用与两个点击特效**同一个 `VoicePlayer`**：一次点击只响一声，
-    上一段没播完时新的点击直接丢弃（不排队、更不叠着放）。
+    播放复用与两个点击特效**同一个 `VoicePlayer`**，但走 `overlap=True`：
+    **允许叠着播** —— 音效是短促的一声，连点时叠起来才有连击手感；串行反而
+    像卡顿（上一声没完就把这次吞掉）。同时在响的条数有上限
+    （`_SFX_VOICES`），满池之后的新点击丢弃、不排队。
     """
 
     def __init__(self, player, seed=89):
@@ -4814,7 +4866,9 @@ class ClickSfx:
         items, _rand = sfx_target(cfg)
         if not items:
             return False
-        if self.player.play_path(self._rng.choice(items)):
+        # overlap=True：音效之间允许重叠。语音那边仍独占 —— 一次点击里
+        # 「文字与音频统一」挑中的那条优先（见 fx_scene 的播放分支）。
+        if self.player.play_path(self._rng.choice(items), overlap=True):
             self._played += 1
             return True
         return False
