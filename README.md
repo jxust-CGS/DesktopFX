@@ -161,11 +161,11 @@
 1. **必须是纯 ASCII**。cmd.exe 用系统 ANSI 代码页（中文 Windows 上是 GBK）读 `.bat`，UTF-8 中文会被拆成乱码并破坏引号配对。
 2. **必须是 CRLF 换行**。只有 LF 时 `goto` 标签解析会失败。
 
-启动器由 `_make_launcher.py` 生成（自动保证 CRLF + ASCII）；**不要直接改 .bat**，要改逻辑请改生成器再运行它：
+启动器由 `tools/_make_launcher.py` 生成（自动保证 CRLF + ASCII）；**不要直接改 .bat**，要改逻辑请改生成器再运行它：
 
 ```bash
-python _make_launcher.py   # 重新生成 启动桌面特效.bat（CRLF + ASCII）
-python _verify_launcher.py # 双击全链路验证（含路径存在性、goto 标签可达性）
+python tools/_make_launcher.py   # 重新生成 启动桌面特效.bat（CRLF + ASCII）
+python tests/_verify_launcher.py # 双击全链路验证（含路径存在性、goto 标签可达性）
 ```
 
 另外：**不要用 Git Bash 写这个文件**。MSYS 会把"看起来像绝对路径"的内容里的反斜杠改成斜杠（`C:\Users\...` → `C://Users//...`）。
@@ -182,7 +182,7 @@ python _verify_launcher.py # 双击全链路验证（含路径存在性、goto �
 
 - **不要拷 venv**（Windows venv 不可迁移，路径写死在创建机器上）；启动器会自动重建。
 - `config.json` / `presets_user.json` / `ui_state.json` 是本机运行数据，拷过去等于带着你的设置；想当"全新安装"发给别人就删掉这三个 + `error.log`。
-- 开发辅助文件（`_verify_*.py` `_diag_*.py` `_mkcrlf.py` 等）与 `_*.png` 截图只在开发时有意义，可一并删除，不影响运行。
+- 开发辅助文件都收在 `tools/`（诊断 `tools/diag/`、出图 `tools/shot/`）与 `tests/`（回归验证）里，连 `_*.png` 截图一起，只在开发时有意义，可一并删除，不影响运行。
 - 机器上同时装了多份 Python 想指定用哪份：设环境变量 `DESKTOP_FX_PY=...python.exe` 即可；venv 位置用 `DESKTOP_FX_VENV` 覆盖。
 
 ## 控制面板
@@ -339,45 +339,48 @@ DesktopFX/
 │
 ├── _run_all_verify.py   # 分层顺序跑验证脚本并汇总（--fast 15 个约 80 秒 / --skip-slow 约 3 分钟 / 全量约 11 分钟；必须顺序，并行会互相干扰出假失败）
 │
-│   # ---- 回归验证脚本（38 个，全部留在根目录：_run_all_verify.py 按**脚本自身目录** glob）----
-├── _verify_attach_rollback.py  # 挂到壁纸层失败时的清理对称性：回读失败必须回写原样式（不留"没有父亲却有 WS_CHILD"的孤儿窗）、取不到样式时一次都不能写（否则拿 0 回写会抹掉全部样式）（真机打桩 + AST 负向对照）
-├── _verify_autosave.py      # 1s 防抖自动保存 + 崩溃恢复
-├── _verify_autostart.py     # 开机自启注册表读写
-├── _verify_cfg_coerce.py    # 配置值钳制：字符串写的布尔（"no" 不再是真）/ 坏数值与 NaN 回退出厂值且面板照常打开 / 天文数字拦下 / 合法值零误伤（88 个默认值 + 350 个预设值全过）/ 被忽略的键写日志但不计入熔断 / 用户预设同样过闸（含"旧实现确有该 bug"的负向对照）
-├── _verify_click.py         # 点击特效 + 分组重构：8 种图案非空且预乘合法 / 旋转档互不相同 / 精灵缓存封顶 / 一次点击的粒子数与到期清空 / 扩散与重力与自旋真的生效 / 池满与乱序输入无 NaN / **文字必须整幅落屏**（曾因拿高度当正方形边长而横向切掉 61%，配负向对照）/ 图案惯用色齐全且"选图案自动套色" / 「彩色」逐粒子取色而单色仍单色 / 彩带是弯的（各列墨迹中心 y 极差 + 宽度沿程变化）/ 文字随机倾斜（有分布、0 时全水平、同一次点击内角度固定）/ 文字多行解析（空行·CRLF·全空白）与多条目轮换 / 弹出档位有过冲 / 文字带描边 / 空文字安全 / 装饰开关 / 4 个分组与点击组互斥 / 三张 UI 表与实现一一对应 / Scene 接线（含负向对照）
-├── _verify_config.py        # 内置预设 + 配置持久化 + snapshot 一致性
-├── _verify_dpi.py           # DPI 感知声明验证
-├── _verify_error_reporting.py  # 故障可见性：落盘/去重/熔断/UI 横幅/上报路径自保
-├── _verify_icon_preview.py  # 托盘图标像素级可见性验证（纯 numpy 自绘预览，不依赖 Win32/GDI）
-├── _verify_kinds.py         # 特效分类表自洽：注册完整 / 默认值 / 同类互斥(开启与预设两路) / 不误伤 / 分层渲染接线 / 混合层级时的层间顺序守卫 / 空层跳过的活动信号
-├── _verify_launcher.py      # 双击入口端到端：文件卫生/启动/渲染/单实例
-├── _verify_layer_skip.py    # 层判空 / 跳过上屏的安全不变量：`u32.max()!=0` 与 `any()` 逐值等价、判为"空"的帧缓冲必须真的全零（否则会冻住画面）、水波衰减到零的完整生命周期
-├── _verify_layer_switch.py  # 特效层级开关端到端：归组与档位命名 / 非法值归一 / 落盘回读 / 旧配置缺键 / **真实点击**开关→cfg→snapshot 与染色 / 启动即恢复桌面层且连续上屏不漂移 / 混合档位 / 桌面层不抢顶 / 切回最上层完全还原 / 桌面层窗口重建后仍带档位
-├── _verify_layers.py        # 图层专项：动画 / 透明洞 / 组合 / Scene 全预设端到端
-├── _verify_meteor.py        # 流星专项：角度方向 / 拖尾连续与平滑(不串珠) / 头亮尾暗 / 双色渐变 / 星空 / 覆盖整屏（密度比，新旧对照定阈值）/ 与雨雪樱同屏
-├── _verify_mouse_init.py    # 鼠标探针首帧幽灵位移修复验证
-├── _verify_paint.py         # 颜料盘专项：静止全透明 / 笔触局部 / 推流方向 / 旋钮差分 / 点击扩散 / 无方格纸(带对照组) / 包围盒无损 / 成本随面积
-├── _verify_perf.py          # 4K 双屏最坏情况（暴雨 + 120 涟漪）性能基准；**带判据**：≥20 ms/帧 才判红退出（14/20 两条线，原先只打印不给退出码 = 没有判据）
-├── _verify_perf_layers.py   # 4K 双屏最坏情况（多图层全开）性能 + 3600 帧稳定性基准；判红用**相对本机单层基线的倍数**（>5×，实测 1.3~1.4×）而不是绝对毫秒——跨 CPU 不可移植，且这个极端组合本来就高于 60 帧预算
-├── _verify_pet.py           # 宠物跟随：静止收敛 / 队列间距跟随体型 / **帧率无关**（60 与 120 帧终点差 <4px）/ 乱序输入无 NaN / 朝向迟滞与翻面 / 精灵预乘合法 / **混合必须随底色变化**（覆盖写法下恒定失败，配负向对照）/ 越界裁剪 / 只落鼠标层 / 六处登记齐全 / 走路帧腿动而静止帧腿不动 / 相位去同步 / 眨眼覆盖层裁剪 / 静止渐隐与重新露面 / **现身门槛**（没动 / 差一点都不现身，越过才出现；原地来回抖 10 秒不算"动过"，钉住"判净位移而非累计路程"）/ 沿轨迹铺开（拐弯后露面时队形纵向拉开，第一只在光标处）/ **原地点击不唤醒** / 10 只同屏（含队列是否真的散开）
-├── _verify_petal.py         # 落樱专项：动画 / 暗底可见 / 形状(非椭圆) / 翻面·自旋·风速差分 / 与雪同屏
-├── _verify_render_guard.py  # 渲染线程的异常保护 + 三处 JSON 原子写：线程入口落盘并拆覆盖窗、帧级 try 覆盖 pump 与帧率控制（AST 判"在 try **体内**"+ 两条负向对照）、原子写无残留 / 失败清理 / 往返一致、`.gitattributes` 行尾属性
-├── _verify_render_loop.py   # 渲染循环性能探针：真实循环下把每帧耗时拆到 特效 update/draw / 上屏 / 抢顶，报帧间隔 p50·p95·max 与掉帧数（配置用副本，不动用户配置）
-├── _verify_single_instance.py  # 互斥体跨进程语义 + 跨进程唤醒消息
-├── _verify_smoke.py         # 各特效 60 帧 + 闪电 + 雪 + 聚光灯 + 窗口水波 + 边界雨量，无回归烟雾
-├── _verify_snow.py          # 雪专项：动画 / 暗底可见 / 边界量 / resize / 换色 / 与雨同屏 / 尺寸分档与形状 / 闪烁·辉光·风速差分
-├── _verify_stability.py     # 18000 帧长跑：内存泄漏 / 帧耗时漂移 / 池溢出
-├── _verify_startup_noflicker.py  # 启动无闪动：构造期窗口全程隐藏、__init__ 末尾才一次性显示，高度不跳变
-├── _verify_taskbar.py       # 避开任务栏：矩形取得对(含副屏) / 只擦任务栏 / 越界裁剪 / 空列表不动手 / 端到端(上屏那刻任务栏区域必须全透明，关掉开关则相反)
-├── _verify_tray.py          # 托盘：TaskbarCreated 重挂 / 开机竞态 / 真机图标可见
-├── _verify_ui_resize.py     # 面板可缩放 + 底部提示迁移：八个手柄齐备 / 拖角时对边钉住 / 拖到最小被夹住 / 尺寸落盘与重启还原 / 自适应高度只放开高度 / 折行宽度跟随 / 恢复默认尺寸
-├── _verify_ui_runtime.py    # 面板运行时冒烟：侧栏遍历 / 预设就地刷新 / 滚动，真实 Tk 下实例化
-├── _verify_user_presets.py  # 用户预设：保存 / 按页分组 / 删除 / 应用
-├── _verify_visibility.py    # 在白底 / 深底上量化每个预设的可见度
-├── _verify_wave.py          # 真实水波专项：匀速推进 / 一路不停(真波 vs 假环的判别断言) / 帧率无关 / 线性叠加 / 相长干涉 / 边界反射(带对照组) / 逐旋钮含义 / 亮暗同现 / 光照方位 / 反预乘颜色语义 / 裁剪无损 / 无方格纸(带对照组) / 强度上限 / 预设梯度单调 / Scene 接线 / 两套涟漪并存
-├── _verify_wave_draw.py     # 水波上屏专项：查表着色 vs 逐项公式(独立重算，最大通道差 ≤ 1) / 染色通道顺序 / 缓存命中 / 直写与掩码写语义(脏缓冲下掩码版必须保住他人像素) / 包围盒被缓冲边界切时不越界 / 零波场不写字节
-├── _verify_window_ripple.py  # 窗口水波专项：事件流(移动 / 缩放 / 最小化 / 恢复 / 静止时绝对零注入) / 逐帧热点追踪 / 四个方向的活塞相位 / 拉宽缩窄同式 / 幅度∝速度并饱和 / 30·60·120 帧率无关 / **只向外**(窗内漏量 < 20% 且波包重心单调外移) / 两种包形积分一致 / 与旧写法波高一致(对照组) / Scene 接线与共用水面(带对照组) / 关闭即清场
-├── _verify_zorder.py        # 置顶保活 + 层级：不变量（链签名短路不拖慢反应、抢顶限流、**插入锚点不得自封顶/不得用非置顶窗**）+ 真实窗口（WorkerW 挂载往返、双覆盖层渲染、空层跳过、运行期切层级、真实置顶窗压上来后抢回、**面板被对手压住时仍抢回**、**置顶位丢失后自愈**、**place_above 方向**）
+├── tests/               # 回归验证脚本（38 个）。**必须整体留着**：_run_all_verify.py 按
+│                        #   **脚本自身目录** glob 再按 basename 调 —— 挪位置不会报错，
+│                        #   只会「0 个通过」（静默失去全部回归保护）。脚本头那段垫片
+│                        #   同时解决 import 与路径基准两件事（HERE 仍指项目根）。
+│   ├── _verify_attach_rollback.py  # 挂到壁纸层失败时的清理对称性：回读失败必须回写原样式（不留"没有父亲却有 WS_CHILD"的孤儿窗）、取不到样式时一次都不能写（否则拿 0 回写会抹掉全部样式）（真机打桩 + AST 负向对照）
+│   ├── _verify_autosave.py      # 1s 防抖自动保存 + 崩溃恢复
+│   ├── _verify_autostart.py     # 开机自启注册表读写
+│   ├── _verify_cfg_coerce.py    # 配置值钳制：字符串写的布尔（"no" 不再是真）/ 坏数值与 NaN 回退出厂值且面板照常打开 / 天文数字拦下 / 合法值零误伤（88 个默认值 + 350 个预设值全过）/ 被忽略的键写日志但不计入熔断 / 用户预设同样过闸（含"旧实现确有该 bug"的负向对照）
+│   ├── _verify_click.py         # 点击特效 + 分组重构：8 种图案非空且预乘合法 / 旋转档互不相同 / 精灵缓存封顶 / 一次点击的粒子数与到期清空 / 扩散与重力与自旋真的生效 / 池满与乱序输入无 NaN / **文字必须整幅落屏**（曾因拿高度当正方形边长而横向切掉 61%，配负向对照）/ 图案惯用色齐全且"选图案自动套色" / 「彩色」逐粒子取色而单色仍单色 / 彩带是弯的（各列墨迹中心 y 极差 + 宽度沿程变化）/ 文字随机倾斜（有分布、0 时全水平、同一次点击内角度固定）/ 文字多行解析（空行·CRLF·全空白）与多条目轮换 / 弹出档位有过冲 / 文字带描边 / 空文字安全 / 装饰开关 / 4 个分组与点击组互斥 / 三张 UI 表与实现一一对应 / Scene 接线（含负向对照）
+│   ├── _verify_config.py        # 内置预设 + 配置持久化 + snapshot 一致性
+│   ├── _verify_dpi.py           # DPI 感知声明验证
+│   ├── _verify_error_reporting.py  # 故障可见性：落盘/去重/熔断/UI 横幅/上报路径自保
+│   ├── _verify_icon_preview.py  # 托盘图标像素级可见性验证（纯 numpy 自绘预览，不依赖 Win32/GDI）
+│   ├── _verify_kinds.py         # 特效分类表自洽：注册完整 / 默认值 / 同类互斥(开启与预设两路) / 不误伤 / 分层渲染接线 / 混合层级时的层间顺序守卫 / 空层跳过的活动信号
+│   ├── _verify_launcher.py      # 双击入口端到端：文件卫生/启动/渲染/单实例
+│   ├── _verify_layer_skip.py    # 层判空 / 跳过上屏的安全不变量：`u32.max()!=0` 与 `any()` 逐值等价、判为"空"的帧缓冲必须真的全零（否则会冻住画面）、水波衰减到零的完整生命周期
+│   ├── _verify_layer_switch.py  # 特效层级开关端到端：归组与档位命名 / 非法值归一 / 落盘回读 / 旧配置缺键 / **真实点击**开关→cfg→snapshot 与染色 / 启动即恢复桌面层且连续上屏不漂移 / 混合档位 / 桌面层不抢顶 / 切回最上层完全还原 / 桌面层窗口重建后仍带档位
+│   ├── _verify_layers.py        # 图层专项：动画 / 透明洞 / 组合 / Scene 全预设端到端
+│   ├── _verify_meteor.py        # 流星专项：角度方向 / 拖尾连续与平滑(不串珠) / 头亮尾暗 / 双色渐变 / 星空 / 覆盖整屏（密度比，新旧对照定阈值）/ 与雨雪樱同屏
+│   ├── _verify_mouse_init.py    # 鼠标探针首帧幽灵位移修复验证
+│   ├── _verify_paint.py         # 颜料盘专项：静止全透明 / 笔触局部 / 推流方向 / 旋钮差分 / 点击扩散 / 无方格纸(带对照组) / 包围盒无损 / 成本随面积
+│   ├── _verify_perf.py          # 4K 双屏最坏情况（暴雨 + 120 涟漪）性能基准；**带判据**：≥20 ms/帧 才判红退出（14/20 两条线，原先只打印不给退出码 = 没有判据）
+│   ├── _verify_perf_layers.py   # 4K 双屏最坏情况（多图层全开）性能 + 3600 帧稳定性基准；判红用**相对本机单层基线的倍数**（>5×，实测 1.3~1.4×）而不是绝对毫秒——跨 CPU 不可移植，且这个极端组合本来就高于 60 帧预算
+│   ├── _verify_pet.py           # 宠物跟随：静止收敛 / 队列间距跟随体型 / **帧率无关**（60 与 120 帧终点差 <4px）/ 乱序输入无 NaN / 朝向迟滞与翻面 / 精灵预乘合法 / **混合必须随底色变化**（覆盖写法下恒定失败，配负向对照）/ 越界裁剪 / 只落鼠标层 / 六处登记齐全 / 走路帧腿动而静止帧腿不动 / 相位去同步 / 眨眼覆盖层裁剪 / 静止渐隐与重新露面 / **现身门槛**（没动 / 差一点都不现身，越过才出现；原地来回抖 10 秒不算"动过"，钉住"判净位移而非累计路程"）/ 沿轨迹铺开（拐弯后露面时队形纵向拉开，第一只在光标处）/ **原地点击不唤醒** / 10 只同屏（含队列是否真的散开）
+│   ├── _verify_petal.py         # 落樱专项：动画 / 暗底可见 / 形状(非椭圆) / 翻面·自旋·风速差分 / 与雪同屏
+│   ├── _verify_render_guard.py  # 渲染线程的异常保护 + 三处 JSON 原子写：线程入口落盘并拆覆盖窗、帧级 try 覆盖 pump 与帧率控制（AST 判"在 try **体内**"+ 两条负向对照）、原子写无残留 / 失败清理 / 往返一致、`.gitattributes` 行尾属性
+│   ├── _verify_render_loop.py   # 渲染循环性能探针：真实循环下把每帧耗时拆到 特效 update/draw / 上屏 / 抢顶，报帧间隔 p50·p95·max 与掉帧数（配置用副本，不动用户配置）
+│   ├── _verify_single_instance.py  # 互斥体跨进程语义 + 跨进程唤醒消息
+│   ├── _verify_smoke.py         # 各特效 60 帧 + 闪电 + 雪 + 聚光灯 + 窗口水波 + 边界雨量，无回归烟雾
+│   ├── _verify_snow.py          # 雪专项：动画 / 暗底可见 / 边界量 / resize / 换色 / 与雨同屏 / 尺寸分档与形状 / 闪烁·辉光·风速差分
+│   ├── _verify_stability.py     # 18000 帧长跑：内存泄漏 / 帧耗时漂移 / 池溢出
+│   ├── _verify_startup_noflicker.py  # 启动无闪动：构造期窗口全程隐藏、__init__ 末尾才一次性显示，高度不跳变
+│   ├── _verify_taskbar.py       # 避开任务栏：矩形取得对(含副屏) / 只擦任务栏 / 越界裁剪 / 空列表不动手 / 端到端(上屏那刻任务栏区域必须全透明，关掉开关则相反)
+│   ├── _verify_tray.py          # 托盘：TaskbarCreated 重挂 / 开机竞态 / 真机图标可见
+│   ├── _verify_ui_resize.py     # 面板可缩放 + 底部提示迁移：八个手柄齐备 / 拖角时对边钉住 / 拖到最小被夹住 / 尺寸落盘与重启还原 / 自适应高度只放开高度 / 折行宽度跟随 / 恢复默认尺寸
+│   ├── _verify_ui_runtime.py    # 面板运行时冒烟：侧栏遍历 / 预设就地刷新 / 滚动，真实 Tk 下实例化
+│   ├── _verify_user_presets.py  # 用户预设：保存 / 按页分组 / 删除 / 应用
+│   ├── _verify_visibility.py    # 在白底 / 深底上量化每个预设的可见度
+│   ├── _verify_wave.py          # 真实水波专项：匀速推进 / 一路不停(真波 vs 假环的判别断言) / 帧率无关 / 线性叠加 / 相长干涉 / 边界反射(带对照组) / 逐旋钮含义 / 亮暗同现 / 光照方位 / 反预乘颜色语义 / 裁剪无损 / 无方格纸(带对照组) / 强度上限 / 预设梯度单调 / Scene 接线 / 两套涟漪并存
+│   ├── _verify_wave_draw.py     # 水波上屏专项：查表着色 vs 逐项公式(独立重算，最大通道差 ≤ 1) / 染色通道顺序 / 缓存命中 / 直写与掩码写语义(脏缓冲下掩码版必须保住他人像素) / 包围盒被缓冲边界切时不越界 / 零波场不写字节
+│   ├── _verify_window_ripple.py  # 窗口水波专项：事件流(移动 / 缩放 / 最小化 / 恢复 / 静止时绝对零注入) / 逐帧热点追踪 / 四个方向的活塞相位 / 拉宽缩窄同式 / 幅度∝速度并饱和 / 30·60·120 帧率无关 / **只向外**(窗内漏量 < 20% 且波包重心单调外移) / 两种包形积分一致 / 与旧写法波高一致(对照组) / Scene 接线与共用水面(带对照组) / 关闭即清场
+│   └── _verify_zorder.py        # 置顶保活 + 层级：不变量（链签名短路不拖慢反应、抢顶限流、**插入锚点不得自封顶/不得用非置顶窗**）+ 真实窗口（WorkerW 挂载往返、双覆盖层渲染、空层跳过、运行期切层级、真实置顶窗压上来后抢回、**面板被对手压住时仍抢回**、**置顶位丢失后自愈**、**place_above 方向**）
 └── 启动桌面特效.bat      # 一键启动器（由 tools/_make_launcher.py 生成；ASCII + CRLF）
 ```
 
@@ -428,7 +431,7 @@ DesktopFX/
 python tools/_selftest.py
 
 # 窗口 + 渲染 2 秒冒烟（不启动托盘/UI）
-python _runtime_test.py
+python tools/_runtime_test.py
 
 # 38 个验证脚本：可见度 / 配置 / 用户预设 / 开机自启 / 自动保存 / 故障可见性 / 托盘 /
 #   图标预览 / 烟雾 / 雪 / 落樱 / 流星 / 颜料盘 / 真实水波 / 水波上屏 / 窗口水波 /
@@ -442,47 +445,47 @@ python _runtime_test.py
 python _run_all_verify.py --fast        # 核心回归（15 个脚本），约 80 秒
 python _run_all_verify.py --skip-slow   # 略过性能/长跑/烟雾，约 3 分钟
 python _run_all_verify.py               # 全量，约 11 分钟
-python _verify_visibility.py
-python _verify_config.py
-python _verify_user_presets.py
-python _verify_autostart.py
-python _verify_autosave.py
-python _verify_error_reporting.py
-python _verify_tray.py
-python _verify_smoke.py
-python _verify_snow.py
-python _verify_petal.py
-python _verify_meteor.py
-python _verify_paint.py
-python _verify_wave.py
-python _verify_zorder.py
-python _verify_layer_switch.py
-python _verify_kinds.py
-python _verify_taskbar.py
-python _verify_layers.py
-python _verify_window_ripple.py
-python _verify_perf.py
-python _verify_perf_layers.py
-python _verify_stability.py
-python _verify_mouse_init.py
-python _verify_dpi.py
-python _verify_launcher.py
-python _verify_single_instance.py
-python _verify_ui_runtime.py
+python tests/_verify_visibility.py
+python tests/_verify_config.py
+python tests/_verify_user_presets.py
+python tests/_verify_autostart.py
+python tests/_verify_autosave.py
+python tests/_verify_error_reporting.py
+python tests/_verify_tray.py
+python tests/_verify_smoke.py
+python tests/_verify_snow.py
+python tests/_verify_petal.py
+python tests/_verify_meteor.py
+python tests/_verify_paint.py
+python tests/_verify_wave.py
+python tests/_verify_zorder.py
+python tests/_verify_layer_switch.py
+python tests/_verify_kinds.py
+python tests/_verify_taskbar.py
+python tests/_verify_layers.py
+python tests/_verify_window_ripple.py
+python tests/_verify_perf.py
+python tests/_verify_perf_layers.py
+python tests/_verify_stability.py
+python tests/_verify_mouse_init.py
+python tests/_verify_dpi.py
+python tests/_verify_launcher.py
+python tests/_verify_single_instance.py
+python tests/_verify_ui_runtime.py
 
 # 真机视觉验证（需真实桌面）：启动指定组合并抓帧差分，确认特效真的画到了桌面
-python _diag_layers.py     # 雨 + 聚光灯 同屏
-python _diag_snow.py       # 初雪预设
+python tools/diag/_diag_layers.py     # 雨 + 聚光灯 同屏
+python tools/diag/_diag_snow.py       # 初雪预设
 
 # 长跑体检（需真实桌面，默认 240 秒）：看内存 / GDI / USER / Win32 句柄 / 帧耗时
 # 是否随时间恶化。数据全走临时副本，不碰真实配置；有异常时退出码非 0
-LONGRUN_SECS=600 python _probe_longrun.py
+LONGRUN_SECS=600 python tools/diag/_probe_longrun.py
 
 # 重新生成 README 的面板截图（覆盖 docs/images/panel-*.png，需真实桌面）
-python _shot_panel.py
+python tools/shot/_shot_panel.py
 
 # pythonw 没有控制台，看不到 print。用这个壳把输出和异常抓到 _pw.log：
-pythonw _pwdbg.py && type _pw.log
+pythonw tools/_pwdbg.py && type _pw.log
 
 # 实机运行 10 秒后自动退出（方便捕获日志）
 set DESKTOP_FX_AUTOKILL=10000

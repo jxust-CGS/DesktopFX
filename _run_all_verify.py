@@ -58,8 +58,16 @@ SLOW = [
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
     py = sys.executable
+    here = os.path.dirname(os.path.abspath(__file__))   # 项目根
+    tests = os.path.join(here, "tests")
+    py = sys.executable
     all_scripts = sorted(os.path.basename(p)
-                         for p in glob.glob(os.path.join(here, "_verify_*.py")))
+                         for p in glob.glob(os.path.join(tests, "_verify_*.py")))
+    if not all_scripts:
+        # 空列表不该被当成"0 个通过"—— 那是**静默失去全部回归保护**
+        print(f"在 {tests} 下没找到任何 _verify_*.py，检查目录是否被改名/搬走",
+              file=sys.stderr)
+        return 1
     if "--fast" in sys.argv:
         scripts = FAST
     elif "--skip-slow" in sys.argv:
@@ -71,8 +79,10 @@ def main():
     t_all = time.time()
     for s in scripts:
         t0 = time.time()
-        r = subprocess.run([py, s], cwd=here, capture_output=True, text=True,
-                           errors="replace")
+        # 仍以**项目根**为 cwd，只是脚本路径带上 tests/ —— 这样任何
+        # 依赖 cwd 的写法都不会被这次搬迁顺手改坏。
+        r = subprocess.run([py, os.path.join("tests", s)], cwd=here,
+                           capture_output=True, text=True, errors="replace")
         dt = time.time() - t0
         tail = [l for l in (r.stdout or "").strip().splitlines() if l.strip()]
         summary = ""
@@ -104,4 +114,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

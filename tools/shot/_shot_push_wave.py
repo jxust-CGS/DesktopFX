@@ -27,8 +27,11 @@ import sys
 ROOT = Path(__file__).resolve().parent
 while not (ROOT / "desktop_fx.py").exists() and ROOT.parent != ROOT:
     ROOT = ROOT.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+# tests/ 也要进 path：下面 import 了 tests/ 里的 _verify_window_ripple（跨目录）。
+for _p in (ROOT, ROOT / "tests"):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
 from fx_effects import WaterRippleField
 from _verify_window_ripple import _old_band
 
