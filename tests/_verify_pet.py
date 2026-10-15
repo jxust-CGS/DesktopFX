@@ -36,6 +36,8 @@ for _p in (ROOT, _TESTS_DIR):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import _srclib  # noqa: E402  测试助手：按源码打补丁做负向对照（见 fx_effects 三层拆分）
+
 HERE = ROOT          # 见上：HERE 仍指项目根
 
 import desktop_fx as d                              # noqa: E402
@@ -828,11 +830,14 @@ def test_negative_copy_instead_of_over():
     `dst[...] = out` —— 它在全文件只该出现一次，出现两次说明有人又抄了一份
     混合代码出来，那正是这份对照要拦的。
     """
-    src = open(os.path.join(HERE, "fx_effects.py"), encoding="utf-8").read()
     marker = "    dst[...] = out\n"
-    if src.count(marker) != 1:
-        return False, (f"定位不到共用的混合写回语句（找到 {src.count(marker)} 处）"
+    # ⚠️ 唯一性要**跨 fx_image / fx_click / fx_effects 一起数**：拆分后混合实现
+    # 住在 fx_image.py，若有人又在别处抄一份，这条对照就该变红。
+    total = _srclib.count_marker(marker)
+    if total != 1:
+        return False, (f"定位不到共用的混合写回语句（三个产品文件合计找到 {total} 处）"
                        f" —— 混合实现被抄成了多份？")
+    src = _srclib.read_src("fx_image.py")
     # 换成"覆盖"写法：直接用精灵像素写回，完全不读 dst。这是本文件其它特效
     # 惯用的那套写法，但在有羽化边缘的精灵上就是错的。
     stripped = src.replace(marker,
@@ -845,12 +850,11 @@ def test_negative_copy_instead_of_over():
                            "                | (np.clip(a * 255.0, 0.0, 255.0)\n"
                            "                   .astype(np.uint32) << np.uint32(24)))\n")
 
-    import types
-    mod = types.ModuleType("fxeff_copy_mod")
-    mod.__dict__["__name__"] = "fxeff_copy_mod"
-    mod.__dict__["__file__"] = os.path.join(HERE, "fx_effects.py")
     try:
-        exec(compile(stripped, "fx_effects_copy.py", "exec"), mod.__dict__)
+        # `_over_blend` 住在 fx_image，而 PetField 在 import 时把它绑进了自己的
+        # 命名空间 —— 必须连着 fx_image 一起重新 exec（详见 _srclib）。
+        with _srclib.patched("fx_image", stripped):
+            mod = _srclib.exec_module("fx_effects.py", "fxeff_copy_mod")
     except Exception as e:
         return False, f"负向对照模块编译失败：{type(e).__name__}: {e}"
 

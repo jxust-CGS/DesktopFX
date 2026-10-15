@@ -42,12 +42,20 @@ for _p in (ROOT, _TESTS_DIR):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import _srclib  # noqa: E402  测试助手：按源码打补丁做负向对照（见 fx_effects 三层拆分）
+
 HERE = ROOT          # 见上：HERE 仍指项目根
 
 import desktop_fx as d                              # noqa: E402
 import fx_effects as F                              # noqa: E402
 import fx_kinds                                     # noqa: E402
 from fx_effects import ClickEmojiField, ClickTextField   # noqa: E402
+
+# ⚠️ 打桩 `_mci_send` 必须打在 **fx_click** 上，不能打 `fx_effects`。
+# `_mci_send` 拆到了 fx_click.py，`fx_effects._mci_send` 只是转出（同一个函数
+# 对象），而 `VoicePlayer` 是在**自己模块的全局**里找这个名字的 ——
+# 改 `fx_effects._mci_send` 不会影响它，症状是"打桩后一条播放命令都没发出"。
+import fx_click                                     # noqa: E402
 
 W, H = 640, 480
 
@@ -620,20 +628,22 @@ def test_negative_copy_instead_of_over():
 
     点击特效和宠物共用同一份 `_over_blend`，所以这条同时守着两边。
     """
-    src = open(os.path.join(HERE, "fx_effects.py"), encoding="utf-8").read()
     marker = "    dst[...] = out\n"
-    if src.count(marker) != 1:
-        return False, f"定位不到共用的混合写回（找到 {src.count(marker)} 处）"
-    stripped = src.replace(marker, "    dst[...] = np.zeros(dst.shape, np.uint32)\n")
-    if stripped == src:
+    # ⚠️ 唯一性要**跨 fx_image / fx_click / fx_effects 一起数**：拆分后混合实现
+    # 住在 fx_image.py，若有人又在别处抄一份，这条对照就该变红。
+    total = _srclib.count_marker(marker)
+    if total != 1:
+        return False, f"定位不到共用的混合写回（三个产品文件合计找到 {total} 处）"
+    orig = _srclib.read_src("fx_image.py")
+    stripped = orig.replace(marker, "    dst[...] = np.zeros(dst.shape, np.uint32)\n")
+    if stripped == orig:
         return False, "负向对照没改到源码"
 
-    import types
-    mod = types.ModuleType("fxeff_click_copy")
-    mod.__dict__["__name__"] = "fxeff_click_copy"
-    mod.__dict__["__file__"] = os.path.join(HERE, "fx_effects.py")
     try:
-        exec(compile(stripped, "fx_effects_click_copy.py", "exec"), mod.__dict__)
+        # `_over_blend` 住在 fx_image，而 ClickEmojiField 在 import 时把它绑进了
+        # 自己的命名空间 —— 必须连着 fx_image 一起重新 exec（详见 _srclib）。
+        with _srclib.patched("fx_image", stripped):
+            mod = _srclib.exec_module("fx_click.py", "fxclick_click_copy")
     except Exception as e:
         return False, f"负向对照模块编译失败：{type(e).__name__}: {e}"
 
@@ -723,7 +733,7 @@ def test_text_clip_check_is_sensitive():
     没有它，`test_text_not_clipped_horizontally` 可能只是在测"我新写的
     东西自洽"，而不是真的在拦这个 bug。
     """
-    src = open(os.path.join(HERE, "fx_effects.py"), encoding="utf-8").read()
+    src = _srclib.read_src("fx_click.py")
     good = ("        sh, sw = img.shape[:2]\n"
             "        x0 = int(round(cx - sw * 0.5))\n"
             "        y0 = int(round(cy - sh * 0.5))\n"
@@ -738,13 +748,11 @@ def test_text_clip_check_is_sensitive():
     if src.count(good) != 1:
         return False, f"定位不到 _blit 的宽高取值（找到 {src.count(good)} 处）"
 
-    import types
-    mod = types.ModuleType("fxeff_clip_copy")
-    mod.__dict__["__name__"] = "fxeff_clip_copy"
-    mod.__dict__["__file__"] = os.path.join(HERE, "fx_effects.py")
     try:
-        exec(compile(src.replace(good, bad), "fx_effects_clip_copy.py", "exec"),
-             mod.__dict__)
+        # `_blit` 已随点击管线搬进 fx_click.py（见 test_text_clip_check_is_sensitive
+        # 上面的 `src = _srclib.read_src("fx_click.py")`）。
+        mod = _srclib.exec_module("fx_click.py", "fxclick_clip_copy",
+                                  src=src.replace(good, bad))
     except Exception as e:
         return False, f"负向对照模块编译失败：{type(e).__name__}: {e}"
 
@@ -1141,7 +1149,7 @@ def test_voice_no_overlap():
     folder = _mk_audio_folder()
     playing = [True]
     cmds = []
-    orig = F._mci_send
+    orig = fx_click._mci_send
 
     def fake(cmd):
         cmds.append(cmd)
@@ -1149,7 +1157,7 @@ def test_voice_no_overlap():
             return 0, "playing" if playing[0] else "stopped"
         return 0, ""
 
-    F._mci_send = fake
+    fx_click._mci_send = fake
     try:
         vp = F.VoicePlayer()
         first = vp.play_random(folder)
@@ -1163,7 +1171,7 @@ def test_voice_no_overlap():
         # 所以这里查的是它，而不是播放器自身的字段。
         scanned = F.list_audio(folder)
     finally:
-        F._mci_send = orig
+        fx_click._mci_send = orig
         shutil.rmtree(folder, ignore_errors=True)
 
     if not first or not fourth:
@@ -1189,15 +1197,15 @@ def test_voice_releases_on_failure():
     def boom(cmd):
         raise RuntimeError("device gone")
 
-    orig = F._mci_send
-    F._mci_send = boom
+    orig = fx_click._mci_send
+    fx_click._mci_send = boom
     try:
         vp = F.VoicePlayer()
         started = vp.play_random(folder)
         released = _wait_busy(vp, False)
         again = vp.play_random(folder)
     finally:
-        F._mci_send = orig
+        fx_click._mci_send = orig
         shutil.rmtree(folder, ignore_errors=True)
     if not started:
         return False, "起播就失败了（应当先占坑、之后才去碰设备）"
@@ -1815,8 +1823,9 @@ def test_no_shadowed_module_defs():
     读代码看不出来，手动点界面也未必踩得到（要先选中那个文件夹）。
     """
     import ast
-    mods = ("fx_effects.py", "fx_scene.py", "fx_ui.py", "desktop_fx.py",
-            "fx_kinds.py", "fx_winlayer.py", "fx_tray.py", "_paths.py")
+    mods = ("fx_effects.py", "fx_image.py", "fx_click.py", "fx_scene.py",
+            "fx_ui.py", "desktop_fx.py", "fx_kinds.py", "fx_winlayer.py",
+            "fx_tray.py", "_paths.py")
     bad, checked = [], 0
     for fn in mods:
         path = os.path.join(HERE, fn)
@@ -2079,8 +2088,8 @@ def test_sfx_voices_use_separate_aliases():
             return 0, "playing" if playing[0] else "stopped"
         return 0, ""
 
-    orig = F._mci_send
-    F._mci_send = fake
+    orig = fx_click._mci_send
+    fx_click._mci_send = fake
     try:
         vp = F.VoicePlayer()
         n = min(4, F._SFX_VOICES)
@@ -2089,7 +2098,7 @@ def test_sfx_voices_use_separate_aliases():
         # 语音那条独占设备**不能**被音效占用
         vp.play_path("C:/x/a.wav")
     finally:
-        F._mci_send = orig
+        fx_click._mci_send = orig
 
     aliases = [c.rsplit("alias ", 1)[1] for c in cmds if c.startswith("open ")]
     uniq = set(aliases)
@@ -2116,8 +2125,8 @@ def test_sfx_voice_pool_is_bounded_and_released():
             return 0, "playing" if playing[0] else "stopped"
         return 0, ""
 
-    orig = F._mci_send
-    F._mci_send = fake
+    orig = fx_click._mci_send
+    fx_click._mci_send = fake
     try:
         vp = F.VoicePlayer()
         # 超过池容量的连点：前 N 条起播，之后必须开始返回 False（不是无限开设备）
@@ -2138,7 +2147,7 @@ def test_sfx_voice_pool_is_bounded_and_released():
         if not vp.play_path("C:/x/a.wav", overlap=True):
             return False, "释放之后仍然起不了播（池没还回来）"
     finally:
-        F._mci_send = orig
+        fx_click._mci_send = orig
     return True, (f"池封顶在 {F._SFX_VOICES} 条（超出丢弃不排队）；"
                   "播完全部归还，可再次起播")
 

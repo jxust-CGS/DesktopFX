@@ -295,7 +295,10 @@ DesktopFX/
 ├── desktop_fx.py          # 主程序：渲染线程 + 事件采集 + 生命周期
 ├── fx_kinds.py            # 特效分类表：侧栏分组 / 渲染分层 / 同类互斥三处共用的一份定义（新增特效只改这里）
 ├── fx_winlayer.py         # 分层透明窗口（Win32 UpdateLayeredWindow + DIBSection；支持"最上层"与"仅桌面图层 WorkerW"两种层级）
-├── fx_effects.py          # numpy 向量化雨滴 / 雪花 / 花瓣 / 流星 / 流体颜料 / 涟漪 / 真实水波（含"窗口=活塞"的注入接口）/ 聚光灯 / WindowProbe 渲染
+│   # 特效引擎分三层，依赖方向单向下行（往下一层 import，不许反向）：
+├── fx_image.py            # 像素底层：色值解析 / 预乘打包 / over 混合 / PIL 可用性 —— fx_effects 与 fx_click 共用
+├── fx_click.py            # 点击管线：图案与文字精灵 / 字体表 / 素材扫描 / 图片池 / MCI 音频 / 爆发引擎
+├── fx_effects.py          # 其余全部特效：雨滴 / 雪花 / 花瓣 / 流星 / 流体颜料 / 涟漪 / 真实水波（含"窗口=活塞"注入接口）/ 聚光灯 / 宠物跟随 / 窗口探测
 ├── fx_scene.py            # 场景合成器：把雨/雪/落樱/流星雨/颜料盘/涟漪/真实水波/聚光灯/窗口水波/鼠标组合成可开关的图层（窗口水波与真实水波**共用同一个水面**，前者只往水里注入位移）
 ├── fx_tray.py             # 原生 Shell_NotifyIcon 托盘（LoadImageW 加载 assets/tray_icon.ico）
 ├── fx_ui.py               # tkinter 深色玻璃风控制面板（PIL 抗锯齿自绘控件 + 侧栏导航）
@@ -383,6 +386,12 @@ DesktopFX/
 │   └── _verify_zorder.py        # 置顶保活 + 层级：不变量（链签名短路不拖慢反应、抢顶限流、**插入锚点不得自封顶/不得用非置顶窗**）+ 真实窗口（WorkerW 挂载往返、双覆盖层渲染、空层跳过、运行期切层级、真实置顶窗压上来后抢回、**面板被对手压住时仍抢回**、**置顶位丢失后自愈**、**place_above 方向**）
 └── 启动桌面特效.bat      # 一键启动器（由 tools/_make_launcher.py 生成；ASCII + CRLF）
 ```
+
+三层之间靠 `fx_effects.py` 顶部的 `from fx_image import *` / `from fx_click import *`
+**兼容转出**：外部仍可按 `fx_effects.<名字>` 引用被搬走的东西。那两个 `import`
+看着"没人用"，**不能删** —— 删掉会把上百处引用打成 `AttributeError`。
+转出走的是两个模块各自定义的 `__all__`（**含下划线名**），因为默认的
+`import *` 不带下划线名，而 `_over_blend` / `_BurstEngine` 这类私有名恰恰是外部要用的。
 
 ## 性能与限制
 
