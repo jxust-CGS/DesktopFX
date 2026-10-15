@@ -7,7 +7,9 @@
   error.log 都在这里，随 exe 走，重启不丢）。
 - res_path(name)：只读资源。
   冻结单文件模式下资源打包进 sys._MEIPASS 临时目录，从那里取；
-  否则退回 app_root()（开发时 tray_icon.* 就在项目目录）。
+  否则退回 app_root()。开发时图标在 `assets/` 下，所以调用方一律写
+  `res_path(os.path.join("assets", ...))`（与 `fx_effects.builtin_sfx_dir` 同）
+  —— 别拼字符串，`_MEIPASS` 那条分支才走得通。
 """
 import json
 import os
