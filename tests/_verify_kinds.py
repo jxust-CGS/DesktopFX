@@ -245,6 +245,10 @@ def test_restack_guard():
             self.z_mode = z_mode
             self.hwnd = hwnd
             self.calls = []
+            self._riding = False
+
+        def is_riding_panel(self):
+            return self._riding
 
         def place_above(self, other):
             self.calls.append(other)
@@ -259,6 +263,16 @@ def test_restack_guard():
     app.overlays = [fs, ms]
     assert app._restack_overlays() is True
     assert ms.calls == [111], "两层都在最上层时没有纠正顺序"
+
+    # 临时骑在面板之上（点击特效播放中）时不纠正两层先后 —— 那次
+    # SetWindowPos 可能把鼠标层压回面板之下，正在播的特效就看不见了
+    ms.calls.clear()
+    ms._riding = True
+    assert app._restack_overlays() is False
+    assert ms.calls == [], "骑面板期间仍在重排两层"
+    ms._riding = False
+    ms.calls.clear()
+    assert app._restack_overlays() is True, "结束骑乘后应恢复纠正"
 
     fs.z_mode = fx_kinds.LAYER_DESKTOP          # 全屏层沉到桌面壁纸
     ms.calls.clear()

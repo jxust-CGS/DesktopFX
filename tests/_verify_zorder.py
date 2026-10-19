@@ -882,6 +882,89 @@ def test_real_empty_layer_skip():
                   f"开启聚光灯后立即恢复提交")
 
 
+# ------------------------------------------- 不变量 I：骑面板期间不抢顶
+def test_panel_ride_suppresses_keep_on_top():
+    """临时"骑在面板之上"（面板空白处的点击特效播放中）时，keep_on_top
+    必须整段让位，一次 SetWindowPos 都不许发。
+
+    背景（实测踩过的坑）：提升之后本窗口排在面板之上，`_anchor` 的资格
+    检查恰好判"面板压得住任何对手"，锚点就变成面板 —— keep_on_top 每帧把
+    我们插回面板之下，提升只活一帧，面板上永远看不到文字/表情。所以
+    raise_topmost 置 _ride_above_panel，keep_on_top 必须认这个标志。
+    """
+    ov, fake = _patched({OVERLAY: PANEL, PANEL: 0}, {PANEL}, panel=PANEL)
+    ov._ride_above_panel = True
+    moved = ov.keep_on_top()
+    if moved or fake.setpos:
+        return False, (f"骑面板期间 keep_on_top 仍发 {len(fake.setpos)} 次 "
+                       f"SetWindowPos —— 提升会被自己打回去，面板上"
+                       f"永远看不到点击特效")
+    return True, "骑面板期间 -> 0 次 SetWindowPos（提升不被自我否定）"
+
+
+def test_panel_ride_restored_after_leave():
+    """结束骑乘后 keep_on_top 必须恢复正常抢顶能力。"""
+    ov, fake = _patched({OVERLAY: OTHER, OTHER: 0}, {OTHER}, panel=PANEL,
+                        classes={hwnd_int(OTHER): "SomeTopmostApp"})
+    ov._ride_above_panel = True
+    if ov.keep_on_top() or fake.setpos:
+        return False, "骑乘期间就抢顶了"
+    # 结束骑乘（fake 的 SetWindowPos 只记录，不改标志 —— 标志由 leave 管）
+    ov._ride_above_panel = False
+    fake.setpos.clear()
+    ov.keep_on_top()
+    if not fake.setpos:
+        return False, "结束骑乘后仍不抢顶（真实遮挡存在却没恢复）"
+    return True, "结束骑乘 -> 抢顶恢复"
+
+
+def test_raise_topmost_sets_ride_flag():
+    """raise_topmost 必须置 _ride_above_panel（否则上面两条都不成立）。"""
+    ov, fake = _patched({OVERLAY: PANEL, PANEL: 0}, {PANEL}, panel=PANEL)
+    if ov.raise_topmost() is False:
+        return False, "raise_topmost 返回失败"
+    if not ov._ride_above_panel:
+        return False, "raise_topmost 没有置 _ride_above_panel"
+    if not fake.setpos:
+        return False, "raise_topmost 没发 SetWindowPos"
+    if ov.leave_panel_ride(PANEL) is False:
+        return False, "leave_panel_ride 返回失败"
+    if ov._ride_above_panel:
+        return False, "leave_panel_ride 没清 _ride_above_panel"
+    return True, "raise_topmost 置位骑乘标志、leave_panel_ride 清位"
+
+
+def test_keep_riding_panel_self_heals():
+    """骑乘期间每帧自检：被面板抢顶打下去后必须补一次提升。
+
+    背景（实测）：控制面板自己有 1s 一次的置顶保活（fx_ui._raise_top ->
+    SetWindowPos(HWND_TOPMOST)），会把面板顶到我们之上，把点击特效重新压回
+    面板底下 —— 实测提升只活 ~0.3s。keep_riding_panel 就是每帧问一次
+    "我还在面板之上吗"，掉了就补一次 SetWindowPos。
+    """
+    # 链上找不到面板 -> 说明面板确实在我们之上（我们被打下去了）-> 应补提升
+    ov, fake = _patched({OVERLAY: 0}, set(), panel=PANEL)
+    ov._ride_above_panel = True
+    healed = ov.keep_riding_panel(PANEL)
+    if not healed:
+        return False, "被打到面板之下后没有补提升（特效只活 0.3s 就消失）"
+    if not fake.setpos:
+        return False, "补提升时没发 SetWindowPos"
+    # 仍在面板之上 -> 不该乱动
+    fake.setpos.clear()
+    ov, fake = _patched({OVERLAY: PANEL, PANEL: 0}, {PANEL}, panel=PANEL)
+    ov._ride_above_panel = True
+    if ov.keep_riding_panel(PANEL):
+        return False, "位置正常时不该重复提升（每帧发 SetWindowPos 会闪）"
+    if fake.setpos:
+        return False, f"位置正常时仍发了 {len(fake.setpos)} 次 SetWindowPos"
+    # 不在骑乘状态 -> 什么都不做
+    ov, fake = _patched({OVERLAY: 0}, set(), panel=PANEL)
+    if ov.keep_riding_panel(PANEL) or fake.setpos:
+        return False, "非骑乘状态不该动 z 序"
+    return True, "骑乘自愈：掉了就补、没掉不动、非骑乘不碰"
+
+
 def main():
     tests = [
         test_steady_state_is_noop,
@@ -899,6 +982,10 @@ def main():
         test_occluder_found_past_helpers,
         test_raise_is_throttled,
         test_chain_change_triggers_immediate_recheck,
+        test_panel_ride_suppresses_keep_on_top,
+        test_panel_ride_restored_after_leave,
+        test_raise_topmost_sets_ride_flag,
+        test_keep_riding_panel_self_heals,
         test_real_window_steady_state,
         test_real_window_geometry_sane,
         test_real_foreign_topmost_is_recovered,

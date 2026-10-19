@@ -43,6 +43,8 @@ class _StubApp:
         self.fps = 60.0
         self.cost_ms = 9.0
         self.paused = False
+        self.ui_hwnd = 0
+        self.ui_btn_hwnds = frozenset()
 
     def set(self, k, v):
         self.cfg[k] = v
@@ -850,6 +852,39 @@ def main():
     p._sync_from_cfg()
     p.root.update_idletasks()
     assert _shown("点击表情", "图案"), "改了来源之后「图案」行应当显示出来"
+
+    # 8h) 交互控件集合同步：面板必须把"按钮 / 滑块 / 侧栏导航"等交互控件的
+    # HWND 同步给 App —— 渲染线程靠它做面板点击三态判定（交互控件抑制、
+    # 面板空白放行、面板外照常）。集合为空 = 过滤失灵 = "点按钮双响"回归；
+    # 面板根本身混进去 = 面板空白处点击被误抑制 = "控制面板上不生效"回归。
+    p._sync_interactive_hwnds()
+    _ia = getattr(app, "ui_btn_hwnds", None)
+    assert _ia, "交互控件集合为空（_sync_interactive_hwnds 没同步出去？）"
+
+    def _walk_all(w, out):
+        for c in w.winfo_children():
+            out.append(c)
+            _walk_all(c, out)
+        return out
+
+    _all = _walk_all(p.root, [])
+    _btns = [w for w in _all if w.winfo_class() == "Button"]
+    assert _btns, "面板上找不到任何 Button（控件树空了？）"
+    for _b in _btns[:8]:
+        assert int(_b.winfo_id()) in _ia, \
+            f"Button「{_b.cget('text')}」没进交互控件集合"
+    _sliders = [w for w in _all if type(w).__name__ == "_Slider"]
+    assert _sliders, "面板上找不到 _Slider"
+    for _s in _sliders[:8]:
+        assert int(_s.winfo_id()) in _ia, \
+            "_Slider 没进集合（它 winfo_class 是 Canvas，靠类型名特判收录）"
+    # bind 型交互：侧栏导航项是 Frame + Label 组合，点它切页 —— 必须收录
+    for _n in ("下雨", "点击音效"):
+        assert int(p._nav[_n]["frame"].winfo_id()) in _ia, \
+            f"侧栏导航 {_n} 没进集合（bind 型交互漏收，点它会双触发）"
+    # 反面：面板根（TkTopLevel）不能进集合 —— 点面板最底层背景要放行
+    assert int(p.root.winfo_id()) not in _ia, \
+        "面板根窗口进了交互集合（点面板空白会被误抑制）"
 
     p.root.destroy()
     # 清理测试写出的 UI 状态文件，避免污染实机默认页

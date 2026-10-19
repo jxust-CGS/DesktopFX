@@ -8,7 +8,9 @@ import ctypes
 import ctypes.wintypes as wt
 import json
 import os
+import random
 import tkinter as tk
+import time
 
 from _win32 import user32, HANDLE, HWND, INT, UINT, hwnd_int, screen_pixel
 from _paths import app_root, atomic_write_json
@@ -118,6 +120,7 @@ TIP_DELAY = 400      # 鼠标停多久才弹出（ms）
 TIP_WRAP = 300       # 提示文字折行宽度（px）
 
 HWND_TOPMOST = wt.HWND(-1)
+HWND_NOTOPMOST = wt.HWND(-2)   # 摘掉置顶位，窗口留在当前 z 序位置
 SWP_NOMOVE = 0x0002
 SWP_NOSIZE = 0x0001
 SWP_NOACTIVATE = 0x0010
@@ -194,7 +197,7 @@ class _Slider(tk.Canvas):
     TRACK_H = 4
 
     def __init__(self, parent, lo, hi, res, variable, command=None,
-                 width=200, **kw):
+                 on_release=None, width=200, **kw):
         kw.setdefault("highlightthickness", 0)
         kw.setdefault("bd", 0)
         kw.setdefault("bg", CARD)
@@ -205,6 +208,7 @@ class _Slider(tk.Canvas):
         self.res = float(res)
         self.var = variable
         self.command = command
+        self.on_release = on_release
         self._req_w = int(width)   # 请求宽度；勿用 _w（tkinter 内部 Tcl 路径）
         self._bake_key = None   # 上次烘焙的 (宽, 取值, 底色)，同键不重烘焙
         self._xpad = self.RADIUS + 3
@@ -298,6 +302,11 @@ class _Slider(tk.Canvas):
 
     def _on_release(self, _e):
         self._drag = False
+        if self.on_release:
+            try:
+                self.on_release()
+            except Exception:
+                pass
 
     def _set_from_x(self, x):
         v = self._x_to_value(x)
@@ -705,7 +714,15 @@ class ControlPanel:
         self.root.withdraw()
         self.root.overrideredirect(True)
         self.root.attributes("-alpha", 0.97)
-        self.root.attributes("-topmost", True)
+        # **面板是普通窗口，不置顶**（2026-10-19 起）。
+        # 之前设了 -topmost 且每秒抢一次顶，代价是面板永远压住特效层：
+        # "点击文字/表情"这类要在面板上可见的效果得靠渲染循环临时把覆盖层
+        # 抬到面板之上（raise_topmost + 每帧自检补提升），一有别的置顶窗口
+        # 参与就来回打架。现在面板就是普通窗口：
+        #   * 点它就正常获得焦点、正常被别的窗口盖住 —— 与其他软件一致；
+        #   * 特效层仍是 topmost，天然显示在面板之上，不需要任何临时提升。
+        # 因此 desktop_fx 里那套"骑乘面板"机制（_ride_above_panel /
+        # keep_riding_panel）也随之失去存在意义，见 fx_winlayer 的注释。
         self._drag = (0, 0)
         self._rz = None         # 正在拖拽的缩放手柄方向（None = 没在缩放）
         self._hints = []        # 说明文字 Label：窗口宽度变了要重算折行宽度
@@ -748,6 +765,11 @@ class ControlPanel:
         self._tip_win = None
         self._tip_lb = None
         self._tip_after = None
+        # 交互控件 HWND 集合：渲染线程据此区分"点按钮/滑块"（UI 操作，抑制
+        # 点击特效）与"点面板空白处"（放行 —— 用户要求面板上也生效）。
+        # 由 _poll 每 1s 扫描一次控件树同步（预设按钮/行内按钮会动态增删）。
+        self._ia_hwnds = frozenset()
+        self._ia_last_scan = 0.0
 
         self._center()
         self._build()
@@ -1016,40 +1038,51 @@ class ControlPanel:
         self.root.after(50, _try)
 
     def _raise_top(self):
+        """把面板 hwnd 登记给覆盖层，并让面板自己保持在置顶组。
+
+        ⚠️ 2026-10-19 起**不再周期性抢顶**（`SetWindowPos(HWND_TOPMOST)` 已
+        移除，只保留首次）。原因：面板每秒把 z 序抢回最顶，会把"点击文字/表情
+        临时骑在面板之上"的提升反复打掉（渲染循环要靠 `keep_riding_panel`
+        每帧补一次才能扛住），也是用户报的"面板上的特效第二次就被盖住"的
+        放大器之一。抢顶保活交给覆盖层单方面做即可 —— 它本来就有每帧自检，
+        而面板只是设置界面，被别人盖住时用户从托盘再点一次就行（`show()`
+        会临时置顶一次再立刻摘掉）。
+
+        同轮还去掉了 `set_panel_fx_mode`（播放点击特效期间把 acrylic 从
+        alpha 210 切到 255 去毛玻璃）：那套是为"特效需要临时提升"配套的，
+        面板变成普通窗口后前提消失，而它造成的副作用很直观 —— 点一下面板
+        颜色就变深、播完又变回来，用户报的就是这个。
+
+        **必须保留的是下面 `set_panel_hwnd` 那段**：覆盖层重建后要重新登记
+        面板 hwnd（`Overlay._anchor` 会读它；登记为空时抢顶退回 HWND_TOPMOST，
+        那是安全降级，不会把覆盖层的 TOPMOST 清掉）。
+        """
         try:
             h = self._hwnd()
             if h:
                 # 把面板 hwnd 交给覆盖层：它做置顶保活时会把面板排除在
                 # "谁盖住了我"之外，并在"面板压得住对手"时拿面板当插入锚点
-                # （插到面板正下方 = 既复位又不遮住设置界面）。否则 overlay
-                # 每 0.5s、面板每 2s 各抢一次 topmost 组顶部，互相翻转 z 序
-                # -> 表现为"每隔几秒闪一下"。
+                # （插到面板正下方 = 既复位又不遮住设置界面）。
                 ovs = getattr(self.app, "overlays", None) \
                     or [getattr(self.app, "overlay", None)]
                 for ov in ovs:
                     if ov is not None:
                         ov.set_panel_hwnd(h)
-                # **面板隐藏时也要补置顶位**，不能跳过。覆盖层拿面板当插入锚点
-                # 之前会先验"面板是不是置顶窗"：插到一个非置顶窗之后会把覆盖层
-                # 自己的 WS_EX_TOPMOST 一起清掉（实测：清掉之后连抢 30 次都回不来，
-                # 效果从此被任何普通窗口盖住）。而面板一旦从未被置顶过、又一直
-                # 缩在托盘里，就会踩中这条。置顶位对隐藏窗口同样有效，也不改变
-                # 可见性，所以这里无条件补。
-                user32.SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0,
-                                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+                # 抢顶已移除（见方法 docstring）。面板的置顶位靠构造时的
+                # `attributes("-topmost", True)` 维持 —— WS_EX_TOPMOST 不会自己
+                # 掉，只会被"插到某个非置顶窗之后"清掉，而现在没有任何地方再把
+                # 面板当插入点用了。
         except Exception:
             pass
-        # 提示浮层此刻可能正开着：抢完置顶位后补抬一次（它本来是**从属**于
-        # 面板的，正常压得住；这一手是兜底，防个别系统上 owner 关系被别处
-        # 重置 —— 提示一闪就不见，用户只会说"这提示根本看不见"）。
+        # 提示浮层此刻可能正开着：补抬一次（它本来是**从属**于面板的，正常
+        # 压得住；这一手是兜底，防个别系统上 owner 关系被别处重置 —— 提示
+        # 一闪就不见，用户只会说"这提示根本看不见"）。
         self._tip_relift()
-        # 1s 一次（早先 2s）：对手（Citrix 那类十几 Hz 重新置顶的全屏窗）在
-        # 两次之间的窗口期里会把面板压下去，面板一被压住就不能再给覆盖层当
-        # 天花板 —— 覆盖层此时会退回"插到置顶组顶部"（见 Overlay._anchor），
-        # 所以不再是硬依赖，但面板勤快一点能让"面板浮在特效之上"这件事更稳。
+        # 仍 1s 续期，但只为"覆盖窗可能重建"服务：重建后的 Overlay 没有
+        # panel_hwnd，不重新登记的话它会把面板当普通对手插下去。
         # 退出中不再续期：窗口销毁后 Tcl 解释器还会把已排队的 after 跑一遍，
         # 报一串 "invalid command name ..._raise_top"（验证脚本连开多个面板时
-        # 尤其吵），而且对一个正在关闭的面板去抢置顶本身也没意义。
+        # 尤其吵）。
         if not getattr(self, "_quitting", False):
             self.root.after(1000, self._raise_top)
 
@@ -1078,8 +1111,34 @@ class ControlPanel:
         self.root.withdraw()
 
     def show(self):
+        """从托盘唤出面板。
+
+        面板本身是**普通窗口**（不再 topmost，见 __init__ 的说明），但用户
+        双击托盘图标把它叫出来时，期待的是"它出现在最前面"—— 这时要临时
+        置顶一次，再立刻摘掉置顶位。
+
+        为什么必须"临时"而不是常驻：常驻置顶就是上一轮取消掉的那个行为，
+        面板会永远压住特效层，且被别的置顶窗口压住后还得每秒抢顶。而唤出
+        这一个动作需要的只是"排在前面"，`SetWindowPos(HWND_NOTOPMOST)`
+        正好把置顶位摘掉、窗口仍留在置顶组的当前位置上（还在最前面），
+        之后再被谁激活/盖住都是普通窗口的标准行为。
+
+        `root.lift()` 保留：它是 Tk 侧的抬升，与 Win32 置顶是两条路。
+        """
         self.root.deiconify()
         self.root.lift()
+        h = self._hwnd()
+        if h:
+            try:
+                # 先置顶（保证排在最前），再立刻摘掉置顶位 —— 这一对调用
+                # 必须连续，中间的几毫秒里窗口处于置顶组顶部。
+                user32.SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0,
+                                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+                user32.SetWindowPos(h, HWND_NOTOPMOST, 0, 0, 0, 0,
+                                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+            except Exception:
+                pass
+        self._tip_relift()
 
     # ------------------------------------------------------------ 构建
     def _build(self):
@@ -1247,6 +1306,9 @@ class ControlPanel:
         # 那行灰字常年占着窗口底部，窗口一缩就成了最先被挤掉的东西。
         # 手柄最后铺，保证压在内容之上（place 的堆叠顺序 = 创建顺序）。
         self._build_grips()
+        # 交互控件集合先同步一次（此刻窗口还是 withdraw，控件未必 realize，
+        # 很可能扫出空集合 —— 无妨，_poll 每秒会重扫，面板显示后必然齐整）
+        self._sync_interactive_hwnds()
 
     # ------------------------------------------------------------ 侧栏/导航
     def _nav_group(self, side, text):
@@ -2734,18 +2796,33 @@ class ControlPanel:
         items = fx_effects.list_builtin_sfx()
         return ("内置 %d 个音效" % len(items)) if items else "内置音效缺失"
 
+    def _preview_click_sfx(self):
+        """按当前「点击音效」配置挑一条**立即试听**（所见即所闻）。
+
+        与实际点击同源：同一个播放器、同一支音量滑块，听到的与真去点一下桌面
+        完全一致。选内置音效 / 拖音量滑块松手时调它，消掉"选了却没声音、要等
+        下次点击才听到"的断层。来源没配到东西时静默跳过。
+        """
+        cfg = self.app.cfg
+        items, is_rand = fx_effects.sfx_target(cfg)
+        if not items:
+            return
+        path = random.choice(items) if (is_rand and len(items) > 1) else items[0]
+        self.app.preview_audio(path, cfg.get("click_sfx_volume", 1.0))
+
     def _pick_sfx_builtin(self, name):
-        """内置音效里挑了一个 —— 存回**文件名**。
+        """内置音效里挑了一个 —— 存回**文件名**，并立即试听。
 
         存名字而不是下标：往目录里加/删一个文件不会让已选的项错位。
         """
         if name == SFX_BUILTIN_RANDOM:
             self.app.set("click_sfx_builtin", "")
-            return
-        for p in fx_effects.list_builtin_sfx():
-            if fx_effects.audio_label(p) == name:
-                self.app.set("click_sfx_builtin", os.path.basename(p))
-                return
+        else:
+            for p in fx_effects.list_builtin_sfx():
+                if fx_effects.audio_label(p) == name:
+                    self.app.set("click_sfx_builtin", os.path.basename(p))
+                    break
+        self._preview_click_sfx()      # 选中即试听，不用等下次真实点击
 
     def _page_click_sfx(self, parent):
         p = tk.Frame(parent, bg=BG)
@@ -2785,6 +2862,13 @@ class ControlPanel:
                      tip="开着时打字每按一次键也响一声（只认能出字符的键，"
                          "Ctrl / Shift 这类修饰键不算）。青轴那类打字音效"
                          "配这一项最合适。")
+        self._slider(c, "音量", "click_sfx_volume", 0.0, 1.0, 0.05,
+                     "{:.0%}",
+                     on_release=self._preview_click_sfx,
+                     tip="相对系统主音量的大小（0%~100%）。100% = 等于当前系统"
+                         "音量；拖到 0 即静音。作用于点击发出的所有声音"
+                         "（点击音效，以及「语音与文字统一」挑中的语音）；"
+                         "松手会按当前音量试听一条。")
         self._save_bar(c, "点击音效")
         self._preset_block(p, "点击音效")
         return p
@@ -3086,7 +3170,8 @@ class ControlPanel:
         self._ctrls[key] = {"kind": "toggle", "var": var, "on": _on,
                             "label": lb}
 
-    def _slider(self, parent, label, key, lo, hi, res, fmt, tip=None, when=None):
+    def _slider(self, parent, label, key, lo, hi, res, fmt, tip=None,
+                when=None, on_release=None):
         app = self.app
         f = tk.Frame(parent, bg=CARD)
         f.pack(fill="x", padx=16, pady=8)
@@ -3104,7 +3189,7 @@ class ControlPanel:
             val.config(text=fmt.format(v))
 
         val = tk.Label(f, text="", bg=CARD, fg=ACCENT, font=FONT_NUM)
-        _Slider(f, lo, hi, res, var, command=on,
+        _Slider(f, lo, hi, res, var, command=on, on_release=on_release,
                 width=120).grid(row=0, column=1, sticky="ew", padx=(14, 10))
         val.grid(row=0, column=2, sticky="e")
         on()
@@ -3505,6 +3590,77 @@ class ControlPanel:
         except Exception:
             pass
 
+    # ------------------------------------------------ 交互控件集合（给渲染线程）
+    # 判定"这个控件是不是交互控件"用三条规则的并集：
+    #   ① Win32 类名白名单（Tk 原生控件在 Windows 上的真实类名）；
+    #   ② 类型名 _Slider —— 它是 tk.Canvas 子类，winfo_class 是 "Canvas"，
+    #      类名白名单收不到，只能按类型名特判；
+    #   ③ 控件自身绑了 <ButtonPress-1> —— 覆盖侧栏导航 / 分组标题 / 标题栏
+    #      拖动 / 缩放手柄这类 Frame+Label 组合的 bind 型交互。
+    # 实测确认：bind_all 只挂 <MouseWheel>，且 bind_all 的绑定**不会**出现在
+    # `w.bind()` 的返回里，所以规则 ③ 不会把整棵树误收进来。
+    _IA_CLASSES = frozenset({
+        "Button", "Checkbutton", "Radiobutton", "Menubutton", "Entry",
+        "Spinbox", "Listbox", "Treeview", "Scale", "Menu",
+        "TButton", "TCheckbutton", "TRadiobutton", "TCombobox", "TSpinbox",
+        "TMenubutton", "TEntry",
+    })
+
+    @staticmethod
+    def _ia_pressed(w):
+        """控件自身是否绑了鼠标按下（bind_all 的那条不算）。
+
+        两个 Tk 细节都实测过，别凭印象写：
+        * `w.bind()` 无参返回的是**序列名**元组（如 `('<Button-1>',)`），
+          不是 (sequence, function) 对 —— 不能按 `x[0]` 取序列名；
+        * 绑 `<ButtonPress-1>` 会被规范成 `<Button-1>`（Press 可省略）。
+        bind_all 的绑定不会出现在这里（项目只拿它挂 MouseWheel，双重安全）。
+        """
+        try:
+            seqs = w.bind() or ()
+            return any(s in ("<Button-1>", "<ButtonPress-1>") for s in seqs)
+        except Exception:
+            return False
+
+    def _ia_scan(self, w, out):
+        """递归收集交互控件的 HWND。
+
+        收录后**继续往下递归**：_nav_item 这类组合控件是 Frame 上绑点击、
+        里面还套着也绑了点击的 Label —— WindowFromPoint 命中的是最具体的
+        子窗口，父级被收录但子级漏收的话，点子控件就会漏过滤。
+        原生控件（Button/Scale）没有子窗口，递归无害。
+        """
+        try:
+            if not w.winfo_exists():
+                return
+            if (w.winfo_class() in self._IA_CLASSES
+                    or type(w).__name__ == "_Slider"
+                    or self._ia_pressed(w)):
+                hid = int(w.winfo_id())
+                if hid:                  # 未 realize 的控件 winfo_id 为 0，跳过
+                    out.add(hid)
+            for c in w.winfo_children():
+                self._ia_scan(c, out)
+        except Exception:
+            pass
+
+    def _sync_interactive_hwnds(self):
+        """把面板上所有交互控件的 HWND 同步给 App（渲染线程每帧读）。
+
+        面板自身（TkTopLevel 根）**不**进集合 —— 扫描从 root 的子节点开始，
+        点面板最底层的背景算"面板其它区域"，点击特效照常放行（用户诉求：
+        控制面板上也生效）。异常一律吞掉：这是给渲染线程的辅助信息，
+        同步失败的最坏结果只是过滤失灵，不能让面板线程炸掉。
+        """
+        try:
+            out = set()
+            for c in self.root.winfo_children():
+                self._ia_scan(c, out)
+            self._ia_hwnds = frozenset(out)
+            self.app.ui_btn_hwnds = self._ia_hwnds
+        except Exception:
+            pass
+
     def _toggle_autostart(self):
         target = self._autostart_var.get()
         ok = self.app.set_autostart(target)
@@ -3530,7 +3686,7 @@ class ControlPanel:
 
         try:
             while True:
-                kind, _ = app.events.get_nowait()
+                kind, payload = app.events.get_nowait()
                 if kind == "panel":
                     if self.root.state() == "withdrawn":
                         self.show()
@@ -3578,11 +3734,25 @@ class ControlPanel:
             else:
                 self.err_bar.pack_forget()
 
+        # 交互控件集合限频同步：预设按钮 / 行内按钮会随配置动态增删，全树扫描
+        # 一次几百微秒，1s 一次完全无感；首次立即扫一次，别让面板刚建起来的
+        # 头一秒处于"零集合"状态（那期间点按钮会放特效）。
+        now = time.monotonic()
+        if now - self._ia_last_scan > 1.0:
+            self._ia_last_scan = now
+            self._sync_interactive_hwnds()
+
         self.root.after(200, self._poll)
 
     def run(self):
         try:
             self.root.mainloop()
         finally:
+            # 面板销毁：清掉同步出去的交互控件集合，别让渲染线程拿一堆死
+            # 窗口的 HWND 当过滤依据（HWND 会被系统回收复用，风险实打实）
+            try:
+                self.app.ui_btn_hwnds = frozenset()
+            except Exception:
+                pass
             if not getattr(self, "_quitting", False):
                 self.app.quit()

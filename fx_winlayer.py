@@ -348,6 +348,10 @@ class Overlay:
         # 控制面板 hwnd。面板是我们自己的窗口，必须从"谁盖住了我"的判定里排除，
         # 否则 overlay 会跟面板无限互抢 z 序（见 keep_on_top）。
         self.panel_hwnd = None
+        # 临时"骑在面板之上"（面板空白处的点击特效播放期间）。这期间
+        # keep_on_top 必须整段跳过，否则它会把我们又插回面板之下 ——
+        # 详见 raise_topmost 的说明。
+        self._ride_above_panel = False
         self._last_raise = 0.0          # 上次真正抢顶的时刻（单调钟），供限流
         # 每帧自检的短路状态：链签名 + 上次全量检查时刻（见 _chain_sig）
         self._last_sig = None
@@ -483,8 +487,13 @@ class Overlay:
         """返回压在我们之上、被判为遮挡物的**第一个**窗口 hwnd（没有则 0）。
 
         沿 z 序向上逐个检查（GW_HWNDPREV）：我们是 WS_EX_TOPMOST，链上的窗口
-        必然同属 topmost 组，因此链上出现任何"非自家"的真实窗口即视为被盖。
-        控制面板不算"别人"—— 面板浮在特效之上是预期状态，不是故障。
+        必然同属 topmost 组。
+
+        关于控制面板：**2026-10-19 起面板不再是置顶窗**（普通窗口，与其他
+        软件一致），而我们是 topmost —— 两者根本不在同一个 z 序组，这条链
+        上溯**永远碰不到它**，下面那个"排除面板"的判断因此成了死代码。
+        保留它只为兼容"面板被改回置顶"的旧配置路径，不删是因为它在那种情况
+        下依然是必要的：面板压住特效是预期状态，不该被判成故障去抢顶。
 
         返回 hwnd 而不是 bool 的原因：抢顶时要判断"面板是不是比这个对手高"
         （见 _anchor）——拿面板当锚点只有在面板确实压得住对手时才成立。
@@ -510,24 +519,25 @@ class Overlay:
 
         Win32 语义（实测确认，含"插到非置顶窗之后会丢掉 WS_EX_TOPMOST"一条）：
             SetWindowPos(A, B) 把 A 插到 **B 之下** —— B 在 A 之上。
-        所以 after = 面板 就是"插到面板正下方"：既把自己复位到最上层附近，
-        又不把面板压掉（面板是本程序自己的窗口，压掉它等于让特效糊在设置界面上）。
 
-        **但这只在面板确实比对手高时才成立。** 面板的置顶保活是 fx_ui 每 2s 一次
-        （面板隐藏时早先还压根不补），而 Citrix 那类远控全屏窗会以十几 Hz 把自己
-        重新置顶 —— 面板很容易被它压在下面。那一刻再拿面板当锚点，就等于把面板
-        的位置当成天花板：每次"抢顶"都只是把我们重新插回面板之下，**永远回不到
-        对手之上**。
+        **当前实况（2026-10-19 起）：面板已不是置顶窗**（fx_ui 去掉了
+        `-topmost` 与每秒抢顶，面板就是普通窗口），所以下面第一道关
+        `_is_topmost_window(p)` 恒为假、**永远返回 HWND_TOPMOST** —— 抢顶
+        一律插到置顶组顶部，不拿面板当锚点。这也正是想要的：特效层是 topmost，
+        天然压在普通窗口（面板）之上，"面板上的点击特效可见"不再需要任何
+        临时提升机制。
 
-        合成对手 + 合成面板、同一进程只换锚点的实测：
-            锚点 = HWND_TOPMOST  -> 被盖采样 0%（静态对手 / 10Hz 对手都一样）
-            锚点 = 面板 hwnd      -> 被盖采样 100%，抢顶 78 次全部白费
-        即"抢顶频率/帧率"不是瓶颈（20fps 与 60fps 结果相同），**方向**才是。
-
-        还有一条更硬的约束：锚点自己不是置顶窗时，SetWindowPos 会把我们的
-        WS_EX_TOPMOST 一起清掉，之后任何普通窗口都能盖住特效，而 keep_on_top
-        每次"抢顶"只是又插回同一个非置顶锚点之后 —— 实测连抢 30 次仍丢失。
-        所以锚点资格必须先验。
+        保留面板锚点分支只为兼容"面板被改回置顶"的旧路径，它本身的坑必须
+        记住：
+        * after = 面板 是"插到面板正下方"，能复位又不压掉设置界面；
+        * 但只在面板确实比对手高时成立 —— Citrix 那类十几 Hz 重新置顶的远控
+          全屏窗很容易把面板压在下面，那时拿面板当锚点就是把它的位置当天花板，
+          每次抢顶都只是把自己插回面板之下，**永远回不到对手之上**
+          （实测：锚点=面板 -> 被盖采样 100%，抢顶 78 次全白费）；
+        * 更硬的约束：锚点自己不是置顶窗时，SetWindowPos 会把我们的
+          WS_EX_TOPMOST 一起清掉，之后任何普通窗口都能盖住特效，
+          而 keep_on_top 每次"抢顶"只是又插回同一个非置顶锚点之后 ——
+          实测连抢 30 次仍丢失。所以锚点资格必须先验。
         """
         p = self.panel_hwnd
         if not p or not _is_topmost_window(p):
@@ -581,6 +591,13 @@ class Overlay:
         SetWindowPos 都不许发"这条不变量就变成"被限流挡住了"，测试会失效。
         """
         if not self.hwnd or self.z_mode != LAYER_TOPMOST:
+            return False
+        # 临时"骑在面板之上"期间（面板空白处的点击特效播放中）**整段跳过
+        # 抢顶**。不跳过的话会自相矛盾地把自己打回去：被提升后本窗口排在
+        # 面板之上，_anchor 的资格检查恰好判"面板压得住任何对手"，锚点就
+        # 变成面板，每帧 SetWindowPos 把自己插回面板之下 —— 提升只活一帧，
+        # 面板上永远看不到文字/表情（实测：raise 后立刻测仍是"面板之下"）。
+        if self._ride_above_panel:
             return False
         # 置顶位自愈：一旦 WS_EX_TOPMOST 掉了，这个窗口就被任何普通窗口盖住，
         # 而链签名/遮挡判定的前提（"我们之上的窗口同属 topmost 组"）也跟着失效。
@@ -773,6 +790,47 @@ class Overlay:
         # 与挂载对称：这里的 SetParent 同样会废掉分层表面（见该方法注释）
         self._rebuild_layered_surface()
 
+    def is_above(self, other_hwnd):
+        """本窗口是否真的位于 other_hwnd **之上**（沿 z 序实查，不靠猜）。
+
+        骑乘期间每帧都要问一次：控制面板自己有 1s 一次的置顶保活
+        （fx_ui._raise_top -> SetWindowPos(HWND_TOPMOST)），会把面板顶到
+        我们之上，把点击特效重新压回面板底下。实测提升只活了 ~0.3s 就是
+        被它打下去的。
+        """
+        if not self.hwnd or not other_hwnd:
+            return False
+        target = hwnd_int(other_hwnd)
+        h = user32.GetWindow(HWND(self.hwnd), GW_HWNDPREV)
+        n = 0
+        while h and n < _CHAIN_GUARD:
+            if hwnd_int(h) == target:
+                return True
+            h = user32.GetWindow(h, GW_HWNDPREV)
+            n += 1
+        return False
+
+    def keep_riding_panel(self, panel_hwnd):
+        """骑乘期间的自愈：确认自己仍在面板之上，掉了就重新提升。
+
+        代价是一次沿 GW_HWNDPREV 的短链查找（~0.7µs/级），每帧可承受。
+        返回 True = 本次真的补了一次 SetWindowPos。
+        """
+        if not self._ride_above_panel or not panel_hwnd:
+            return False
+        if self.is_above(panel_hwnd):
+            return False
+        self._last_sig = None
+        return self.raise_topmost()
+
+    def is_riding_panel(self):
+        """当前是否处在"临时骑在控制面板之上"的状态（点击特效播放期间）。
+
+        给 _restack_overlays 用：那段时间里不能纠正两层先后，否则那次
+        SetWindowPos 会把正在播的点击特效压回面板之下。
+        """
+        return bool(self._ride_above_panel)
+
     def place_above(self, other_hwnd):
         """把本窗口插到另一个窗口的**正上方**（只在最上层模式下有意义）。
 
@@ -794,6 +852,60 @@ class Overlay:
         after = HWND(above_other) if above_other else HWND_TOPMOST
         return bool(user32.SetWindowPos(
             self.hwnd, after, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOCOPYBITS
+            | SWP_NOOWNERZORDER))
+
+    def raise_topmost(self):
+        """把本窗口插到**置顶组最顶**（插入点 HWND_TOPMOST）。
+
+        "骑到面板之上播放点击特效"必须用这个，不能用 place_above ——
+        place_above 拿"面板之上的窗口"当插入点，而实测确认：SetWindowPos
+        插到**非置顶窗**之后会连 WS_EX_TOPMOST 一起清掉（见 _anchor 注释），
+        于是下一帧 keep_on_top 的自愈逻辑又把窗口插回锚点（面板）之下，
+        提升当场被打回 —— 表现为"文字只在面板下透出一两帧的模糊影子"。
+
+        同时置位 _ride_above_panel：让 keep_on_top 在特效播放期间不再抢顶，
+        否则"提升 → 被判定被面板盖住 → 锚点=面板 → 插回面板之下"会每帧
+        自我否定，提升只活一帧（keep_on_top 里对同一标志有对应检查）。
+        """
+        if not self.hwnd:
+            return False
+        self._ride_above_panel = True
+        return bool(user32.SetWindowPos(
+            self.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOCOPYBITS
+            | SWP_NOOWNERZORDER))
+
+    def leave_panel_ride(self, panel_hwnd):
+        """结束"骑在面板之上"：降回面板之下，并恢复抢顶保活。
+
+        插入点用面板本身（SetWindowPos(A, B) 把 A 插到 B **之下**），
+        恢复常态"面板浮在特效之上"。置顶位自愈交给下一帧 keep_on_top。
+        """
+        self._ride_above_panel = False
+        if not self.hwnd or not panel_hwnd:
+            return False
+        self._last_sig = None
+        return bool(user32.SetWindowPos(
+            self.hwnd, HWND(panel_hwnd), 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOCOPYBITS
+            | SWP_NOOWNERZORDER))
+
+    def place_below(self, other_hwnd):
+        """把本窗口插到另一个窗口的**正下方**（place_above 的逆操作）。
+
+        用途：面板空白处的点击特效播放期间，鼠标层被 place_above 临时提到
+        面板之上（否则文字/表情全被面板挡住，见 desktop_fx 渲染循环），播放
+        结束用这个降回来，恢复"面板浮在特效之上"的常态设计。
+
+        Win32 语义：SetWindowPos(A, B) 把 A 插到 **B 之下**，所以 other 本身
+        就是插入点 —— 和 place_above 正好相反（那里必须拿 other 的上一个窗口
+        当插入点，直接传 other 方向是反的）。
+        """
+        if not self.hwnd or not other_hwnd:
+            return False
+        return bool(user32.SetWindowPos(
+            self.hwnd, HWND(other_hwnd), 0, 0, 0, 0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOCOPYBITS
             | SWP_NOOWNERZORDER))
 

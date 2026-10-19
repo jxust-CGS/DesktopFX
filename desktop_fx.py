@@ -18,6 +18,7 @@ import threading
 import time
 import winreg
 
+import _win32
 from _win32 import user32, kernel32
 from _paths import app_root, atomic_write_json
 import fx_kinds
@@ -227,6 +228,11 @@ DEFAULTS = {
     # 键盘敲击也触发（默认关）：开着时打字每按一次键也会响一声。
     # 只认"能出字符"的那批键，Ctrl / Shift 这类修饰键不算。
     "click_sfx_keyboard": False,
+    # 点击音效音量：相对系统主音量的比例（0~1）。MCI 默认（不设）就是设备最大，
+    # 实际听感 = 系统主音量 × 此值，所以 1.0 即"等于当前系统音量"；0 = 静音。
+    # 只作用于「点击音效」，不波及「语音与文字统一」的语音包（那条走 overlap=False
+    # 且不传 volume，保持原样）。
+    "click_sfx_volume": 1.0,
     # ---- 窗口水波（窗口移动 / 缩放 / 最小化 / 恢复时扰动水面）----
     # 它**不自己画**：窗口只是水面的一个扰动源 —— 和鼠标共用同一片水（见
     # WaterRippleField.push_rect / dome_rect），所以这里只剩"扰动多大、多宽"
@@ -699,6 +705,20 @@ class App:
         # 否则用户只会看到"图标没了但雨还在下"，error.log 却干干净净。
         self._raw_events = queue.Queue()
         self.events = queue.Queue()
+        # 配置面板的根窗口句柄（面板建好后由 main 填入，渲染循环每帧同步给
+        # Scene）+ 面板上**交互控件**的 HWND 集合（由 ControlPanel._poll 每
+        # 秒扫描同步）。两者配合做三态判定：不在面板上照常触发；命中交互
+        # 控件抑制（点按钮/滑块别放烟花也别出声，否则旧音效和试听叠成双响）；
+        # 命中面板其它区域放行（用户要求面板上也生效）。详见 Scene._panel_hit。
+        self.ui_hwnd = 0
+        self.ui_btn_hwnds = frozenset()
+        # 鼠标层是否正临时"骑"在配置面板之上（面板空白处的点击特效播放期间）。
+        # 见渲染循环里 panel_fx_until 那段。
+        self._panel_raised = False
+        # 试听命令队列：面板"选内置音效 / 拖音量滑块"经它让渲染线程用**同一个
+        # 播放器**播放（所见即所闻）。与给控制面板的 events 分开 —— 这条要送到
+        # 渲染线程，不能混进面板消费的那条。
+        self.audio_cmds = queue.Queue()
         self._evt_thread = threading.Thread(target=self._pump_events,
                                             name="fx-events", daemon=True)
         self._evt_thread.start()
@@ -858,6 +878,36 @@ class App:
         self.snapshot = dict(self.cfg)
         self._autosave_dirty = True
 
+    # ---------------------------------------------------------------- 试听
+    def preview_audio(self, path, volume=None):
+        """试听一条音频：入队，稍后由渲染线程用**同一个播放器**播放。
+
+        与真实点击走同一条 `play_path`、同一套别名与音量，听到的与实际点击
+        完全一致（所见即所闻）。面板在"选内置音效 / 拖音量滑块"时调用，解决
+        "选了却没声音、要等下次真实点击才听到"的交互断层。
+        """
+        if not path:
+            return
+        try:
+            self.audio_cmds.put((str(path), volume))
+        except Exception:
+            pass
+
+    def _drain_audio_previews(self, scene):
+        """渲染线程每帧排空试听队列。任何异常都不得逃出（线程静默死亡）。"""
+        try:
+            while True:
+                try:
+                    path, vol = self.audio_cmds.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    scene.voice.play_path(path, overlap=True, volume=vol)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     # ---------------------------------------------------------------- 同类互斥
     def _exclusive_after(self, key, value):
         """开了某个特效之后，若该分类"不允许多开"，把同类的其它特效关掉。
@@ -924,6 +974,11 @@ class App:
         ov_fs, ov_ms = self.overlays[0], self.overlays[1]
         if (ov_fs.z_mode != fx_kinds.LAYER_TOPMOST
                 or ov_ms.z_mode != fx_kinds.LAYER_TOPMOST):
+            return False
+        # 临时"骑在面板之上"期间不能纠正两层先后：place_above 插到 ov_fs
+        # 之上正是常态，但那次 SetWindowPos 可能把鼠标层的置顶位或相对位置
+        # 搅乱，把正在播放的点击特效压回面板之下。播放结束后会自然恢复。
+        if ov_ms.is_riding_panel():
             return False
         return ov_ms.place_above(ov_fs.hwnd)
 
@@ -1231,6 +1286,10 @@ class App:
             last = t0
             cfg = self.snapshot
 
+            # 试听队列：面板选内置音效 / 拖音量时经此播放（用同一个播放器，
+            # 所见即所闻）。放最前，暂停时也想听到刚挑的音效。
+            self._drain_audio_previews(scene)
+
             try:
                 # 暂停分支也在这层保护里：`ov.pump()` 会走 wndproc
                 # （"调出面板"请求、窗口重建都从那里进来），裸跑在
@@ -1276,6 +1335,8 @@ class App:
                         scene.resize(w, h)
                         scene.set_origin(ov_fs.x, ov_fs.y)
                         resized = True
+                        # 覆盖窗重建同样重排 z 序，临时提升状态作废
+                        self._panel_raised = False
 
                 # 3) 显示层级：用户改了立即生效，不必重启
                 modes = (cfg.get("layer_fullscreen", fx_kinds.LAYER_TOPMOST),
@@ -1288,6 +1349,9 @@ class App:
                             ov.apply_z_mode(m)
                         except Exception as exc:
                             self.report_error("layer", exc)
+                    # 层级切换会重排 z 序，"骑在面板之上"的临时状态随之失效，
+                    # 复位标志让下一次面板点击重新走一遍提降流程
+                    self._panel_raised = False
                     # 鼠标层恒在全屏层之上（两层都是最上层时才纠正，见 _restack_overlays）
                     self._restack_overlays()
 
@@ -1324,6 +1388,32 @@ class App:
                 if not ms_empty or rebuilt or resized:
                     u32_ms[:] = 0
                 scene.cfg = cfg
+                # 面板句柄每帧同步：面板是 main 线程建的，渲染线程够不着，走
+                # App 属性中转。0（未建/已销毁）时 Scene 不做面板点击过滤。
+                scene.ui_hwnd = self.ui_hwnd
+                # 交互控件集合同理（frozenset 整体替换，读引用即可，原子）
+                scene.ui_btn_hwnds = self.ui_btn_hwnds
+
+                # 面板空白处的点击特效播放期间：把鼠标层临时插到面板**之上**。
+                # 2026-10-19 起面板已是**普通窗口**（不再 topmost），而覆盖层
+                # 恒为 topmost —— 理论上覆盖层天然就在面板之上，这段是双保险：
+                # 万一将来面板又被改回置顶，这套机制原样还能顶住。
+                # 播放结束（panel_fx_until 过期）降回常态。
+                panel_h = ov_ms.panel_hwnd
+                if panel_h:
+                    if scene.panel_fx_until > now:
+                        if not self._panel_raised:
+                            # raise_topmost 会置 ov_ms._ride_above_panel，
+                            # 让 keep_on_top 在特效播放期间不再抢顶（否则它
+                            # 会把我们又插回面板之下，提升只活一帧）。
+                            ov_ms.raise_topmost()
+                            self._panel_raised = True
+                        else:
+                            # 期间每帧自检一次真 z 序，被打下去就补提升
+                            ov_ms.keep_riding_panel(panel_h)
+                    elif self._panel_raised:
+                        ov_ms.leave_panel_ride(panel_h)
+                        self._panel_raised = False
                 scene.step(dt, u32_fs, w, h, u32_ms)
 
                 # 5b) 避开任务栏：覆盖窗是置顶窗而任务栏不是，不擦的话特效会
@@ -1567,6 +1657,13 @@ def main():
     else:
         from fx_ui import ControlPanel
         ui = ControlPanel(app)
+        # 面板根窗口句柄交给 Scene 做"点面板不算桌面点击"过滤（否则在面板里
+        # 点按钮会同时响旧音效 + 试听的新音效）。winfo_id 取到的是 Tk 子窗口
+        # HWND，GetAncestor(GA_ROOT) 归一到顶层；面板没建起来也不致命。
+        try:
+            app.ui_hwnd = _win32.root_window(ui.root.winfo_id())
+        except Exception:
+            app.ui_hwnd = 0
         ui.run()
     return 0
 
