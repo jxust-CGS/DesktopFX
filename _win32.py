@@ -223,6 +223,12 @@ def patch_libs():
     user32.SetForegroundWindow.argtypes = [HWND]
     user32.GetCursorPos.restype = BOOL
     user32.GetCursorPos.argtypes = [ctypes.c_void_p]
+    # 屏幕点 -> 窗口命中（配置面板点击过滤用）。POINT **按值**传，不设
+    # argtypes 的话 64 位上结构体会被拆成两个 int 传错。
+    user32.WindowFromPoint.restype = HWND
+    user32.WindowFromPoint.argtypes = [wt.POINT]
+    user32.GetAncestor.restype = HWND
+    user32.GetAncestor.argtypes = [HWND, UINT]
     user32.GetAsyncKeyState.restype = SHORT
     user32.GetAsyncKeyState.argtypes = [INT]
     user32.SetWindowPos.restype = BOOL
@@ -349,3 +355,33 @@ def screen_pixel(x, y):
     if v == 0xFFFFFFFF:
         return None
     return (v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF)
+
+
+GA_ROOT = 2
+
+
+def window_at(x, y):
+    """屏幕物理坐标 (x,y) 处的窗口句柄；没有则 0。
+
+    与 `screen_pixel` 同一套坐标系（虚拟桌面，兼容多屏负坐标）。
+    命中子窗口时返回**子窗口**句柄 —— 要判"是不是某个顶层窗口"，配
+    `root_window` 一起用。
+    """
+    if user32 is None:
+        return 0
+    try:
+        h = user32.WindowFromPoint(wt.POINT(int(x), int(y)))
+    except Exception:
+        return 0
+    return int(h or 0)
+
+
+def root_window(hwnd):
+    """窗口句柄的**根**（顶层）窗口句柄；取不到返回 0。"""
+    if user32 is None or not hwnd:
+        return 0
+    try:
+        h = user32.GetAncestor(wt.HWND(int(hwnd)), GA_ROOT)
+    except Exception:
+        return 0
+    return int(h or 0)

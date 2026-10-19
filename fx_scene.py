@@ -10,8 +10,11 @@
 在 DEFAULTS 里加对应的开关/参数键。逐帧物理逻辑与原 _render_loop 完全
 一致，只是从"硬编码顺序"搬进了可组合的 Scene。
 """
+import time
+
 import numpy as np
 
+import _win32
 from fx_effects import (RainField, RippleField, MeteorField, MouseProbe,
                         PaintField, PetalField, SnowField, SpotlightField,
                         PetField, ClickEmojiField, ClickTextField, ClickSfx,
@@ -47,6 +50,21 @@ class Scene:
         # 覆盖层在虚拟屏幕里的左上角偏移（鼠标坐标要折算进来）
         self.ov_x = 0
         self.ov_y = 0
+
+        # 配置面板的根窗口句柄（0 = 未设置）+ 面板上交互控件的 HWND 集合。
+        # 两者配合做**三态判定**（见 _panel_hit）：
+        #   * 不在面板上          -> 点击照常触发（桌面 / 其它窗口 / WorkBuddy）
+        #   * 命中面板交互控件    -> 抑制：点按钮/滑块/侧栏时放烟花、出声纯属
+        #     噪音，更糟的是"按下触发的旧音效"会和"选择后的试听"叠成双响
+        #   * 命中面板其它区域    -> 放行：用户明确要求"控制面板上也生效"
+        # 由渲染循环每帧从 App.ui_hwnd / App.ui_btn_hwnds 同步过来。
+        self.ui_hwnd = 0
+        self.ui_btn_hwnds = frozenset()
+        # 面板空白处点击特效的"播放截止时刻"（monotonic 秒）。渲染循环据此
+        # 在播放期间把鼠标层临时提到面板之上 —— 面板（TkTopLevel）本身在
+        # 覆盖层之上（z 序最顶），不提升的话文字/表情会被面板挡住，只剩音效。
+        self.panel_fx_until = 0.0
+        self._panel_click = False        # 本帧是否发生了"放行的面板点击"
 
         # 每帧由渲染循环喂入的当前配置快照
         self.cfg = {}
@@ -140,6 +158,29 @@ class Scene:
         return self._ripple_color_cache
 
     # ------------------------------------------------------------ 每帧
+    def _panel_hit(self):
+        """光标（虚拟屏幕物理坐标）下的窗口相对配置面板的位置。
+
+        返回 (在面板上, 命中交互控件)。面板未设置（`ui_hwnd == 0`，如测试
+        环境 / 面板还没建起来）时两者皆 False。WindowFromPoint 命中子窗口返
+        回的是子窗口句柄，所以还要 GetAncestor 归一到根窗口再比。
+        全程纯 Win32 查询，渲染线程调用安全（不碰 Tk）。
+        """
+        hwnd = self.ui_hwnd
+        if not hwnd:
+            return False, False
+        try:
+            h = _win32.window_at(int(self.mouse.x), int(self.mouse.y))
+            if not h or _win32.root_window(h) != int(hwnd):
+                return False, False
+            return True, int(h) in self.ui_btn_hwnds
+        except Exception:
+            return False, False
+
+    def _over_ui(self):
+        """本次点击是否是"面板 UI 操作"（该抑制）。_panel_hit 的布尔形式。"""
+        return self._panel_hit()[1]
+
     def step(self, dt, u32, w, h, u32_mouse=None):
         """推进一帧。u32 = 全屏特效层缓冲。
 
@@ -165,6 +206,21 @@ class Scene:
         keys = bool(cfg.get("click_sfx_enabled", False)
                     and cfg.get("click_sfx_keyboard", False))
         dist = self.mouse.update(dt, self.ov_x, self.ov_y, keys=keys)
+
+        # 点自己配置面板上的**交互控件**（按钮 / 滑块 / 侧栏导航…）不算"桌面
+        # 点击"：鼠标钩子是全局的，不拦这一下的话，在面板里点个按钮会同时触发
+        # 「当前音效（旧配置）+ 试听（新选择）」两声，且每拨一个开关 / 拖一下
+        # 滑块都附带放一次点击特效（音效 / 涟漪 / 水波 / 点击图案）。
+        # 但**面板空白处放行** —— 用户明确要求点击特效在控制面板上也生效；
+        # 那一下会被标 _panel_click，渲染循环随即把鼠标层临时提到面板之上，
+        # 让文字/表情不被面板本身挡住（见 panel_fx_until）。
+        self._panel_click = False
+        if self.mouse.clicked:
+            on_panel, on_ia = self._panel_hit()
+            if on_panel and on_ia:
+                self.mouse.clicked = 0
+            elif on_panel:
+                self._panel_click = True
 
         # ---------------- 窗口水波（窗口移动 / 缩放 / 最小化 / 恢复 -> 扰动水面）
         # 窗口是水面上的障碍物，把它当活塞：四条边各按**自身速度**推水（见
@@ -373,10 +429,28 @@ class Scene:
         # 一声是自然结果，不用额外判重。
         path = self.click_text.take_voice()
         if path:
-            self.voice.play_path(path)
+            # 音量与「点击音效」同一支滑块：统一模式挑中的这条语音也按它缩放，
+            # 否则"开着统一时点击声不听音量"—— 正是"还有部分音效不受控"的那类。
+            self.voice.play_path(path, volume=cfg.get("click_sfx_volume", 1.0))
         elif cfg.get("click_sfx_enabled", False) \
                 and (self.mouse.clicked or self.mouse.key_clicked):
             self.click_sfx.trigger(cfg)
+
+        # 面板空白处放行了这一次点击：记下播放截止时刻，渲染循环会在这段
+        # 时间里把鼠标层临时提到面板之上，文字/表情才看得见（否则全被面板
+        # 盖住，只剩音效能听）。时长取文字/表情寿命的上限再留余量；三类
+        # 点击特效全关着时不置位 —— 没有要播的东西，别让面板白闪一下。
+        # ⚠️ 时钟必须与渲染循环一致：那里用 time.perf_counter() 比。
+        # 曾经这里用 time.monotonic() —— Windows 上两者同源但刻度/值域不同
+        # （monotonic=GetTickCount64，perf_counter=QPC），比较恒真，提升状态
+        # 永远降不回来。
+        if self._panel_click and (
+                cfg.get("click_text_enabled", False)
+                or cfg.get("click_emoji_enabled", False)
+                or cfg.get("click_sfx_enabled", False)):
+            life = max(float(cfg.get("click_text_life", 1.4)),
+                       float(cfg.get("click_emoji_life", 1.1)))
+            self.panel_fx_until = time.perf_counter() + life + 0.4
 
     # ------------------------------------------------------------ 真实水波
     def _wave_trigger(self, cfg, dist, w, h, dt):

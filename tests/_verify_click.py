@@ -50,6 +50,7 @@ import desktop_fx as d                              # noqa: E402
 import fx_effects as F                              # noqa: E402
 import fx_kinds                                     # noqa: E402
 from fx_effects import ClickEmojiField, ClickTextField   # noqa: E402
+import _win32                                       # noqa: E402  面板点击过滤用
 
 # ⚠️ 打桩 `_mci_send` 必须打在 **fx_click** 上，不能打 `fx_effects`。
 # `_mci_send` 拆到了 fx_click.py，`fx_effects._mci_send` 只是转出（同一个函数
@@ -1254,7 +1255,7 @@ def test_scene_voice_wiring():
     calls = []
 
     class _Spy:
-        def play_path(self, p, overlap=False):
+        def play_path(self, p, overlap=False, volume=None):
             calls.append(p)
             return True
 
@@ -2037,7 +2038,7 @@ def test_click_sfx_triggers_and_overlaps():
             self.overlaps = []
             self.cap = 4          # 假装设备条数有限
 
-        def play_path(self, p, overlap=False):
+        def play_path(self, p, overlap=False, volume=None):
             self.overlaps.append(overlap)
             if self.cap <= 0:
                 return False
@@ -2160,7 +2161,7 @@ def test_scene_sfx_mouse_and_keyboard():
     calls = []
 
     class _Spy:
-        def play_path(self, p, overlap=False):
+        def play_path(self, p, overlap=False, volume=None):
             calls.append(p)
             return True
 
@@ -2276,7 +2277,8 @@ def test_click_sfx_defaults():
             "click_sfx_builtin": "",
             "click_sfx_file": "",
             "click_sfx_dir": "",
-            "click_sfx_keyboard": False}
+            "click_sfx_keyboard": False,
+            "click_sfx_volume": 1.0}
     for k, v in want.items():
         if k not in d.DEFAULTS:
             return False, f"缺配置键 {k}"
@@ -2294,6 +2296,53 @@ def test_click_sfx_defaults():
             return False, f"预设「{nm}」引用的内置音效 {b} 不存在"
     return True, (f"{len(want)} 个键默认值正确；"
                   f"{len(d.PRESET_GROUPS['点击音效'])} 个预设引用的内置音效都在")
+
+
+def test_sfx_volume_command_per_device_type():
+    """MCI 路径的音量命令只发给 mpegvideo；waveaudio 一律不发。
+
+    演进（这条测试被实测推翻过一次，别再退回去）：
+    * 第一版：统一发 0~1000 -> wav 被压成约 1.5% 音量（"音量只对旅店铃声生效"）。
+    * 第二版：给 waveaudio 发 0~65535 双声道打包 -> **实测 winmm 对 waveaudio
+      根本不认 `setaudio volume`（错误 261 "Unrecognized command"）**，白发。
+    * 现在：wav 在 play_path 上游就分流到 waveOut 软件混音池，`_worker` 只
+      处理 mpegvideo（mp3/wma，0~1000 合法区间）与 wav 兜底；兜底那条没有
+      音量可设。所以这里断言：mp3 发 500，wav **一个 setaudio 都不发**。
+    """
+    cmds = []
+    def fake(cmd):
+        cmds.append(cmd)
+        if cmd.startswith("status"):
+            return 0, "stopped"   # 一查就停，线程立刻收尾
+        return 0, ""
+    orig = fx_click._mci_send
+    fx_click._mci_send = fake
+    try:
+        vp = F.VoicePlayer()
+        # 直接同步调 _worker（避开线程竞态）；用 _VOICE_ALIAS 不会污染别名池。
+        vp._worker("C:/x/a.wav", F._VOICE_ALIAS, 0.5)
+        vp._worker("C:/x/b.mp3", F._VOICE_ALIAS, 0.5)
+    finally:
+        fx_click._mci_send = orig
+
+    def vol_of(path):
+        saw_open = False
+        for c in cmds:
+            if c.startswith("open"):
+                saw_open = (path in c)     # 换文件就重置，别把别人的算过来
+            elif saw_open and c.startswith("setaudio") and "volume" in c:
+                return int(c.rsplit("to ", 1)[1])
+        return None
+
+    wav_v = vol_of("a.wav")
+    mp3_v = vol_of("b.mp3")
+    if wav_v is not None:
+        return False, (f"waveaudio 居然收到 setaudio（winmm 实测不认，错误 261）："
+                       f"音量={wav_v}")
+    if mp3_v != 500:
+        return False, f"mp3 音量应为 500（0.5×1000），实际 {mp3_v}"
+    return True, ("mpegvideo 走 MCI setaudio volume to 500（0~1000）；waveaudio "
+                  "一个 setaudio 都不发（wav 音量走 waveOut 软件混音池）")
 
 
 def test_text_pack_defaults():
@@ -2335,7 +2384,7 @@ def test_scene_plays_the_matched_audio():
     calls = []
 
     class _Spy:
-        def play_path(self, p, overlap=False):
+        def play_path(self, p, overlap=False, volume=None):
             calls.append(("path", p))
             return True
 
@@ -2404,6 +2453,274 @@ def test_scene_plays_the_matched_audio():
         return False, f"文字特效关着却播了音频：{calls}"
     return True, ("统一模式播的正是那行字对应的音频；未指定时退回随机源；"
                   "特效关着时不播")
+
+
+def test_scene_volume_covers_voice_and_sfx():
+    """音量必须覆盖**两条**点击发声路径：语音与文字统一 + 点击音效。
+
+    之前只有「点击音效」传了 volume，统一模式挑中的语音 `play_path(path)` 没传，
+    表现就是"开着统一时点击声不听音量"—— 即"还有部分音效不受控"。这条把两条
+    路径都钉死：都得带上 cfg 里的 click_sfx_volume。
+    """
+    import queue as _q  # noqa: F401  仅为与驱动同款、本测试不直接用
+    from _verify_kinds import _base_cfg
+    from fx_scene import Scene
+
+    folder = _mk_pack()
+    seen = []
+
+    class _Spy:
+        def play_path(self, p, overlap=False, volume=None):
+            seen.append(volume)
+            return True
+
+        def play_random(self, f):
+            return True
+
+    def _drive(sc, frames=4):
+        box = {"fired": False}
+
+        def fake_update(dt, ox, oy, keys=False):
+            sc.mouse.mx, sc.mouse.my = W * 0.5, H * 0.5
+            sc.mouse.clicked = 0 if box["fired"] else 1
+            return 0.0
+
+        sc.mouse.update = fake_update
+        buf = np.zeros(W * H, np.uint32)
+        for k in range(frames):
+            box["fired"] = (k >= 1)      # 只第一帧给一次点击
+            sc.step(1.0 / 60.0, buf, W, H, buf)
+
+    VOL = 0.4
+    try:
+        # 1) 统一模式：语音路径也要带音量
+        sc = Scene(W, H)
+        sc.voice = _Spy()
+        sc.click_sfx.player = sc.voice
+        sc.cfg = _base_cfg(click_text_enabled=True, click_text_voice_match=True,
+                           click_text_deco="无", click_text_list="自定义甲",
+                           click_sfx_volume=VOL, **_sfx_pack(folder))
+        _drive(sc)
+        if not seen or seen[-1] != VOL:
+            return False, f"统一模式的语音没带音量：{seen}，期望 {VOL}"
+
+        # 2) 关统一、开「点击音效」：那一档也要带音量
+        seen.clear()
+        sc2 = Scene(W, H)
+        sc2.voice = _Spy()
+        sc2.click_sfx.player = sc2.voice
+        sc2.cfg = _base_cfg(click_text_enabled=True, click_text_voice_match=False,
+                            click_text_list="自定义甲", click_text_deco="无",
+                            click_sfx_enabled=True, click_sfx_volume=VOL,
+                            **_sfx_pack(folder))
+        _drive(sc2)
+        if not seen or seen[-1] != VOL:
+            return False, f"「点击音效」没带音量：{seen}，期望 {VOL}"
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+    return True, f"统一模式语音与「点击音效」两条路径都带上 click_sfx_volume={VOL}"
+
+
+def test_preview_audio_routes_to_player_with_volume():
+    """试听接线：面板 preview_audio 入队，渲染线程 _drain_audio_previews 用**同一个
+    播放器**按同音量播出（所见即所闻）。守住"选内置音效 / 拖音量 → 立即听到"这条链，
+    杜绝又回到"选了没声音、要等下次真实点击才生效"。
+    """
+    import queue as _q
+    app = d.App.__new__(d.App)          # 不跑 __init__：避开配置/线程副作用
+    app.audio_cmds = _q.Queue()
+    seen = []
+
+    class _VP:
+        def play_path(self, p, overlap=False, volume=None):
+            seen.append((p, overlap, volume))
+            return True
+
+    class _Scene:
+        voice = _VP()
+
+    app.preview_audio("C:/x/a.wav", 0.4)
+    if app.audio_cmds.qsize() != 1:
+        return False, "preview_audio 没入队"
+    app._drain_audio_previews(_Scene())
+    if seen != [("C:/x/a.wav", True, 0.4)]:
+        return False, f"试听没按 (路径, overlap=True, 音量) 播出：{seen}"
+    if app.audio_cmds.qsize() != 0:
+        return False, "试听队列没排空（下次会补播旧的）"
+    # 空路径不入队（面板在来源没配到时不该误播）
+    app.preview_audio("", 0.4)
+    if app.audio_cmds.qsize() != 0:
+        return False, "空路径也入了队"
+    return True, "试听经同一播放器、overlap=True、带音量播出；空路径忽略、队列排空"
+
+
+# ------------------------------------------------ wav 软件音量（waveOut 池）
+def test_wav_pcm16_decode_and_volume():
+    """wav 解码 + 软件混音：16-bit PCM 读出、44.1k 立体声、音量语义正确。
+
+    这条守两件事：
+    1. `wav_pcm16_mono_44k` 对**真实内置 wav**解得开（内置音效全是 16-bit
+       PCM，读不出来就会整条退回 MCI 无音量播放）；
+    2. `mix_pcm16_stereo` 的音量语义：1.0 原样、0.5 幅度减半、0 全静音、
+       超 1 不溢出（clip）。
+    """
+    wavs = [p for p in F.list_builtin_sfx()
+            if os.path.splitext(p)[1].lower() == ".wav"]
+    if not wavs:
+        return False, "内置 wav 一个都没有"
+    a = fx_click.wav_pcm16_mono_44k(wavs[0])
+    if a is None:
+        return False, f"{os.path.basename(wavs[0])} 解不出 PCM"
+    if a.dtype != np.float32 or len(a) <= 0:
+        return False, f"解码结果异常：dtype={a.dtype} len={len(a)}"
+    # 解码出的样本必须落在 int16 量程内（读的是 16-bit 源）
+    if len(a) and (a.max() > 32767.5 or a.min() < -32768.5):
+        return False, "解码样本超出 int16 量程"
+    full = np.frombuffer(fx_click.mix_pcm16_stereo(a, 1.0), dtype="<i2")
+    half = np.frombuffer(fx_click.mix_pcm16_stereo(a, 0.5), dtype="<i2")
+    zero = np.frombuffer(fx_click.mix_pcm16_stereo(a, 0.0), dtype="<i2")
+    if len(full) != len(a) * 2:
+        return False, "立体声展开后长度不对（应为 mono × 2）"
+    if len(zero) and zero.any():
+        return False, "音量 0 仍有非零样本（静音失效）"
+    ref = np.clip(a, -32768.0, 32767.0).astype("<i2")
+    if not np.array_equal(full[0::2], ref):
+        return False, "音量 1.0 不是原样（左声道对不上）"
+    # 0.5 幅度减半：逐样本比对（clip 前的源没有贴着边界的样本）
+    mid = np.abs(a) < 32000.0
+    if mid.any() and not np.allclose(half[0::2][mid], ref[mid] * 0.5, atol=1.0):
+        return False, "音量 0.5 不是线性减半"
+    over = np.frombuffer(fx_click.mix_pcm16_stereo(a, 2.5), dtype="<i2")
+    if len(over) and (over.max() > 32767 or over.min() < -32768):
+        return False, "音量超 1 没被 clip（溢出）"
+    # 读不出 PCM 的必须返回 None（交给上层退 MCI，不能抛）
+    if fx_click.wav_pcm16_mono_44k(os.path.join(HERE, "desktop_fx.py")) is not None:
+        return False, "非 wav 文件没有返回 None"
+    return True, (f"{len(wavs)} 个内置 wav 解得出 PCM；音量 1.0 原样 / 0.5 减半 / "
+                  f"0 静音 / 超 1 clip；非 wav 返回 None")
+
+
+def test_wav_volume_never_via_mci_setaudio():
+    """wav 的音量**绝不走 MCI setaudio**；mp3 仍走 MCI 的 0~1000。
+
+    根因（2026-10-16 实测）：MCI 的 waveaudio 设备对 `setaudio volume`
+    直接返回错误 261（不认这条命令），发 0~1000 / 0~65535 / 双声道打包值
+    统统被拒 —— 这就是"音量只对旅店铃声（mp3）生效、对 wav 无效"的真凶。
+    现在 wav 改走 waveOut 软件混音池，所以：
+    * 有音频设备 -> wav 一条 MCI 命令都不该发；
+    * 无设备 / 解不出 PCM -> 退 MCI 兜底，但**记录里不允许出现 setaudio**
+      （旧代码会给 waveaudio 发打包音量，纯属白发）。
+    mp3 对照组：仍走 MCI，且 setaudio 值 = int(v*1000)。
+    """
+    orig = fx_click._mci_send
+    cmds = []
+    try:
+        fx_click._mci_send = lambda c: (cmds.append(c), (0, ""))[1]
+        vp = fx_click.VoicePlayer()
+        wavs = [p for p in F.list_builtin_sfx()
+                if os.path.splitext(p)[1].lower() == ".wav"]
+        if wavs:
+            cmds.clear()
+            ok = vp.play_path(wavs[0], overlap=True, volume=0.5)
+            if not ok:
+                return False, "wav 起播失败（池没起、MCI 兜底也没成）"
+            if any("setaudio" in c for c in cmds):
+                return False, f"wav 居然发了 setaudio：{cmds}"
+            if not fx_click._WAV_POOL.playing() and not any(
+                    "open" in c for c in cmds):
+                return False, "wav 既没进池也没退 MCI（链路断了）"
+        mp3s = [p for p in F.list_builtin_sfx()
+                if os.path.splitext(p)[1].lower() == ".mp3"]
+        if mp3s:
+            cmds.clear()
+            if not vp.play_path(mp3s[0], overlap=True, volume=0.5):
+                return False, "mp3 起播失败"
+            # 别名从池尾借，编号不定（fxclicksfxN），只比对命令形态与取值
+            if not any(c.startswith("setaudio fxclicksfx")
+                       and c.endswith("volume to 500") for c in cmds):
+                return False, f"mp3 的音量命令不对：{cmds}"
+    finally:
+        fx_click._mci_send = orig
+    return True, ("wav 全程无 setaudio（走 waveOut 软件混音池）；mp3 仍走 MCI "
+                  "setaudio volume to 500（0~1000 区间）")
+
+
+def test_scene_panel_click_three_states():
+    """面板点击三态：交互控件抑制 / 面板空白放行 / 面板外照常。
+
+    演进记录（两次用户反馈逼出来的）：
+    * 第一版：命中面板（含所有子窗口）一律清零 clicked —— 修掉了"点按钮
+      双响"（按下触发旧音效 + pick() 试听新音效），但把面板空白处的点击
+      也一刀切没了，用户报"控制面板上不生效"。
+    * 现在：只有命中**交互控件**（按钮/滑块/侧栏导航…）才抑制；命中面板
+      其它区域放行，并置 panel_fx_until —— 渲染循环据此在播放期间把鼠标层
+      临时提到面板之上，文字/表情才不被面板本身挡住。
+    """
+    import fx_scene
+    TW, TH = 320, 240
+    # 一维缓冲：Scene.step 的绘制端按扁平索引写（u32[iy*stride+ix]），
+    # 传 2D 数组会错形状。
+    buf = np.zeros(TW * TH, np.uint32)
+    sc = fx_scene.Scene(TW, TH)
+    # 完整配置：step 里各特效直接下标读键（如 cfg["rain_amount"]），缺键会
+    # KeyError —— 用 DEFAULTS 做基底最稳。
+    sc.cfg = dict(d.DEFAULTS)
+    sc.cfg["click_sfx_enabled"] = True     # 默认关着的，本测试要它响
+    sc.cfg["click_text_enabled"] = True
+    calls = []
+    sc.click_sfx.trigger = lambda cfg: calls.append(1)
+    # 不让真鼠标探针覆盖 clicked（本测试只验过滤逻辑）
+    sc.mouse.update = lambda *a, **k: 0
+    orig_at = _win32.window_at
+    orig_root = _win32.root_window
+    try:
+        # A) 面板没设（ui_hwnd=0）：不过滤，点击照常触发
+        calls.clear()
+        sc.ui_hwnd = 0
+        sc.ui_btn_hwnds = frozenset()
+        sc.mouse.clicked = 1
+        sc.step(0.016, buf, TW, TH, buf)
+        if sc.mouse.clicked != 1 or len(calls) != 1:
+            return False, f"未设面板时点击被误吞：clicked={sc.mouse.clicked} calls={len(calls)}"
+        # B) 命中面板交互控件：抑制，trigger 一次都不该调，也不置提升标志
+        calls.clear()
+        sc.ui_hwnd = 777
+        sc.ui_btn_hwnds = frozenset({555})     # 555 = 某个交互控件
+        fx_scene._win32.window_at = lambda x, y: 555
+        fx_scene._win32.root_window = lambda h: 777       # 归一是面板根
+        sc.mouse.clicked = 1
+        sc.panel_fx_until = 0.0
+        sc.step(0.016, buf, TW, TH, buf)
+        if sc.mouse.clicked != 0:
+            return False, "命中交互控件但 clicked 没被清零"
+        if calls:
+            return False, f"点按钮仍触发了 {len(calls)} 次点击特效（双响回归）"
+        if sc.panel_fx_until != 0.0:
+            return False, "被抑制的点击不该置 panel_fx_until"
+        # C) 命中面板**非**交互区域（另一个子窗口）：放行 + 置提升标志
+        calls.clear()
+        fx_scene._win32.window_at = lambda x, y: 556      # 不在交互集合里
+        sc.mouse.clicked = 1
+        sc.panel_fx_until = 0.0
+        sc.step(0.016, buf, TW, TH, buf)
+        if sc.mouse.clicked != 1:
+            return False, "面板空白处的点击被误吞（用户报的不生效）"
+        if len(calls) != 1:
+            return False, f"面板空白处该触发一次，实际 {len(calls)}"
+        if not sc.panel_fx_until > 0.0:
+            return False, "面板空白点击应置 panel_fx_until（临时提升鼠标层用）"
+        # D) 面板外：不过滤
+        calls.clear()
+        fx_scene._win32.root_window = lambda h: 999       # 别的窗口
+        sc.mouse.clicked = 1
+        sc.step(0.016, buf, TW, TH, buf)
+        if sc.mouse.clicked != 1 or len(calls) != 1:
+            return False, f"面板外的点击被误吞：clicked={sc.mouse.clicked} calls={len(calls)}"
+    finally:
+        fx_scene._win32.window_at = orig_at
+        fx_scene._win32.root_window = orig_root
+    return True, ("三态判定：交互控件抑制（无双响）、面板空白放行且置提升标志、"
+                  "面板外照常")
 
 
 # ------------------------------------------------------------------ 驱动
@@ -2650,6 +2967,12 @@ def main():
         test_sfx_independent_from_click_effects,
         test_sfx_never_reported_as_layer_content,
         test_click_sfx_defaults,
+        test_sfx_volume_command_per_device_type,
+        test_scene_volume_covers_voice_and_sfx,
+        test_preview_audio_routes_to_player_with_volume,
+        test_wav_pcm16_decode_and_volume,
+        test_wav_volume_never_via_mci_setaudio,
+        test_scene_panel_click_three_states,
     ]
     print("== 点击特效 + 分组 ==")
     bad = 0

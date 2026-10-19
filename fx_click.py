@@ -828,11 +828,277 @@ def _mci_send(cmd):
     return int(r), buf.value
 
 
+# ------------------------------------------------- waveOut 软件音量池（wav 专用）
+# 为什么需要它：**MCI 的 waveaudio 设备实测不支持 `setaudio volume`** ——
+# winmm 对该命令直接返回错误 261（"Unrecognized command"），发 0~1000、0~65535、
+# 双声道打包值统统被拒（本机 winmm 实测，2026-10-16）。而 winmm 又没有
+# per-stream 的音量 API（waveOutSetVolume 是全局的，会污染别的程序的声音），
+# 所以「音量」对 wav 只能**自己混音**实现。
+#
+# - mp3 / wma 不走这里：它们走 MCI mpegvideo，`setaudio volume` 0~1000 实测
+#   正常（500 回读 501、32767 报超范围错误 282）。
+# - 读 PCM 用标准库 `wave`（只认未压缩 PCM；别的格式/读不出来返回 None，
+#   由调用方退回 MCI 播放 —— 至少响，只是那条没音量）。
+# - 音量 = 软件混音：int16 样本乘系数后 clip。1.0 = 当前系统音量，0 = 静音。
+# - 每条流一条 waveOut 句柄（同一设备可多开，各写各的 WAVEHDR），保住「点击
+#   音效可叠着播」的语义；句柄懒打开、常驻复用，不随每次播放开关。
+# - 完成判定：守护线程轮询 WAVEHDR.dwFlags & WHDR_DONE，**不用回调** ——
+#   pythonw 下没有消息循环，回调穿越 GIL 太脆。守护线程入口整段 try/except：
+#   pythonw 没有 stderr，异常绝不能漏出去把线程弄死。
+# - 池满 -> 返回 False，调用方退回 MCI（与 MCI 别名池"满则丢弃"同一思路）。
+
+_WHDR_DONE = 0x00000001
+_WAVE_MAPPER = 0xFFFFFFFF     # UINT(-1)：让系统挑默认输出设备
+_WAV_POOL_SIZE = 6            # 与 MCI 音效别名池（_SFX_VOICES）一致
+
+
+class _WAVEHDR(ctypes.Structure):
+    """winmm WAVEHDR（64 位布局）。字段顺序即 SDK 原序，勿重排。"""
+
+    _fields_ = [
+        ("lpData", ctypes.c_void_p),
+        ("dwBufferLength", ctypes.c_uint),
+        ("dwBytesRecorded", ctypes.c_uint),
+        ("dwUser", ctypes.c_void_p),
+        ("dwFlags", ctypes.c_uint),
+        ("dwLoops", ctypes.c_uint),
+        ("lpNext", ctypes.c_void_p),
+        ("reserved", ctypes.c_void_p),
+    ]
+
+
+class _WAVEFORMATEX(ctypes.Structure):
+    _fields_ = [
+        ("wFormatTag", ctypes.c_ushort),
+        ("nChannels", ctypes.c_ushort),
+        ("nSamplesPerSec", ctypes.c_uint),
+        ("nAvgBytesPerSec", ctypes.c_uint),
+        ("nBlockAlign", ctypes.c_ushort),
+        ("wBitsPerSample", ctypes.c_ushort),
+        ("cbSize", ctypes.c_ushort),
+    ]
+
+
+if _winmm is not None:
+    _winmm.waveOutGetNumDevs.restype = ctypes.c_uint
+    _winmm.waveOutOpen.restype = ctypes.c_uint
+    _winmm.waveOutOpen.argtypes = [ctypes.POINTER(ctypes.c_void_p),
+                                   ctypes.c_uint, ctypes.c_void_p,
+                                   ctypes.c_void_p, ctypes.c_void_p,
+                                   ctypes.c_uint]
+    _winmm.waveOutPrepareHeader.restype = ctypes.c_uint
+    _winmm.waveOutPrepareHeader.argtypes = [ctypes.c_void_p,
+                                            ctypes.POINTER(_WAVEHDR),
+                                            ctypes.c_uint]
+    _winmm.waveOutWrite.restype = ctypes.c_uint
+    _winmm.waveOutWrite.argtypes = [ctypes.c_void_p,
+                                    ctypes.POINTER(_WAVEHDR), ctypes.c_uint]
+    _winmm.waveOutUnprepareHeader.restype = ctypes.c_uint
+    _winmm.waveOutUnprepareHeader.argtypes = [ctypes.c_void_p,
+                                              ctypes.POINTER(_WAVEHDR),
+                                              ctypes.c_uint]
+    _winmm.waveOutReset.restype = ctypes.c_uint
+    _winmm.waveOutReset.argtypes = [ctypes.c_void_p]
+    _winmm.waveOutClose.restype = ctypes.c_uint
+    _winmm.waveOutClose.argtypes = [ctypes.c_void_p]
+
+
+def wav_pcm16_mono_44k(path):
+    """读 wav -> float32 mono 44.1kHz 样本数组；读不了返回 None。
+
+    只接 **16-bit 未压缩 PCM**（内置音效全是；8/24/32-bit、float、ADPCM
+    这类交给 MCI 兜底，不在这里猜格式）。多声道先下混成 mono，非 44.1k
+    的用线性插值重采样 —— 统一成一种格式，waveOut 句柄才能常驻复用
+    （句柄按格式打开，播不同格式的文件就得反复开合）。
+    """
+    import wave
+    try:
+        w = wave.open(str(path), "rb")
+    except Exception:
+        return None
+    try:
+        if w.getcomptype() != "NONE" or w.getsampwidth() != 2:
+            return None
+        n = w.getnframes()
+        ch = w.getnchannels()
+        fr = w.getframerate()
+        if n <= 0 or ch <= 0 or fr <= 0:
+            return None
+        raw = w.readframes(n)
+    except Exception:
+        return None
+    finally:
+        try:
+            w.close()
+        except Exception:
+            pass
+    a = np.frombuffer(raw, dtype="<i2").astype(np.float32)
+    if ch > 1:
+        a = a.reshape(-1, ch).mean(axis=1)      # 立体声/多声道 -> mono
+    if fr != 44100:
+        n_out = int(round(len(a) * 44100.0 / fr))
+        if n_out <= 0:
+            return None
+        if n_out != len(a):
+            xs = np.linspace(0.0, len(a) - 1.0, n_out)
+            a = np.interp(xs, np.arange(len(a), dtype=np.float32), a)
+    return a
+
+
+def mix_pcm16_stereo(a, volume):
+    """float32 mono 样本 × 音量 -> 16-bit **立体声**小端 bytes。
+
+    软件音量的落点：乘系数后 clip 回 int16 防溢出，再复制成立体声
+    （播放格式统一 44.1k/2ch/16bit）。`volume` 1.0 = 原样（= 当前系统
+    音量），0 = 静音。
+    """
+    v = max(0.0, min(1.0, float(volume)))
+    pcm = np.clip(a * v, -32768.0, 32767.0).astype("<i2")
+    return np.repeat(pcm[:, None], 2, axis=1).reshape(-1).tobytes()
+
+
+class _WavOutPool:
+    """waveOut 播放池：wav 的软件音量 + 多流并发（见上方大段注释）。"""
+
+    def __init__(self, size=_WAV_POOL_SIZE):
+        self._lock = threading.Lock()
+        self._free = list(range(size))       # 空闲槽号（栈）
+        self._h = [None] * size              # 槽 -> waveOut 句柄；False=开过且失败
+        self._playing = []                   # [(槽, hdr, buf, on_free)]
+        fmt = _WAVEFORMATEX()
+        fmt.wFormatTag = 1                   # WAVE_FORMAT_PCM
+        fmt.nChannels = 2
+        fmt.nSamplesPerSec = 44100
+        fmt.nAvgBytesPerSec = 44100 * 2 * 2
+        fmt.nBlockAlign = 4
+        fmt.wBitsPerSample = 16
+        fmt.cbSize = 0
+        self._fmt = fmt
+        self._reaper = threading.Thread(target=self._reap_loop,
+                                        name="WavReaper", daemon=True)
+        self._reaper_started = False
+
+    # ------------------------------------------------------------ 调用方接口
+    def playing(self):
+        """当前有几条流在播（0 = 全空闲）。"""
+        with self._lock:
+            return len(self._playing)
+
+    def play(self, path, volume, on_free=None):
+        """起播一条 wav；成功返回 True（失败/池满/无设备 False）。"""
+        a = wav_pcm16_mono_44k(path)
+        if a is None:
+            return False
+        data = mix_pcm16_stereo(a, volume)
+        with self._lock:
+            if not self._free:
+                return False
+            if _winmm is None or _winmm.waveOutGetNumDevs() == 0:
+                return False
+            slot = self._free.pop()
+            if not self._open(slot):
+                self._free.append(slot)
+                return False
+            hwo = self._h[slot]
+            hdr = _WAVEHDR()
+            buf = ctypes.create_string_buffer(data)
+            hdr.lpData = ctypes.cast(buf, ctypes.c_void_p)
+            hdr.dwBufferLength = len(data)
+            hdr.dwFlags = 0
+            if _winmm.waveOutPrepareHeader(hwo, ctypes.byref(hdr),
+                                           ctypes.sizeof(hdr)):
+                self._free.append(slot)
+                return False
+            if _winmm.waveOutWrite(hwo, ctypes.byref(hdr),
+                                   ctypes.sizeof(hdr)):
+                try:
+                    _winmm.waveOutUnprepareHeader(hwo, ctypes.byref(hdr),
+                                                  ctypes.sizeof(hdr))
+                except Exception:
+                    pass
+                self._free.append(slot)
+                return False
+            self._playing.append((slot, hdr, buf, on_free))
+            if not self._reaper_started:
+                self._reaper_started = True
+                self._reaper.start()
+        return True
+
+    def stop(self):
+        """关掉所有句柄（进程退出时调；不调也会随进程退出回收）。"""
+        with self._lock:
+            for i, h in enumerate(self._h):
+                if h and h is not False:
+                    try:
+                        _winmm.waveOutReset(h)
+                    except Exception:
+                        pass
+                    try:
+                        _winmm.waveOutClose(h)
+                    except Exception:
+                        pass
+                self._h[i] = None
+
+    # ------------------------------------------------------------ 内部
+    def _open(self, slot):
+        """（持锁）懒打开槽对应的 waveOut 句柄。开过且失败的不再重试。"""
+        cur = self._h[slot]
+        if cur is False:
+            return False
+        if cur is not None:
+            return True
+        h = ctypes.c_void_p()
+        r = _winmm.waveOutOpen(ctypes.byref(h), _WAVE_MAPPER,
+                               ctypes.byref(self._fmt), None, None, 0)
+        if r or not h.value:
+            self._h[slot] = False
+            return False
+        self._h[slot] = h
+        return True
+
+    def _reap_loop(self):
+        while True:
+            time.sleep(0.012)
+            try:
+                self._reap_once()
+            except Exception:
+                pass        # pythonw 没有 stderr，守护线程绝不能死
+
+    def _reap_once(self):
+        """（持锁）回收已放完（WHDR_DONE）的流：拆头、还槽、通知。"""
+        done = [i for i, (_, hdr, _, _) in enumerate(self._playing)
+                if hdr.dwFlags & _WHDR_DONE]
+        for i in reversed(done):
+            slot, hdr, buf, on_free = self._playing.pop(i)
+            h = self._h[slot]
+            if h and h is not False:
+                try:
+                    _winmm.waveOutUnprepareHeader(h, ctypes.byref(hdr),
+                                                  ctypes.sizeof(hdr))
+                except Exception:
+                    pass
+            self._free.append(slot)
+            if on_free is not None:
+                try:
+                    on_free()
+                except Exception:
+                    pass
+
+
+_WAV_POOL = _WavOutPool()
+
+
 class VoicePlayer:
     """点一下播一段音频（语音包与点击音效共用）。
 
-    播放走 Windows 自带的 MCI（`winmm`）—— wav / mp3 / wma 都能放，不引
-    第三方库。整段播放跑在一条后台线程里，渲染线程只负责"占坑"。
+    播放后端按文件类型分流，两条路都不引第三方库：
+
+    * wav + 要控音量 -> **waveOut 软件混音池**（`_WavOutPool`）。MCI 的
+      waveaudio 设备实测不认 `setaudio volume`，而 winmm 没有 per-stream
+      音量 API，所以 wav 只能自己混音（详见池上方注释）。
+    * 其余（mp3 / wma / wav 兜底）-> Windows 自带 MCI（`winmm`）。
+
+    整段播放跑在后台线程里，渲染线程只负责"占坑"。
 
     **两种占坑策略**（`play_path(..., overlap=)` 选）：
 
@@ -869,9 +1135,10 @@ class VoicePlayer:
         return self._busy
 
     def voices_busy(self):
-        """当前有几条音效设备被占着（0 = 还能叠新的）。"""
+        """当前有几条音效设备被占着（0 = 还能叠新的）。含 waveOut 池。"""
         with self._lock:
-            return len(_SFX_ALIASES) - len(self._sfx_free)
+            return (len(_SFX_ALIASES) - len(self._sfx_free)
+                    + _WAV_POOL.playing())
 
     def play_random(self, folder):
         """随机播一个；正在播 -> 放弃这次（返回 False）。"""
@@ -881,7 +1148,7 @@ class VoicePlayer:
         """随机挑一条（不播）。给"文字与音频统一"用。"""
         return pick_audio(folder, self._rng)
 
-    def play_path(self, path, overlap=False):
+    def play_path(self, path, overlap=False, volume=None):
         """播**指定**的这一条，返回是否真的起了播。
 
         `overlap=True` -> 从音效别名池借一条空闲设备，允许与正在响的**叠着播**；
@@ -893,13 +1160,21 @@ class VoicePlayer:
         if not path:
             return False
         path = str(path)
+        # wav + 要控音量 -> waveOut 软件混音池。为什么绕开 MCI：MCI 的
+        # waveaudio 设备实测**不认** `setaudio volume`（winmm 回错误 261），
+        # winmm 也没有 per-stream 音量 API，详见 _WavOutPool 上方注释。
+        # 池起播失败（非 16-bit PCM / 无音频设备 / 池满）时往下走 MCI 兜底：
+        # 至少响，只是那条不跟着音量滑块。
+        if volume is not None and os.path.splitext(path)[1].lower() == ".wav":
+            if self._pool_play(path, overlap, volume):
+                return True
         if overlap:
             with self._lock:
                 if not self._sfx_free:      # 设备全占满：丢弃，不排队
                     return False
                 alias = self._sfx_free.pop()
                 self._played += 1
-            threading.Thread(target=self._worker, args=(path, alias),
+            threading.Thread(target=self._worker, args=(path, alias, volume),
                              name="VoiceSfx", daemon=True).start()
             return True
         if self._busy:
@@ -909,16 +1184,39 @@ class VoicePlayer:
                 return False
             self._busy = True
             self._played += 1
-        threading.Thread(target=self._worker, args=(path, _VOICE_ALIAS),
+        threading.Thread(target=self._worker, args=(path, _VOICE_ALIAS, volume),
                          name="VoicePlayer", daemon=True).start()
         return True
+
+    def _pool_play(self, path, overlap, volume):
+        """wav 走 waveOut 池起播，返回是否真的起了播。
+
+        `overlap=False`（语音独占语义）时**任一**后端在播都放弃 —— 池和 MCI
+        两条路都查，避免"池里在播语音、MCI 又播一条"变成同时两段。
+        `_busy` 由 `_on_pool_free` 在流放完时清。
+        """
+        with self._lock:
+            if not overlap and (self._busy or _WAV_POOL.playing()):
+                return False
+            ok = _WAV_POOL.play(path, volume, on_free=self._on_pool_free)
+            if ok:
+                self._played += 1
+                if not overlap:
+                    self._busy = True
+        return ok
+
+    def _on_pool_free(self):
+        """池里一条流放完：清独占播放标记（overlap=True 的也会走到，那时
+        `_busy` 本来就是 False，无害）。"""
+        with self._lock:
+            self._busy = False
 
     def stats(self):
         with self._lock:
             return self._played, self._failed
 
     # ---------------------------------------------------------- 播放线程
-    def _worker(self, path, alias=_VOICE_ALIAS):
+    def _worker(self, path, alias=_VOICE_ALIAS, volume=None):
         """在 `alias` 这条设备上放完 `path`，然后把它还回池子。
 
         **每条线程只碰自己那条 alias** —— 这是并发能成立的前提：共用一条的话，
@@ -935,6 +1233,18 @@ class VoicePlayer:
                 with self._lock:
                     self._failed += 1
                 return
+            # 点击音效音量：相对系统主音量的比例（0~1）。**只对 mpegvideo
+            # （mp3/wma）有效** —— 0~1000 是它的合法区间（实测 setaudio 500
+            # 后 status 回读 501、发 32767 报超范围错误 282）。
+            # waveaudio（.wav）走不到这里：winmm 对它压根不认
+            # `setaudio volume`（实测错误 261 "Unrecognized command"），wav
+            # 已在 play_path 上游分流到 waveOut 软件混音池；能走到这里的 wav
+            # 只剩一种 —— 读不出 PCM 或池满时的 MCI 兜底播放，那时没有音量
+            # 可设，照常响。
+            # 语音包（volume=None）不设置，保持原样。
+            if volume is not None and kind != "waveaudio":
+                v = max(0.0, min(1.0, float(volume)))
+                _mci_send("setaudio %s volume to %d" % (alias, int(v * 1000.0)))
             _mci_send("play %s" % alias)
             t0 = time.monotonic()
             while time.monotonic() - t0 < self.MAX_SECONDS:
@@ -1081,7 +1391,10 @@ class ClickSfx:
             return False
         # overlap=True：音效之间允许重叠。语音那边仍独占 —— 一次点击里
         # 「文字与音频统一」挑中的那条优先（见 fx_scene 的播放分支）。
-        if self.player.play_path(self._rng.choice(items), overlap=True):
+        # 音量走 MCI setaudio：相对系统主音量的比例（默认 1.0 = 系统音量）。
+        vol = cfg.get("click_sfx_volume", 1.0)
+        if self.player.play_path(self._rng.choice(items), overlap=True,
+                                 volume=vol):
             self._played += 1
             return True
         return False
