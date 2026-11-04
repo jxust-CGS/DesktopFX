@@ -143,6 +143,15 @@ DEFAULTS = {
     "spotlight_radius": 220.0,
     "spotlight_dim": 0.6,
     "spotlight_color": "#05070A",
+    # ---- 鼠标光环（随系统播放的音乐律动）----
+    # 电平来自 IAudioMeterInformation（系统输出设备的实时峰值），不是程序
+    # 自己播放器的声音 —— 律动的意义是跟随用户正在听的音乐。
+    # 灵敏度越大越容易"跳起来"；尺寸是环的基础半径（像素）。
+    "halo_enabled": False,
+    "halo_style": "呼吸圆环",
+    "halo_color": "#7EC8FF",
+    "halo_size": 46.0,
+    "halo_sensitivity": 1.0,
     # ---- 宠物跟随（小猫 / 小狗跟着鼠标跑）----
     # 形象由 fx_effects.PetField **用代码画**出来（PIL 超采样 + LANCZOS），
     # 不引入任何图片资源 —— 也就不牵扯第三方形象授权，还能整体换色。

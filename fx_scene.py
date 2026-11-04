@@ -18,7 +18,8 @@ import _win32
 from fx_effects import (RainField, RippleField, MeteorField, MouseProbe,
                         PaintField, PetalField, SnowField, SpotlightField,
                         PetField, ClickEmojiField, ClickTextField, ClickSfx,
-                        WaterRippleField, WindowProbe, VoicePlayer, hex_to_bgr)
+                        WaterRippleField, WindowProbe, VoicePlayer, hex_to_bgr,
+                        HaloField, AudioLevel)
 
 
 class Scene:
@@ -35,6 +36,12 @@ class Scene:
         self.wave = WaterRippleField(w, h, seed=41)
         self.mouse = MouseProbe()
         self.spot = SpotlightField(w, h, seed=17)       # 聚光灯
+        # 鼠标光环：电平来自**系统正在播放的音频**（IAudioMeterInformation），
+        # 采集跑在自己的后台线程里（COM 有 apartment 归属，只能在创建它的
+        # 线程用），渲染线程每帧只读一个 float。
+        self.halo = HaloField(w, h, seed=61)
+        self.audio = AudioLevel()
+        self.audio_started = False
         self.pets = PetField(w, h, seed=53)             # 宠物跟随
         self.click_emoji = ClickEmojiField(w, h, seed=73)   # 点击表情
         self.click_text = ClickTextField(w, h, seed=79)     # 点击文字
@@ -134,7 +141,8 @@ class Scene:
                   or self.ripples.active.any()
                   or self.pets.active()
                   or self.click_emoji.active()
-                  or self.click_text.active())
+                  or self.click_text.active()
+                  or cfg.get("halo_enabled", False))
         return fs, ms
 
     def resize(self, w, h):
@@ -146,6 +154,7 @@ class Scene:
         self.paint.resize(w, h)
         self.wave.resize(w, h)
         self.spot.resize(w, h)
+        self.halo.resize(w, h)
         self.pets.resize(w, h)
         self.click_emoji.resize(w, h)
         self.click_text.resize(w, h)
@@ -384,6 +393,25 @@ class Scene:
             self.wave.reset()
             self._wave_acc = 0.0
             self._wave_amb = 0.0
+
+        # ---------------- 鼠标光环（随系统播放的音乐律动）
+        # 画在水波之后、宠物之前：光是这一层里最"亮"的东西，压在水面上才
+        # 看得清；宠物是实体，压在光环之上。
+        # 音频采集线程**按需起停** —— 关掉光环就别让它白占一个线程。
+        if cfg.get("halo_enabled", False):
+            self.audio.set_sensitivity(float(cfg.get("halo_sensitivity", 1.0)))
+            if not self.audio_started:
+                self.audio.start()
+                self.audio_started = True
+            self.halo.set_cursor(float(self.mouse.mx), float(self.mouse.my))
+            self.halo.set_style(cfg.get("halo_style", "呼吸圆环"))
+            self.halo.set_color(cfg.get("halo_color", "#7EC8FF"))
+            self.halo.set_size(float(cfg.get("halo_size", 46.0)))
+            self.halo.set_level(self.audio.level())
+            self.halo.draw(buf_ms, w, h, cfg, dt)
+        elif self.audio_started:
+            self.audio.stop()
+            self.audio_started = False
 
         # ---------------- 宠物跟随（画在最后 = 鼠标层最上）
         # 宠物是这一层的主体，压在涟漪与水波之上才看得清；水波那次 solo 整片

@@ -66,6 +66,16 @@ PET_KINDS = ["小猫", "小狗"]
 # 所以在两端各取"米白"与"深棕"作端点色。换色会连带耳朵内侧、描边、眼睛一起配色。
 PET_COLORS = ["#F2C27B", "#E9A0A8", "#B9CBE8", "#9FD8C0", "#F5F1E8", "#6B5A50"]
 
+# ---- 鼠标光环（随音乐律动）----
+# 样式名必须与 fx_halo.HALO_STYLES 的键**一一对应**：少一个会静默退回
+# 默认样式，多一个会画不出东西（样式名对不上 -> norm_halo_style 兜底）。
+# 这条对应关系由 tests/_verify_kinds.py 锁定。
+HALO_STYLE_NAMES = ["呼吸圆环", "双环脉冲", "彩虹光环", "辐条光环",
+                    "星芒光环", "粒子光环"]
+# 光环配色：偏亮的冷色为主（深色桌面上最显眼），末尾给两个暖色备用。
+HALO_COLORS = ["#7EC8FF", "#A8E6FF", "#5FD0FF", "#7CFFB2", "#FFD08A",
+               "#FF8FB1"]
+
 # ---- 点击特效 ----
 # 这三张表必须与 fx_effects 里的实现一一对应：
 #   CLICK_SHAPES <-> fx_effects._SHAPE_NAMES（少了会画出空白，多了会静默退回爱心）
@@ -572,6 +582,13 @@ class _NavIcon(tk.Canvas):
             for yy in (5.4, 9.0, 12.6):
                 line([3, yy, 5.4, yy - 1.7, 7.8, yy, 10.2, yy + 1.7, 12.6, yy,
                       15, yy - 1.7], width=1.4)
+        elif n == "鼠标光环":
+            # 环 + 两侧长短不一的律动条（像音频均衡器）
+            # 与「涟漪」刻意区分开：那里是"环套环"，这里是"环旁边有跳动的条"，
+            # 一眼能认出是"跟着音乐跳"而不是"水面涟漪"。
+            ring(9, 8, 4.6)
+            for x, hgt in ((3.2, 3.0), (4.9, 5.4), (13.1, 5.4), (14.8, 3.0)):
+                line([x, 8 - hgt / 2.0, x, 8 + hgt / 2.0], width=1.4)
         elif n == "宠物跟随":
             # 爪印：下方掌垫 + 上方三个脚趾
             dot(9.0, 12.0, 2.9)
@@ -650,6 +667,11 @@ class _NavIcon(tk.Canvas):
             for yy in (5.4, 9.0, 12.6):
                 self._legacy_line([3, yy, 5.4, yy - 1.7, 7.8, yy, 10.2, yy + 1.7,
                                    12.6, yy, 15, yy - 1.7], w)
+        elif n == "鼠标光环":
+            # 与 PIL 版同构：环 + 两侧长短不一的律动条
+            self.create_oval(4.4, 3.4, 13.6, 12.6, outline=self.color, width=w)
+            for x, hgt in ((3.2, 3.0), (4.9, 5.4), (13.1, 5.4), (14.8, 3.0)):
+                self._legacy_line([x, 8 - hgt / 2.0, x, 8 + hgt / 2.0], w)
         elif n == "宠物跟随":
             for cx, cy, r in ((9.0, 12.0, 2.9), (4.6, 7.0, 1.7),
                               (9.0, 5.2, 1.7), (13.4, 7.0, 1.7)):
@@ -1284,6 +1306,7 @@ class ControlPanel:
             "宠物跟随": self._page_pet,
             "涟漪": self._page_ripple,
             "真实水波": self._page_wave,
+            "鼠标光环": self._page_halo,
             "点击表情": self._page_click_emoji,
             "点击文字": self._page_click_text,
             "点击音效": self._page_click_sfx,
@@ -1561,7 +1584,13 @@ class ControlPanel:
         if w is None:
             w = tk.Toplevel(self.root)
             w.overrideredirect(True)
-            w.attributes("-topmost", True)
+            # ⚠️ **不要给提示浮层自己设 -topmost**。它本来就是面板的**从属
+            # 窗口**（owner = 面板），而 Windows 的规则是"从属窗口永远画在
+            # 拥有者之上" —— 这一条自动成立，不需额外置顶。
+            # 面板在 2026-10-19 起改成**普通窗口**（不再 topmost），如果提示
+            # 浮层还自己置顶，两者就分属不同的 z 序组，这条规则随之失效：
+            # 提示会飘到离面板很远的地方（实测从面板往上 40 个窗口都找不到
+            # 它），面板被别的窗口盖住时它还留在屏幕上。
             w.configure(bg=LINE, highlightthickness=1,
                         highlightbackground=LINE, highlightcolor=LINE)
             self._tip_lb = tk.Label(w, bg=CARD, fg=TEXT, font=FONT_SMALL,
@@ -2351,6 +2380,30 @@ class ControlPanel:
                      tip="压暗时叠上去的颜色，默认接近黑。")
         self._save_bar(c, "聚光灯")
         self._preset_block(p, "聚光灯")
+        return p
+
+    def _page_halo(self, parent):
+        p = tk.Frame(parent, bg=BG)
+        self._page_head(p, "鼠标光环")
+        c = tk.Frame(p, bg=CARD)
+        c.pack(fill="x", padx=16, pady=(0, 8))
+        self._toggle(c, "启用鼠标光环", "halo_enabled",
+                     tip="在光标处画一圈光环，跟着系统正在播放的音乐律动："
+                         "鼓点一响，光环就涨一下。")
+        self._choices(c, "样式", "halo_style", HALO_STYLE_NAMES,
+                      columns=3,
+                      tip="光环长什么样：呼吸圆环 / 双环脉冲 / 彩虹光环 / "
+                          "辐条光环 / 星芒光环 / 粒子光环。")
+        self._slider(c, "大小", "halo_size", 18, 160, 2, "{:.0f} 像素",
+                     tip="光环的基础半径。音乐越响，它涨得越大。")
+        self._slider(c, "灵敏度", "halo_sensitivity", 0.2, 3.0, 0.05,
+                     "{:.2f}",
+                     tip="多容易被音乐带动：调低是轻微起伏，调高就跟着鼓点"
+                         "剧烈跳动。")
+        self._swatch(c, "颜色", "halo_color", HALO_COLORS,
+                     tip="光环的颜色。")
+        self._save_bar(c, "鼠标光环")
+        self._preset_block(p, "鼠标光环")
         return p
 
     def _page_pet(self, parent):

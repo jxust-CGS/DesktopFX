@@ -485,8 +485,8 @@ def test_text_draws_and_rises():
 
 # ---------------------------------------------------------- 4. 分组重构
 def test_categories():
-    want = ["全屏特效", "鼠标拖动特效", "鼠标点击特效", "鼠标点击音效",
-            "其他特效"]
+    want = ["全屏特效", "鼠标拖动特效", "音频特效", "鼠标点击特效",
+            "鼠标点击音效", "其他特效"]
     if list(fx_kinds.CATEGORY_ORDER) != want:
         return False, f"分组是 {fx_kinds.CATEGORY_ORDER}，期望 {want}"
     if fx_kinds.effects_of("鼠标点击特效") != ["点击表情", "点击文字"]:
@@ -497,6 +497,12 @@ def test_categories():
     if fx_kinds.effects_of("鼠标点击音效") != ["点击音效"]:
         return False, ("鼠标点击音效组的内容是 "
                        f"{fx_kinds.effects_of('鼠标点击音效')}")
+    # 「音频特效」也要独立成类：鼠标光环若归进「鼠标拖动特效」，同类互斥
+    # 会让开光环变成"关掉聚光灯/颜料盘/宠物/涟漪/水波"，而它恰恰最该
+    # 与它们叠加（聚光灯压暗 + 光环律动 = 音乐可视化）。
+    if fx_kinds.effects_of("音频特效") != ["鼠标光环"]:
+        return False, ("音频特效组的内容是 "
+                       f"{fx_kinds.effects_of('音频特效')}")
     drag = fx_kinds.effects_of("鼠标拖动特效")
     for name in ("聚光灯", "颜料盘", "宠物跟随", "涟漪", "真实水波"):
         if name not in drag:

@@ -35,6 +35,9 @@ from _paths import res_path as _res_path
 # 21 个私有名，所以 `__all__` 在这里是必需的，不是装饰。
 from fx_image import *          # noqa: F401,F403
 from fx_click import *          # noqa: F401,F403
+# 鼠标光环（音频采集 + 光环绘制）。同样按"兼容转出"处理：fx_scene 从这里
+# 取 HaloField / AudioLevel，外部脚本也可能按 `fx_effects.<名字>` 引用。
+from fx_halo import *           # noqa: F401,F403
 
 
 # ---- Win32 窗口枚举（仅 Windows 下可用；非 Windows 仅跳过，不报错）----
