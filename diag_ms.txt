@@ -1,0 +1,48 @@
+frame=0 nonzero=1636 bbox=(2549, 429, 2691, 571) cfg_halo=True level=0.000 style='彩虹光环'
+set halo_size=70.0 from:
+  File "C:\Users\hspcadmin\WorkBuddy\2026-09-01-16-47-25\DesktopFX\fx_ui.py", line 2418, in _page_halo
+    self._slider(c, "大小", "halo_size", 18, 160, 2, "{:.0f} 像素",
+  File "C:\Users\hspcadmin\WorkBuddy\2026-09-01-16-47-25\DesktopFX\fx_ui.py", line 3269, in _slider
+    on()
+  File "C:\Users\hspcadmin\WorkBuddy\2026-09-01-16-47-25\DesktopFX\fx_ui.py", line 3262, in on
+    app.set(key, v)
+
+set halo_sensitivity=1.0 from:
+  File "C:\Users\hspcadmin\WorkBuddy\2026-09-01-16-47-25\DesktopFX\fx_ui.py", line 2420, in _page_halo
+    self._slider(c, "灵敏度", "halo_sensitivity", 0.2, 3.0, 0.05,
+  File "C:\Users\hspcadmin\WorkBuddy\2026-09-01-16-47-25\DesktopFX\fx_ui.py", line 3269, in _slider
+    on()
+  File "C:\Users\hspcadmin\WorkBuddy\2026-09-01-16-47-25\DesktopFX\fx_ui.py", line 3262, in on
+    app.set(key, v)
+
+frame=20 nonzero=1636 bbox=(2549, 429, 2691, 571) cfg_halo=True level=0.000 style='彩虹光环'
+frame=40 nonzero=1636 bbox=(2549, 429, 2691, 571) cfg_halo=True level=0.000 style='彩虹光环'
+frame=60 nonzero=1636 bbox=(2549, 429, 2691, 571) cfg_halo=True level=0.000 style='彩虹光环'
+frame=80 nonzero=1636 bbox=(2549, 429, 2691, 571) cfg_halo=True level=0.000 style='彩虹光环'
+frame=100 nonzero=1636 bbox=(2549, 429, 2691, 571) cfg_halo=True level=0.000 style='彩虹光环'
+frame=120 nonzero=1636 bbox=(2549, 429, 2691, 571) cfg_halo=True level=0.000 style='彩虹光环'
+frame=140 nonzero=1636 bbox=(2549, 429, 2691, 571) cfg_halo=True level=0.000 style='彩虹光环'
+frame=160 nonzero=1636 bbox=(2549, 429, 2691, 571) cfg_halo=True level=0.000 style='彩虹光环'
+frame=180 nonzero=1636 bbox=(2549, 429, 2691, 571) cfg_halo=True level=0.000 style='彩虹光环'
+frame=200 nonzero=1636 bbox=(2549, 429, 2691, 571) cfg_halo=True level=0.000 style='彩虹光环'
+frame=220 nonzero=1636 bbox=(2549, 429, 2691, 571) cfg_halo=True level=0.000 style='彩虹光环'
+frame=240 nonzero=1636 bbox=(2549, 429, 2691, 571) cfg_halo=True level=0.000 style='彩虹光环'
+frame=260 nonzero=1636 bbox=(2549, 429, 2691, 571) cfg_halo=True level=0.000 style='彩虹光环'
+frame=280 nonzero=1636 bbox=(2549, 429, 2691, 571) cfg_halo=True level=0.000 style='彩虹光环'
+frame=300 nonzero=1636 bbox=(2549, 429, 2691, 571) cfg_halo=True level=0.000 style='彩虹光环'
+frame=320 nonzero=1636 bbox=(2549, 429, 2691, 571) cfg_halo=True level=0.000 style='彩虹光环'
+frame=340 nonzero=1636 bbox=(2549, 429, 2691, 571) cfg_halo=True level=0.000 style='彩虹光环'
+frame=360 nonzero=1636 bbox=(2549, 429, 2691, 571) cfg_halo=True level=0.000 style='彩虹光环'
+frame=380 nonzero=1636 bbox=(2549, 429, 2691, 571) cfg_halo=True level=0.000 style='彩虹光环'
+frame=400 nonzero=1636 bbox=(2549, 429, 2691, 571) cfg_halo=True level=0.000 style='彩虹光环'
+frame=420 nonzero=1636 bbox=(2549, 429, 2691, 571) cfg_halo=True level=0.000 style='彩虹光环'
+frame=440 nonzero=1636 bbox=(2549, 429, 2691, 571) cfg_halo=True level=0.000 style='彩虹光环'
+frame=460 nonzero=1636 bbox=(2549, 429, 2691, 571) cfg_halo=True level=0.000 style='彩虹光环'
+frame=480 nonzero=1636 bbox=(2549, 429, 2691, 571) cfg_halo=True level=0.000 style='彩虹光环'
+frame=500 nonzero=1636 bbox=(2549, 429, 2691, 571) cfg_halo=True level=0.000 style='彩虹光环'
+frame=520 nonzero=1636 bbox=(2549, 429, 2691, 571) cfg_halo=True level=0.000 style='彩虹光环'
+frame=540 nonzero=1636 bbox=(2549, 429, 2691, 571) cfg_halo=True level=0.000 style='彩虹光环'
+frame=560 nonzero=1636 bbox=(2549, 429, 2691, 571) cfg_halo=True level=0.000 style='彩虹光环'
+frame=580 nonzero=1636 bbox=(2549, 429, 2691, 571) cfg_halo=True level=0.000 style='彩虹光环'
+frame=600 nonzero=1636 bbox=(2549, 429, 2691, 571) cfg_halo=True level=0.000 style='彩虹光环'
+frame=620 nonzero=1636 bbox=(2549, 429, 2691, 571) cfg_halo=True level=0.000 style='彩虹光环'
