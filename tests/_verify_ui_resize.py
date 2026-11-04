@@ -363,8 +363,18 @@ def main():
     check("win_h" not in saved, f"自适应后 ui_state 里没有 win_h：{saved}")
     check(saved.get("win_w") == p.W,
           f"自适应高度不改宽度：{saved.get('win_w')} == {p.W}")
-    check(p.H == p._clamp_h(max(p.H_MIN, p._content_h + p._chrome)),
-          f"自适应高度 {p.H} = 内容 {p._content_h} + chrome {p._chrome}")
+    check(p.H == p._clamp_h(max(p.H_MIN,
+                                 max(p._content_h, p._nav_needed_h())
+                                 + p._chrome)),
+          f"自适应高度 {p.H} = max(内容 {p._content_h}, 侧栏 "
+          f"{p._nav_needed_h()}) + chrome {p._chrome}")
+    # **侧栏必须装得下**：新增特效后侧栏（17 项 + 5 个组标题）比最高的
+    # 内容页还高（917 > 860）。窗口高度若只按内容算，侧栏多出来的那一截
+    # 会被窗口底边切掉 —— 最后一项「鼠标光环」露不出来，得滚动才看得见。
+    # 这条断言锁住"侧栏不溢出"。
+    check(p._nav_needed_h() <= p._nav_view_h(),
+          f"侧栏装得下：需要 {p._nav_needed_h()} <= 视图 {p._nav_view_h()}"
+          f"（窗口高 {p.H}）—— 否则最后几项特效被窗口底边切掉")
     sr = p._size_rows["win_h"]
     check(int(sr["var"].get()) == p.H and sr["label"].cget("text") == f"{p.H} 像素",
           f"自适应后「窗口高度」显示 {sr['label'].cget('text')!r}"
@@ -414,7 +424,9 @@ def main():
     fx_ui._UI_STATE_PATH = fresh
     p3 = fx_ui.ControlPanel(_StubApp())
     p3.root.update()
-    expect_h = p3._clamp_h(max(p3.H_MIN, p3._content_h + p3._chrome))
+    expect_h = p3._clamp_h(max(p3.H_MIN,
+                               max(p3._content_h, p3._nav_needed_h())
+                               + p3._chrome))
     check(p3.W == p3.W_DEF, f"默认宽度 {p3.W}（期望 {p3.W_DEF}）")
     check(p3.H == expect_h,
           f"默认高度按内容自适应 {p3.H}（期望 {expect_h}）")

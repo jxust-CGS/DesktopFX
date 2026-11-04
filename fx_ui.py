@@ -1834,6 +1834,17 @@ class ControlPanel:
         else:
             self._canvas.configure(scrollregion=(bb[0], top, bb[2], bottom))
 
+    def _nav_needed_h(self):
+        """侧栏内容需要多少像素高（滚动区的请求高度）。
+
+        收口在这里，别在各处重复写 `winfo_reqheight()` —— 构造期侧栏可能还没
+        layout，取不到就当 0（按"不需要"处理，退回旧行为）。
+        """
+        try:
+            return int(self._nav_in.winfo_reqheight())
+        except Exception:
+            return 0
+
     def _fit_height(self):
         """定下窗口尺寸：宽度用默认值或用户记忆值，高度**按内容自适应**。
 
@@ -1860,10 +1871,20 @@ class ControlPanel:
         hs = {n: int(f.winfo_reqheight()) for n, f in self._pages.items()}
         content = max(hs.values()) if hs else 0
         self._content_h = content
+        # **侧栏也要装得下**：窗口高原来只按**内容区**算，于是侧栏比内容区高的
+        # 那一截会被窗口底边切掉 —— 新增特效后侧栏有 17 项 + 5 个组标题
+        # （实测需要 917px），而最高的"真实水波"页只有 860px，于是最后一项
+        # 「鼠标光环」露不出来，得滚动才看得见。
+        # 所以窗口高取**内容与侧栏的较大者**（上限 _clamp_h 兜住）。
+        try:
+            nav_h = self._nav_needed_h()
+        except Exception:
+            nav_h = 0
         if self._user_h:
             h = self._clamp_h(self._user_h)
         else:
-            h = self._clamp_h(max(self.H_MIN, content + self._chrome))
+            h = self._clamp_h(max(self.H_MIN,
+                                  max(content, nav_h) + self._chrome))
         w = self._clamp_w(self._user_w or self.W_DEF)
         # 不能只在 `w/h != self.W/self.H` 时才应用：窗口尺寸可能被外部改过
         # （测试里压矮造溢出、用户拖过了）而 W/H 没变 -> 就恢复不回来了。
