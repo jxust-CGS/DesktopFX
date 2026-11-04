@@ -38,3 +38,11 @@ shot.png
 preview.png
 _longrun_config.json
 _longrun_presets.json
+
+# 诊断脚本的临时产物（真机探测用，不入库）
+diag_ms.txt
+ms_layer.png
+ms_halo_crop.png
+one_shot.png
+one_shot_full.png
+screen_halo.png
