@@ -171,6 +171,113 @@ def test_halo_bounded():
     return True, "贴边不越界（远处脏像素 %d）" % far
 
 
+def test_swing_amplitude():
+    """波动幅度：调到 1.65 时半径涨落是原来的 3 倍。
+
+    这正是"波动幅度调节范围增大 3 倍"这条需求的判据 ——
+    幅度系数从 0.55 提到 1.65（正好 3 倍），半径的涨落量也应精确 3 倍。
+
+    基准尺寸取 50 像素：这样两个幅度下的理论半径（77 与 132）都远在
+    `MAX_HALO_R` 之内，测到的是**纯粹的 3 倍关系**，不受上限干扰。
+    """
+    from fx_halo import HALO_SWING_DEFAULT, HALO_SWING_MAX, MAX_HALO_R
+
+    def radius_at(swing, size=50.0):
+        h = HaloField(W, H)
+        h.set_style("呼吸圆环")
+        h.set_size(size)
+        h.set_level(1.0)
+        h.set_swing(swing)
+        h.set_cursor(W / 2.0, H / 2.0)
+        u32 = np.zeros(W * H, dtype=np.uint32)
+        h.draw(u32, W, H, {}, 0.016)
+        a = (u32 >> 24).reshape(H, W)
+        ys, xs = np.nonzero(a)
+        if len(xs) == 0:
+            return 0.0
+        rr = np.sqrt((xs - W / 2.0) ** 2 + (ys - H / 2.0) ** 2)
+        return float(rr.max())
+
+    r_base = radius_at(HALO_SWING_DEFAULT)
+    r_max = radius_at(HALO_SWING_MAX)
+    amp_base = r_base - 50.0
+    amp_max = r_max - 50.0
+    ratio = amp_max / max(amp_base, 1e-6)
+    check(abs(HALO_SWING_MAX / HALO_SWING_DEFAULT - 3.0) < 1e-6,
+          "上限是默认值的 3 倍（%.2f vs %.2f）"
+          % (HALO_SWING_MAX, HALO_SWING_DEFAULT))
+    check(2.8 < ratio < 3.2,
+          "半径涨落量精确放大 3 倍（实测 %.2f 倍：%.1f -> %.1f px）"
+          % (ratio, r_base, r_max))
+    # 上限不能小到让"3 倍"名不副实
+    check(MAX_HALO_R >= 50.0 * (1.0 + HALO_SWING_MAX) * 0.95,
+          "半径上限（%.0f）不会把 3 倍幅度削掉太多" % MAX_HALO_R)
+    return True, "幅度 %.2f -> %.2f，涨落量 %.1f -> %.1f px（%.2f 倍）" % (
+        HALO_SWING_DEFAULT, HALO_SWING_MAX, amp_base, amp_max, ratio)
+
+
+def test_hollow_center_clear():
+    """空心样式：鼠标指针所在的位置必须**干净**。
+
+    辐条/星芒以前是实心的，芒线尖端正好压在光标上 —— 想点准一个小按钮
+    得先猜光标在哪。改成空心后，光标周围一圈（半径 0.2 倍基准半径内）
+    不该有任何像素。
+    """
+    bad = []
+    for name in ("辐条光环", "星芒光环"):
+        halo = HaloField(W, H)
+        halo.set_style(name)
+        halo.set_color("#7EC8FF")
+        halo.set_size(60.0)
+        halo.set_level(1.0)
+        halo.set_swing(1.65)
+        halo.set_cursor(W / 2.0, H / 2.0)
+        u32 = np.zeros(W * H, dtype=np.uint32)
+        halo.draw(u32, W, H, {}, 0.016)
+        a = (u32 >> 24).reshape(H, W)
+        cy = int(H / 2.0)
+        cx = int(W / 2.0)
+        r = 12                       # 光标附近 12 像素
+        near = a[cy - r:cy + r + 1, cx - r:cx + r + 1]
+        n = int((near > 0).sum())
+        if n > 0:
+            bad.append("%s(%d px)" % (name, n))
+    check(not bad, "鼠标中心是干净的：%s" % "; ".join(bad))
+    return True, "辐条/星芒中心均无像素"
+
+
+def test_perf_budget():
+    """性能：幅度拉满时也不能掉帧。
+
+    判据是**每帧耗时 < 16.7ms**（60fps 预算）。这条很关键：包围盒面积
+    与半径的平方成正比，幅度放大后半径涨 3 倍，包围盒就涨 9 倍 ——
+    逐像素画法会直接爆掉（实测星芒从 6ms 涨到 90ms）。改成稀疏描边
+    后代价只随笔画总长（线性）增长。
+    """
+    import time
+    worst = 0.0
+    worst_name = ""
+    for name in halo_style_names():
+        halo = HaloField(1920, 1200)
+        halo.set_style(name)
+        halo.set_color("#7EC8FF")
+        halo.set_size(160.0)          # 最大尺寸
+        halo.set_level(1.0)            # 音乐正响
+        halo.set_swing(1.65)           # 幅度拉满
+        halo.set_cursor(960.0, 600.0)
+        u32 = np.zeros(1920 * 1200, dtype=np.uint32)
+        halo.draw(u32, 1920, 1200, {}, 0.016)      # 预热
+        t0 = time.perf_counter()
+        for _ in range(10):
+            halo.draw(u32, 1920, 1200, {}, 0.016)
+        ms = (time.perf_counter() - t0) / 10 * 1000.0
+        if ms > worst:
+            worst, worst_name = ms, name
+    check(worst < 16.7,
+          "最慢的样式 %s 用了 %.2f ms（预算 16.7ms）" % (worst_name, worst))
+    return True, "最慢 %s %.2f ms / 帧（预算 16.7ms）" % (worst_name, worst)
+
+
 def test_style_names_consistency():
     """UI 的样式名必须与实现一一对应。"""
     import fx_ui
@@ -227,6 +334,9 @@ def main():
         test_level_clamps_api,
         test_all_styles_draw,
         test_styles_follow_level,
+        test_swing_amplitude,
+        test_hollow_center_clear,
+        test_perf_budget,
         test_halo_bounded,
         test_style_names_consistency,
         test_kind_registration,

@@ -407,6 +407,7 @@ class Scene:
             self.halo.set_style(cfg.get("halo_style", "呼吸圆环"))
             self.halo.set_color(cfg.get("halo_color", "#7EC8FF"))
             self.halo.set_size(float(cfg.get("halo_size", 46.0)))
+            self.halo.set_swing(float(cfg.get("halo_swing", 0.55)))
             self.halo.set_level(self.audio.level())
             self.halo.draw(buf_ms, w, h, cfg, dt)
         elif self.audio_started:

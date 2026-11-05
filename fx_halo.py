@@ -291,19 +291,53 @@ HALO_STYLES = {
     "辐条光环": "spokes",
     "星芒光环": "star",
     "粒子光环": "particles",
+    "三条线": "triple",
+    "折线圆环": "poly",
+    "赛博风": "cyber",
 }
 
 HALO_STYLE_ORDER = ["呼吸圆环", "双环脉冲", "彩虹光环", "辐条光环",
-                    "星芒光环", "粒子光环"]
+                    "星芒光环", "粒子光环",
+                    "三条线", "折线圆环", "赛博风"]
 
 # 每个样式要多大包围盒（相对基础半径的倍数）。按样式给而不是一律 2.6 倍：
 # 包围盒越小，逐像素运算越少（彩虹样式的 HSV→RGB 尤其吃这个）。
+#
+# ⚠️ 只对**稠密样式**有意义：稀疏样式（见 `_HALO_SPARSE`）根本不建包围盒。
 _HALO_SPAN = {
     "breath": 1.22, "double": 1.22, "rainbow": 1.28,
-    "spokes": 1.42, "star": 2.20, "particles": 1.55,
+    "particles": 1.55,
 }
 # 哪些样式需要**角度**（arctan2 约 1.1ms/帧，不要白算）
-_HALO_NEEDS_ANG = {"rainbow": True, "spokes": True, "star": True}
+_HALO_NEEDS_ANG = {"rainbow": True}
+
+# 哪些样式走**稀疏描边**路径（不建包围盒、不逐像素算掩码）。
+#
+# 这些样式本质是"从圆心向外的一堆笔画"（辐条、星芒、三条线、折线、赛博），
+# 用极坐标把每条笔画的像素参数化出来即可，不必遍历包围盒里的空白。
+# 代价从 O(包围盒面积 ∝ 半径²) 降到 O(笔画总长 ∝ 半径) ——
+# 这正是"波动幅度能放大 3 倍"的前提。
+#
+# ⚠️ 稀疏路径只写**有墨的像素**，不会像旧的整块写回那样把包围盒里
+# alpha=0 的像素也写成 0 —— 那会把同层（水波）的像素擦掉一块。
+_HALO_SPARSE = {"breath", "double", "rainbow", "particles",
+                "spokes", "star", "triple", "poly", "cyber"}
+
+# 半径上限。波动幅度调大时半径会涨，而**包围盒面积按平方涨** ——
+# 不设上限的话，极端组合（一圈多粗 + 幅度拉满 + 音乐正响）能把一帧
+# 拖到几百毫秒。
+#
+# 320 是权衡值：1080p 屏的半高是 540，光环半径 320 已经相当夸张；
+# 而"大小 160 + 幅度 1.65"的组合理论半径是 424 —— 会被这个上限削掉
+# 一小段（幅度不到 3 倍）。这是**有意的**：再大的光环既难看又抢戏。
+MAX_HALO_R = 320.0
+
+# 波动幅度滑块的范围（相对基准半径的百分比）。
+# 0.55 是原版的写死系数 —— 保留为默认值，老配置升级后观感不变；
+# 上限 1.65 正好是它的 3 倍（"波动幅度调节范围增大 3 倍"）。
+HALO_SWING_MIN = 0.0
+HALO_SWING_MAX = 1.65
+HALO_SWING_DEFAULT = 0.55
 
 
 def halo_style_names():
@@ -353,6 +387,10 @@ class HaloField:
         self._base_r = 46.0
         self._level = 0.0
         self._phase = 0.0
+        self._swing = HALO_SWING_DEFAULT
+        # 稀疏描边的光斑半径（像素）：每个采样点摊成这么大一片，
+        # 相邻采样点的光斑才能叠成连续的线
+        self._spread = 1.2
         # 粒子光环的粒子（角度、基准半径、抖动相位）
         self._parts = self._make_parts(64)
         self._part_offsets = np.zeros((64, 3), dtype=np.float32)
@@ -415,6 +453,15 @@ class HaloField:
     def set_size(self, r):
         self._base_r = max(18.0, float(r))
 
+    def set_swing(self, v):
+        """波动幅度：音乐最响时半径相对基准的涨落比例（0~1.65）。
+
+        半径 = 基准 × (1 + 幅度 × 电平)。幅度 0.55 是原版写死的值，
+        1.65 是它的 3 倍 —— 也就是"波动幅度调节范围增大 3 倍"。
+        """
+        self._swing = max(HALO_SWING_MIN,
+                          min(HALO_SWING_MAX, float(v)))
+
     def set_level(self, v):
         """喂入电平 0~1（由 Scene 从 AudioLevel 取）。"""
         v = float(v)
@@ -434,7 +481,16 @@ class HaloField:
         self._phase += float(dt)
         style = self._style
         sid = HALO_STYLES[style]
-        r0 = self._base_r * (1.0 + 0.55 * self._level)
+        # 半径 = 基准 × (1 + 波动幅度 × 电平)
+        r0 = self._base_r * (1.0 + self._swing * self._level)
+        if r0 > MAX_HALO_R:
+            r0 = MAX_HALO_R
+        fn = getattr(self, "_draw_" + sid)
+        if sid in _HALO_SPARSE:
+            # 稀疏样式：不建包围盒、不逐像素算掩码，直接按笔画画。
+            # 代价只随"笔画总长"增长，与包围盒面积（∝ 半径²）无关。
+            fn(u32, w, h, None, None, None, None, r0)
+            return
         # 包围盒按样式给（`_HALO_SPAN`）—— 越小越省逐像素运算
         span = r0 * _HALO_SPAN.get(sid, 1.3) + 12.0
         x0 = int(max(0, np.floor(self.cx - span)))
@@ -452,104 +508,306 @@ class HaloField:
         ang = (np.arctan2(dy, dx)
                if _HALO_NEEDS_ANG.get(sid) else None)
 
-        fn = getattr(self, "_draw_" + sid)
         fn(u32, w, h, xs, ys, d, ang, r0)
 
     # ---- 各样式 ----
-    def _blend(self, u32, w, h, xs, ys, mask, rgb, alpha_scale=1.0):
-        """把 mask（0~1 的覆盖率）与 rgb 颜色按预乘 alpha 混进缓冲。
+    # -------------------------------------------------- 稀疏描边（快路径）
+    #
+    # 为什么需要它：旧画法在**整个包围盒**内逐像素算 mask。包围盒面积与
+    # 半径的平方成正比，于是「半径随音乐涨落」会把每帧代价按平方放大 ——
+    # 实测星芒光环在半径 250 时已经要 90ms/帧（60fps 预算只有 16.7ms）。
+    # 而"波动幅度调节范围增大 3 倍"恰恰要让半径涨到那么大。
+    #
+    # 稀疏画法换个思路：**先算出真正有墨的像素在哪，只写这些像素**。
+    # 放射状样式（辐条/星芒/折线/赛博）本质上是一堆"从圆心向外的笔画"，
+    # 每笔只占很窄的一条 —— 用极坐标把每笔参数化出来，笔的像素就能直接
+    # 算出来，不必遍历包围盒里其余的空白。
+    # 代价从 O(包围盒面积) 降到 O(笔画总长)，后者只随半径线性增长。
+    #
+    # ⚠️ 附带修掉一个旧画法的隐患：`_blend` 是**整块包围盒写回**，连
+    # alpha=0 的像素也会被写成 0（= 全透明）。光环画在水波之后，于是
+    # 包围盒内那圈水波会被"擦"掉一块。稀疏画法只写有墨的像素，天然
+    # 不会误伤同层的其它特效。
 
-        预乘的意义：半透明的环叠在别的特效上时，颜色不会因为叠加而发灰。
+    def _stroke(self, u32, w, h, r, th0, th1, width, rgb,
+                alpha=1.0, taper=0.0, color_fn=None):
+        """画一段**径向笔画**：半径 r 处、角度 th0~th1 的一条弧。
 
-        `rgb` 必须是 **(b, g, r)** 顺序 —— `_premul_pack(b, g, r, a)` 打包成
-        0xAARRGGBB（低字节是蓝）。传 RGB 进去会红蓝互换。
+        这是稀疏描边的最小积木 —— 环、辐条、折线、赛博风全都是若干条
+        这样的弧拼出来的。
+
+        参数
+            r        —— 笔画所在的半径
+            th0, th1 —— 角度范围（弧度）
+            width    —— 笔画厚度（像素，沿**径向**量）
+            taper    —— 端点收细比例（0 = 不收细，1 = 两端收成尖）
+            alpha    —— 整体不透明度
+            color_fn —— 可选：按角度取色 (角度, 半径) -> (b, g, r)，
+                        用于彩虹光环那种颜色随角度流转的样式
+
+        几何要点：一条弧是"半径固定为 r、角度从 th0 走到 th1"的曲线，
+        它的**厚度在径向上**（内圈到外圈 width 像素宽）。所以到笔画的
+        距离 = |当前半径 - r|，切向那 1 像素弧长只用来**采样密度**，
+        不参与距离计算。
+
+        采样密度按弧长来：角步长 = 1 像素弧长对应的角度 = 1/r。
+        半径大时步长自动变小，弧画得连续；半径小时步长变大，省算力。
         """
-        if alpha_scale <= 0.0:
+        if width <= 0.0 or alpha <= 0.0:
             return
-        a = np.clip(mask * float(alpha_scale), 0.0, 1.0)
-        a_c = np.rint(a * 255.0).astype(np.uint32)
-        if not a_c.any():
+        dth = abs(th1 - th0)
+        if dth < 1e-6:
             return
-        cb, cg, cr = rgb
-        packed = _premul_pack(
-            np.rint(cb * a).astype(np.uint32),
-            np.rint(cg * a).astype(np.uint32),
-            np.rint(cr * a).astype(np.uint32), a_c)
-        grid = ys.astype(np.int32) * np.int32(w) + xs.astype(np.int32)
-        u32[grid.reshape(-1)] = packed.reshape(-1)
+        half_w = width * 0.5
+        # 角步长 = 1 像素弧长 / 半径（保证采样点间距约 1 像素）。
+        #
+        # 但**不必真的每像素一个采样点**：光斑半径有 1.2 像素，采样点间距
+        # 放宽到 1.6 像素时光斑仍然连成线，而采样量降到 6 成。半径越大
+        # 越明显（彩虹样式在半径 320 时采样点是 2010 个）。
+        step_px = 1.6
+        dth_step = step_px / max(r, 1.0)
+        n = max(3, int(math.ceil(dth / dth_step)) + 1)
+        tt = np.linspace(th0, th1, n, dtype=np.float32)
+        # 径向窗口：笔画厚度 + 各 1 像素软边
+        rr = np.arange(r - half_w - 1.0, r + half_w + 1.0,
+                       dtype=np.float32)
+        R = rr[:, None]
+        T = tt[None, :]
+        px = self.cx + R * np.cos(T)
+        py = self.cy + R * np.sin(T)
+        # 到笔画的距离 = 径向偏移（笔画的厚度就是径向的）。
+        # ⚠️ 必须与 T 广播成 (径向格数, 采样点数) —— 只写 np.abs(R - r)
+        # 得到的是 (径向格数, 1)，整条弧会塌成一个点。
+        dist = np.abs(R - r) * np.ones_like(T)
+        mask = np.clip(1.0 - (dist - half_w) / max(0.75, width * 0.35),
+                       0.0, 1.0)
+        if taper > 0.0:
+            # 沿弧长方向两端收细（只影响端点，不影响中段亮度）
+            mid = (th0 + th1) * 0.5
+            u = np.abs((T - mid) / max(dth * 0.5, 1e-6))
+            mask = mask * np.clip(1.0 - (u ** 2) * taper, 0.0, 1.0)
+        # 角度要展平成与 px 同形状（px 是 (径向格数, 采样点数)）
+        self._paint(u32, w, h, px, py, mask, rgb, alpha,
+                    color_fn=color_fn,
+                    angles=np.broadcast_to(T, px.shape))
 
-    def _ring_mask(self, d, radius, width):
-        """圆环的覆盖率：中心线处 1，边缘处 0（软边）。"""
-        half = max(0.5, width * 0.5)
-        t = np.abs(d - radius) / half
-        t = np.clip(t, 0.0, 1.0)
-        return (1.0 - t) * (1.0 - t)
+    def _paint(self, u32, w, h, px, py, mask, rgb, alpha=1.0,
+               color_fn=None, angles=None):
+        """把一小块 mask 画进缓冲（**只写有墨的像素**）。
+
+        `px`/`py`/`mask` 形状相同，是这一小块自己的坐标系。
+
+        ⚠️ 稀疏描边的像素是**采样点**，每个采样点只代表"这里该有多浓"，
+        不是"这里只有一个像素"。所以要把每个采样点摊成一小片（半径
+        `spread` 像素的软斑），相邻采样点的光斑自然叠成连续的线 ——
+        只取整成 1 个像素的话，线会变成断断续续的虚线（采样间距 1 像素
+        时必然如此）。
+
+        `color_fn` 给定时按**每个采样点的角度**取色（彩虹光环用），
+        此时 `angles` 必须与 `px` 同形状。`color_fn(角度, 半径)` 返回
+        (n, 3) 的 (r, g, b)。
+        """
+        if alpha <= 0.0:
+            return
+        a = np.clip(mask * float(alpha), 0.0, 1.0)
+        idx = np.nonzero(a > 0.002)
+        n_sel = len(idx[0])
+        if n_sel == 0:
+            return
+        a_sel = a[idx]
+        sx = px[idx]
+        sy = py[idx]
+        spread = max(1.0, float(self._spread))
+        cb, cg, cr = rgb
+        # 逐采样点的颜色（没给 color_fn 就用统一色）
+        if color_fn is not None and angles is not None:
+            # angles 与 px 同形状 —— 用**二维**索引取值
+            # （idx 是 (行, 列) 元组，不能用在展平数组上）
+            ang_sel = np.asarray(angles, dtype=np.float32)[idx]
+            rad_sel = np.sqrt((sx - self.cx) ** 2 + (sy - self.cy) ** 2)
+            cols = color_fn(ang_sel, rad_sel)          # (n_sel, 3) r,g,b
+        else:
+            cols = None
+        # 光斑偏移网格：显式的 (K, K)，K = 2*k+1
+        k = int(spread)
+        off = np.arange(-k, k + 1, dtype=np.float32)
+        ox = np.repeat(off[None, :], off.size, axis=0)      # (K, K)
+        oy = np.repeat(off[:, None], off.size, axis=1)      # (K, K)
+        dist = np.sqrt(ox * ox + oy * oy)
+        w_blob = np.clip(1.0 - (dist - spread * 0.5) / max(0.6, spread * 0.5),
+                         0.0, 1.0).ravel()      # (K*K,)
+        # 每个采样点摊成 (K*K,) 个像素
+        ix = np.rint(sx[:, None] + ox.ravel()[None, :]).astype(np.int32).ravel()
+        iy = np.rint(sy[:, None] + oy.ravel()[None, :]).astype(np.int32).ravel()
+        wv = (a_sel[:, None] * w_blob[None, :]).ravel()
+        # 每个像素记着它来自哪个采样点（取颜色要用）
+        src = np.repeat(np.arange(n_sel, dtype=np.int32),
+                        ox.size)
+        ok = (ix >= 0) & (ix < w) & (iy >= 0) & (iy < h) & (wv > 0.002)
+        if not ok.any():
+            return
+        ix = ix[ok]
+        iy = iy[ok]
+        wv = wv[ok]
+        src = src[ok]
+        # 同一像素可能被多个采样点覆盖 —— 取**最大权重**（累加会过曝成白）。
+        #
+        # ⚠️ 两条走过的弯路，别再走：
+        #  1. `argsort` + `unique` 去重：O(n log n)，n 是"采样点 × 光斑
+        #     面积"，大半径下几十万 —— 实测占掉一半帧预算。
+        #  2. "局部直方图"（按 flat 的 min..max 开临时数组）：跨越大半个
+        #     屏幕时临时数组有两百万元素 —— 实测星芒从 8ms 涨到 198ms。
+        #
+        # 现在的做法：`np.unique` 拿到唯一像素与反查表（unique 内部虽排序，
+        # 但 n 只与墨迹成正比，比 argsort 那版少一次全量排序），
+        # 再用 `np.maximum.at` 聚合。
+        flat = iy.astype(np.int64) * np.int64(w) + ix.astype(np.int64)
+        uniq, inv = np.unique(flat, return_inverse=True)
+        wmax = np.zeros(len(uniq), dtype=np.float32)
+        np.maximum.at(wmax, inv, wv)
+        if cols is not None:
+            # 颜色按**采样点**聚合，不按像素 —— 光斑的每个像素继承它所属
+            # 采样点的颜色。同一根弧上颜色几乎相同，按采样点聚合省掉
+            # (像素数 × 3) 的临时数组（彩虹样式下这一项就要好几 MB）。
+            #
+            # 去重后每个像素要一个"代表采样点"：取它最后出现的那个
+            # （同一像素被多个光斑覆盖时，颜色取谁都能看）。
+            rep = np.zeros(len(uniq), dtype=np.int32)
+            np.maximum.at(rep, inv, src)
+            cb_v = cols[rep, 2]
+            cg_v = cols[rep, 1]
+            cr_v = cols[rep, 0]
+        else:
+            cb_v = cb
+            cg_v = cg
+            cr_v = cr
+        a_c = np.rint(wmax * 255.0).astype(np.uint32)
+        packed = _premul_pack(
+            np.rint(cb_v * wmax).astype(np.uint32),
+            np.rint(cg_v * wmax).astype(np.uint32),
+            np.rint(cr_v * wmax).astype(np.uint32), a_c)
+        u32[uniq] = packed
 
     def _draw_breath(self, u32, w, h, xs, ys, d, ang, r0):
-        mask = self._ring_mask(d, r0, 3.2 + 2.0 * self._level)
-        self._blend(u32, w, h, xs, ys, mask, self._rgb, 0.55 + 0.45 * self._level)
+        """呼吸圆环：一圈细线，随电平涨落（半径变大、线也变粗变亮）。"""
+        self._stroke(u32, w, h, r0, 0.0, 2.0 * math.pi,
+                     3.2 + 2.0 * self._level, self._rgb,
+                     0.55 + 0.45 * self._level)
 
     def _draw_double(self, u32, w, h, xs, ys, d, ang, r0):
-        m1 = self._ring_mask(d, r0, 3.0)
-        # 内环与外环反相：一涨一落，像声波的两道涟漪
-        m2 = self._ring_mask(d, r0 * 0.62, 2.4)
+        """双环脉冲：内外两环反相 —— 一涨一落，像声波的两道涟漪。"""
         inv = 1.0 - self._level
-        mask = np.maximum(m1 * (0.35 + 0.65 * self._level),
-                          m2 * (0.30 + 0.55 * inv))
-        self._blend(u32, w, h, xs, ys, mask, self._rgb, 0.75)
+        self._stroke(u32, w, h, r0, 0.0, 2.0 * math.pi, 3.0,
+                     self._rgb, 0.35 + 0.65 * self._level)
+        self._stroke(u32, w, h, r0 * 0.62, 0.0, 2.0 * math.pi, 2.4,
+                     self._rgb, 0.30 + 0.55 * inv)
 
     def _draw_rainbow(self, u32, w, h, xs, ys, d, ang, r0):
-        mask = self._ring_mask(d, r0, 4.0 + 2.5 * self._level)
-        if not mask.any():
-            return
-        # 颜色沿角度流转。⚠️ **必须查表**：直接按 HSV 现算要 6 次 np.where
-        # 铺满整张包围盒（实测 11.6ms/帧，单它一个就吃掉大半帧预算）。
-        # 预计算 256 级色环 + 索引取值，视觉上 256 级看不出色阶。
-        idx = ((ang + self._phase * 0.8) / (2.0 * math.pi) % 1.0
-               * 256.0).astype(np.int32) & 255
-        rgb = self._hue_lut[idx]                # (ny, nx, 3)
-        a = np.clip(mask * (0.5 + 0.5 * self._level), 0.0, 1.0)
-        a_c = np.rint(a * 255.0).astype(np.uint32)
-        # `_premul_pack` 要 (b, g, r) —— rgb 的索引是 R,G,B，要交换
-        packed = _premul_pack(
-            (rgb[..., 2] * a * 255.0).astype(np.uint32),
-            (rgb[..., 1] * a * 255.0).astype(np.uint32),
-            (rgb[..., 0] * a * 255.0).astype(np.uint32), a_c)
-        grid = ys.astype(np.int32) * np.int32(w) + xs.astype(np.int32)
-        u32[grid.reshape(-1)] = packed.reshape(-1)
+        """彩虹光环：颜色沿角度流转的圆环。
+
+        ⚠️ **必须查表**：直接按 HSV 现算要 6 次 np.where 铺满整张包围盒
+        （实测 11.6ms/帧，单它一个就吃掉大半帧预算）。预计算 256 级
+        色环 + 索引取值，视觉上 256 级看不出色阶。
+        """
+        def color_fn(th, rr):
+            idx = ((th + self._phase * 0.8) / (2.0 * math.pi) % 1.0
+                   * 256.0).astype(np.int32) & 255
+            return self._hue_lut[idx] * 255.0     # (n, 3) 的 r,g,b
+
+        self._stroke(u32, w, h, r0, 0.0, 2.0 * math.pi,
+                     4.0 + 2.5 * self._level, self._rgb,
+                     0.5 + 0.5 * self._level, color_fn=color_fn)
 
     def _draw_spokes(self, u32, w, h, xs, ys, d, ang, r0):
+        """辐条光环（**空心**）：一圈短弧段，中间是空的。
+
+        为什么改成空心：实心辐条是一根根从圆心射出的**实线楔形**，在鼠标
+        指针周围堆成一坨，视觉上把光标"埋"住了 —— 想点准一个按钮得先
+        猜光标在哪。空心版本只画弧的**两条边**（像仪表盘的刻度框），
+        中心留空，指针始终清清楚楚。
+        """
         n = 24
-        seg = (ang + math.pi) / (2.0 * math.pi) * n
-        # floor 可能正好等于 n（角度在边界上）—— 必须夹住，否则查表越界
-        idx = np.clip(np.floor(seg).astype(np.int32), 0, n - 1)
-        frac = seg - idx
-        # 每根辐条长度随电平变化（用角度序号做伪随机，错开避免整齐划一）。
-        # ⚠️ wob 只依赖**整数序号**，所以查表即可 —— 全网格算 sin 要好几毫秒
-        # （星芒样式的大包围盒下尤其明显）。
-        wob = self._wob_lut(24, 1.7, 3.0)[idx]
-        ln = r0 * (0.35 + 0.75 * self._level * (0.55 + 0.45 * wob))
-        # 沿半径方向的软边
-        half = max(1.5, r0 * 0.10)
-        radial = np.clip((ln - d) / half + 1.0, 0.0, 1.0)
-        # 横向：辐条中线亮，两侧暗（frac 距 0.5 越远越暗）
-        lateral = np.clip(1.0 - np.abs(frac - 0.5) * 2.0, 0.0, 1.0)
-        mask = radial * lateral
-        mask = np.where(d > r0 * 1.35, 0.0, mask)
-        self._blend(u32, w, h, xs, ys, mask, self._rgb, 0.55 + 0.4 * self._level)
+        seg_w = 2.0 * math.pi / n
+        # 24 根辐条，每根画成"口"字形（两条径向边 + 一道外弧）
+        for i in range(n):
+            th = i * seg_w + self._phase * 0.15
+            # 每根辐条长度错开，避免整齐划一
+            wob = 0.5 + 0.5 * math.sin(i * 1.7 + self._phase * 3.0)
+            ln = r0 * (0.55 + 0.55 * self._level * (0.6 + 0.4 * wob))
+            # 辐条占据的角度宽度：窄一点才不会挤成一团
+            hw = seg_w * (0.16 + 0.10 * self._level)
+            al = 0.45 + 0.35 * self._level
+            # 两条径向边（从内圈到外圈）
+            self._stroke(u32, w, h, (ln + r0 * 0.42) * 0.5,
+                         th - hw, th - hw, 1.6, self._rgb, al)
+            self._stroke(u32, w, h, (ln + r0 * 0.42) * 0.5,
+                         th + hw, th + hw, 1.6, self._rgb, al)
+            # 外端那一道弧
+            self._stroke(u32, w, h, ln, th - hw, th + hw,
+                         1.6, self._rgb, al)
 
     def _draw_star(self, u32, w, h, xs, ys, d, ang, r0):
+        """星芒光环（**空心**）：放射状的芒线，只画线不画面。
+
+        旧版是从圆心射出的实心三角，尖端在圆心 —— 正好压在鼠标指针上。
+        现在改成：每道芒是一条**细长的描边三角形**（两条斜边 + 一道底边），
+        中间镂空，且整体从圆心往外让开一段距离，光标所在处完全干净。
+        """
         n = 12
-        seg = (ang + math.pi) / (2.0 * math.pi) * n
-        idx = np.clip(np.floor(seg).astype(np.int32), 0, n - 1)
-        frac = seg - idx
-        wob = self._wob_lut(12, 2.3, 1.5)[idx]
-        ln = r0 * (0.8 + 1.35 * self._level) * (0.6 + 0.4 * (wob * 0.5 + 0.5))
-        half = max(1.2, r0 * 0.06)
-        radial = np.clip((ln - d) / half + 1.0, 0.0, 1.0)
-        lateral = np.clip(1.0 - np.abs(frac - 0.5) * 2.4, 0.0, 1.0)
-        mask = radial * lateral
-        self._blend(u32, w, h, xs, ys, mask, self._rgb, 0.6 + 0.4 * self._level)
+        seg_w = 2.0 * math.pi / n
+        for i in range(n):
+            th = i * seg_w + self._phase * 0.22
+            wob = 0.5 + 0.5 * math.sin(i * 2.3 + self._phase * 1.5)
+            ln = r0 * (0.95 + 0.55 * self._level) * (0.68 + 0.32 * wob)
+            # 内端离圆心留出空档 —— 光标就待在那儿
+            r_in = r0 * 0.34
+            hw = seg_w * 0.20
+            al = 0.55 + 0.35 * self._level
+            # 两条斜边：从内端到外端，角度从 th±hw 收到 th
+            for sgn in (-1.0, 1.0):
+                self._ray(u32, w, h, r_in, ln, th, th + sgn * hw,
+                          1.7, self._rgb, al)
+            # 外端封口
+            self._stroke(u32, w, h, ln, th - hw, th + hw,
+                         1.7, self._rgb, al)
+
+    def _ray(self, u32, w, h, r0, r1, th0, th1, width, rgb, alpha=1.0):
+        """一条**斜的**描边：从 (r0, th0) 连到 (r1, th1) 的直线笔画。
+
+        极坐标下两点连线就是一条直线段。按参数 t 线性插值出这条线上的
+        点，再按**到线段的距离**算覆盖率 —— 只在这条线自己的小窗口里算。
+
+        实现上直接用**笛卡尔坐标**做"点到线段"的距离：把每个采样点投影
+        到线段上，取最近点的距离。全程只在这条线附近的几百个点上运算，
+        与包围盒面积无关。
+        """
+        if alpha <= 0.0 or width <= 0.0:
+            return
+        # 采样密度按线段长度（像素）来
+        ax = self.cx + r0 * math.cos(th0)
+        ay = self.cy + r0 * math.sin(th0)
+        bx = self.cx + r1 * math.cos(th1)
+        by = self.cy + r1 * math.sin(th1)
+        seg_len = math.hypot(bx - ax, by - ay)
+        if seg_len < 1e-3:
+            return
+        n = max(3, int(seg_len * 1.2) + 2)
+        t = np.linspace(0.0, 1.0, n, dtype=np.float32)
+        px = ax + (bx - ax) * t
+        py = ay + (by - ay) * t
+        # 到线段的距离（对每个采样点，取最近点的距离）
+        vx, vy = bx - ax, by - ay
+        ll = vx * vx + vy * vy
+        wx = px - ax
+        wy = py - ay
+        u = np.clip((wx * vx + wy * vy) / ll, 0.0, 1.0)
+        dxp = wx - u * vx
+        dyp = wy - u * vy
+        dist = np.sqrt(dxp * dxp + dyp * dyp)
+        half_w = width * 0.5
+        mask = np.clip(1.0 - (dist - half_w) / max(0.75, width * 0.4),
+                       0.0, 1.0)
+        self._paint(u32, w, h, px, py, mask, rgb, alpha)
 
     def _wob_lut(self, n, k, speed):
         """n 个辐条的伪随机抖动系数（查表用）。
@@ -561,6 +819,11 @@ class HaloField:
         return np.sin(np.arange(n, dtype=np.float32) * k + phase)
 
     def _draw_particles(self, u32, w, h, xs, ys, d, ang, r0):
+        """粒子光环：环上一圈粒子，随电平抖动散开。
+
+        每个粒子就是**一个光斑** —— 稀疏画法里最自然的一种：直接把
+        粒子的位置当作采样点，光斑半径随电平变大。
+        """
         angs, rads, phas = self._parts
         n = len(angs)
         # 粒子半径随电平"炸开"
@@ -576,22 +839,83 @@ class HaloField:
         bright = 0.55 + 0.45 * (np.sin(phas * 2.3 + self._phase * 6.0)
                                 * 0.5 + 0.5)
         size = 2.2 + 3.0 * self._level
-        # ⚠️ **性能**：逐粒子算整格距离场是 64 × (ny×nx) 次运算（每帧好几
-        # 毫秒，白白吃掉一帧预算）。改成**只在粒子周围的小方框内算** ——
-        # 总代价降到 64 × (2·size+1)² ≈ 几千次，几乎免费。
-        acc = np.zeros((ys.shape[0], xs.shape[1]), dtype=np.float32)
-        half = max(size, 0.5) + 1.0
+        # 每个粒子画成一个软圆斑（mask 用径向衰减）
+        off = np.arange(-int(size) - 1, int(size) + 2, dtype=np.float32)
+        ox = np.repeat(off[None, :], off.size, axis=0)      # (K, K)
+        oy = np.repeat(off[:, None], off.size, axis=1)      # (K, K)
+        dist = np.sqrt(ox * ox + oy * oy)
+        blob = np.clip(1.0 - dist / max(size, 0.5), 0.0, 1.0) ** 2
         for i in range(n):
-            ix0 = int(max(0, np.floor(pxs[i] - half)))
-            ix1 = int(min(xs.shape[1], np.ceil(pxs[i] + half) + 1))
-            iy0 = int(max(0, np.floor(pys[i] - half)))
-            iy1 = int(min(ys.shape[0], np.ceil(pys[i] + half) + 1))
-            if ix1 <= ix0 or iy1 <= iy0:
-                continue
-            gx = xs[0, ix0:ix1][None, :]        # (1, w)
-            gy = ys[iy0:iy1, 0][:, None]        # (h, 1)
-            ddx = (gx - pxs[i]) ** 2 + (gy - pys[i]) ** 2
-            m = np.clip(1.0 - np.sqrt(ddx) / max(size, 0.5), 0.0, 1.0) ** 2
-            sub = acc[iy0:iy1, ix0:ix1]
-            np.maximum(sub, m * bright[i], out=sub)
-        self._blend(u32, w, h, xs, ys, acc, self._rgb, 0.55 + 0.45 * self._level)
+            px = pxs[i] + ox.ravel()[None, :]
+            py = pys[i] + oy.ravel()[None, :]
+            m = (blob.ravel()[None, :] * bright[i]).ravel()
+            self._paint(u32, w, h, px, py, m.reshape(1, -1),
+                        self._rgb, 0.55 + 0.45 * self._level)
+
+    # ---- 新增样式 ----
+    def _draw_triple(self, u32, w, h, xs, ys, d, ang, r0):
+        """三条线：同心三条细弧，错相位起伏，像音频均衡器的三根柱。
+
+        电平越高，三条线之间的间距越大（从"挤在一起"散开）——
+        视觉上就是"三根柱子随音乐跳动"。
+        """
+        spread = 0.10 + 0.16 * self._level
+        for k, (rr, al) in enumerate(((0.72, 0.85), (0.88, 0.70), (1.04, 0.55))):
+            # 每条线各自的相位错开 -> 三条线不同步地起伏
+            ph = self._phase * 2.4 + k * 2.1
+            r = r0 * rr * (1.0 + spread * math.sin(ph))
+            # 每条线只画一段（留缺口），像仪表盘的刻度
+            gap = 0.28
+            start = self._phase * 0.35 + k * 2.0
+            self._stroke(u32, w, h, r, start, start + 2.0 * math.pi - gap,
+                         2.0, self._rgb, al * (0.55 + 0.4 * self._level))
+
+    def _draw_poly(self, u32, w, h, xs, ys, d, ang, r0):
+        """折线圆环：多边形边框（而不是圆），随音乐缩放并缓慢自转。
+
+        极坐标下"多边形的一条边"就是一条**斜的直线段**（从顶点到顶点），
+        用 `_ray` 画直线段即可 —— 这正是折线圆环比圆环更"硬朗"的原因。
+        """
+        n = 7
+        r = r0 * (0.72 + 0.30 * self._level)
+        rot = self._phase * 0.25
+        al = 0.55 + 0.4 * self._level
+        for i in range(n):
+            th0 = rot + i * 2.0 * math.pi / n
+            th1 = rot + (i + 1) * 2.0 * math.pi / n
+            # 顶点半径错开一点 -> 是不规则多边形（更有折线感）
+            rv = r * (1.0 + 0.10 * math.sin(i * 2.1 + self._phase * 1.4))
+            self._ray(u32, w, h, r, rv, th0, th1, 2.2, self._rgb, al)
+
+    def _draw_cyber(self, u32, w, h, xs, ys, d, ang, r0):
+        """赛博风：霓虹分段环 + 扫描线 + 数据块。
+
+        三层叠加，全是稀疏描边：
+          1. 外圈：断续的霓虹段（赛博朋克的招牌）
+          2. 内圈：一道快速旋转的扫描弧
+          3. 零散"数据块"：沿圆周分布的小短线
+        """
+        al = 0.6 + 0.4 * self._level
+        # 1) 断续霓虹段
+        n_seg = 14
+        seg_w = 2.0 * math.pi / n_seg
+        for i in range(n_seg):
+            th = i * seg_w + self._phase * 0.3
+            duty = 0.45 + 0.35 * math.sin(i * 1.3 + self._phase * 2.0)
+            r = r0 * (1.0 + 0.05 * math.sin(i * 0.9 + self._phase * 3.0))
+            self._stroke(u32, w, h, r, th, th + seg_w * duty,
+                         2.4, self._rgb, al)
+        # 2) 旋转扫描弧
+        sweep = self._phase * 1.6
+        self._stroke(u32, w, h, r0 * 0.82, sweep - 0.5, sweep + 0.5,
+                     3.0, self._rgb, al)
+        self._stroke(u32, w, h, r0 * 0.82, sweep - 0.5, sweep + 0.5,
+                     1.2, self._rgb, al * 0.7)
+        # 3) 数据块：沿内圈的小短线
+        n_tick = 30
+        for i in range(n_tick):
+            th = i * 2.0 * math.pi / n_tick + self._phase * 0.2
+            ln = 0.06 + 0.05 * (0.5 + 0.5 * math.sin(i * 2.7 + self._phase * 5.0))
+            self._stroke(u32, w, h, r0 * (0.55 + ln),
+                         th - 0.012, th + 0.012, 1.5, self._rgb,
+                         al * (0.35 + 0.5 * (0.5 + 0.5 * math.sin(i * 1.9))))

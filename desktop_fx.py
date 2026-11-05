@@ -152,6 +152,7 @@ DEFAULTS = {
     "halo_color": "#7EC8FF",
     "halo_size": 46.0,
     "halo_sensitivity": 1.0,
+    "halo_swing": 0.55,
     # ---- 宠物跟随（小猫 / 小狗跟着鼠标跑）----
     # 形象由 fx_effects.PetField **用代码画**出来（PIL 超采样 + LANCZOS），
     # 不引入任何图片资源 —— 也就不牵扯第三方形象授权，还能整体换色。
