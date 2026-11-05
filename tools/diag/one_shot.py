@@ -118,8 +118,13 @@ def main():
     cfg_path = os.path.join(ROOT, "config.json")
     with open(cfg_path, "r", encoding="utf-8") as f:
         cfg = json.load(f)
-    cfg.update({"halo_enabled": True, "halo_style": "彩虹光环",
-                "halo_size": 70.0,
+    # 样式与幅度可由命令行指定：python one_shot.py [样式] [幅度] [大小]
+    style = sys.argv[1] if len(sys.argv) > 1 else "彩虹光环"
+    swing = float(sys.argv[2]) if len(sys.argv) > 2 else 0.55
+    size = float(sys.argv[3]) if len(sys.argv) > 3 else 70.0
+    cfg.update({"halo_enabled": True, "halo_style": style,
+                "halo_swing": swing,
+                "halo_size": size,
                 "rain_enabled": False, "snow_enabled": False,
                 "petal_enabled": False, "meteor_enabled": False,
                 "spotlight_enabled": False, "paint_enabled": False,
