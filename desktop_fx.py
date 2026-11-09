@@ -751,6 +751,13 @@ class App:
 
         致命错误（托盘窗口建不起来、热键被占用）在这里就地记录，不依赖控制面板
         是否在运行。否则面板一旦没起来，这些错误就凭空蒸发了。
+
+        ⚠️ **pause 事件在这里就地处理**（不只转发给控制面板）：
+        原先 ("pause", None) 只有 fx_ui（控制面板）在消费，而控制面板是
+        **可选**的 —— 它没起来、或还没跑到它的 _poll 时，事件就堆在队列里
+        没人管，用户按 Ctrl+Alt+R 毫无反应（用户报的"暂停快捷键失效"）。
+        暂停是**全局状态**，本来就该由 App 自己管：这里处理掉，控制面板那边
+        只负责把界面上的"[已暂停]"标记刷新一下。
         """
         while True:
             item = self._raw_events.get()
@@ -763,7 +770,74 @@ class App:
             elif kind == "hotkey-failed":
                 self.report_error("hotkey", RuntimeError(
                     "Ctrl+Alt+R 已被其他程序占用，暂停快捷键不可用"))
+            elif kind == "pause":
+                # 就地处理：暂停不依赖控制面板是否在运行
+                self.on_pause_event(kind, payload)
+                # 仍然转发，但**换个事件名**（pause-state）：控制面板要用它
+                # 刷新状态区标记，但绝不能再切一次暂停状态（那是 App 的活了）。
+                self.events.put(("pause-state", payload))
+                continue
             self.events.put((kind, payload))
+
+    def on_pause_event(self, kind, payload):
+        """处理一次暂停/继续事件（托盘菜单项与 Ctrl+Alt+R 共用）。
+
+        放在 App 而不是控制面板，是因为**暂停必须一直可用**：控制面板可能
+        没起来、可能被用户关掉、也可能正卡在某个模态交互里 —— 这些都不该
+        让"按快捷键暂停"失效。
+
+        从暂停恢复到继续时，顺手把显示层级**强制**修一次：暂停期间渲染
+        循环被跳过（抢顶保活、置顶位自愈、两层先后纠正都不跑），这期间
+        别的置顶窗口会跑到特效层上面。只靠每帧的抢顶逻辑自愈，用户会看到
+        特效"闪一下才浮上来"；这里主动修一次，恢复即到位。
+        """
+        self.paused = not self.paused
+        if not self.paused:
+            self._fix_layers_after_resume()
+        return self.paused
+
+    def _fix_layers_after_resume(self):
+        """从暂停恢复后，把显示层级一次性修到位。
+
+        暂停期间渲染循环整个被跳过（`continue`），于是这些**每帧**做的
+        层级维护一件都没跑：
+
+        * 抢顶保活（`keep_on_top`）—— 别的置顶窗口会趁这期间跑到特效层
+          上面；更重要的是 `WS_EX_TOPMOST` 可能被清掉（插到非置顶窗之下
+          会连置顶位一起清掉），掉了的置顶窗口被**任何**普通窗口盖住。
+        * 两层先后纠正（`_restack_overlays`）—— 鼠标层与全屏层的先后可能
+          翻过来（雨盖住水波）。
+
+        恢复后的第一帧用户就在看，所以这里**主动**修一次，而不是等
+        下一帧的抢顶逻辑慢慢自愈 —— 那会看到特效"闪一下才浮上来"。
+
+        ⚠️ 还要**复位"骑在面板之上"的标志**：`_ride_above_panel` 一旦残留
+        True，`keep_on_top` 开头就 return False，置顶位自愈**永远不执行**
+        —— 特效层再也抢不回顶（用户报的"恢复后无法显示在最上层"）。
+        暂停期间这个标志的配对清理没机会跑，所以必须在这里强制对齐。
+        """
+        # 1) 复位"骑乘"标志：点击特效的临时提升已随暂停过期，
+        #    _ride_above_panel 必须清掉，否则 keep_on_top 永久早退。
+        try:
+            self._panel_raised = False
+            for ov in self.overlays:
+                if ov.is_riding_panel():
+                    ov.leave_panel_ride(ov.panel_hwnd)
+        except Exception:
+            pass
+        # 2) 置顶位自愈（keep_on_top 内部第一件事就是查 WS_EX_TOPMOST，
+        #    掉了就重新施加一次）
+        try:
+            for ov in self.overlays:
+                if ov.z_mode == fx_kinds.LAYER_TOPMOST:
+                    ov.keep_on_top()
+        except Exception:
+            pass
+        # 3) 两层先后纠正（鼠标层要在全屏层之上）
+        try:
+            self._restack_overlays()
+        except Exception:
+            pass
 
     # ---------------------------------------------------------------- 错误上报
     def report_error(self, where, exc, fatal=False):

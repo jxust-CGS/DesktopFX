@@ -1180,7 +1180,11 @@ class ControlPanel:
         self.status = tk.Label(bar, text="", bg=SIDEBAR_BG, fg=SUB,
                                font=FONT_NUM, cursor="hand2")
         self.status.pack(side="left", padx=8)
-        self.status.bind("<ButtonPress-1>", lambda e: self._pause())
+        # 点状态区切暂停：走 App 的统一入口（on_pause_event），
+        # 这样"面板点的"与"快捷键按的"是同一条路径 —— 状态只有一处
+        # 说了算，界面与实际状态不会对不上（以前是两处各切一次，
+        # 谁后处理谁赢，界面显示的"[已暂停]"经常是错的）。
+        self.status.bind("<ButtonPress-1>", lambda e: self._toggle_pause())
         self.status.bind("<Enter>", lambda e: self._status_paint(True))
         self.status.bind("<Leave>", lambda e: self._status_paint(False))
         self._bind_tip(self.status, "点一下暂停 / 继续全部特效"
@@ -3642,8 +3646,50 @@ class ControlPanel:
         self._refresh_rows()
         self._sync_sfx_lock()
 
-    def _pause(self):
-        self._paused = bool(self.app.toggle_pause())
+    def _notify_hotkey_failed(self):
+        """热键注册失败时弹一次提示（只弹一次）。
+
+        失败意味着用户按 Ctrl+Alt+R 不会有任何反应 —— 而托盘菜单里的
+        "暂停 / 继续" 仍可用，所以不是"程序坏了"，只是"快捷键不可用"。
+        不提示的话，用户只会以为快捷键失灵或程序卡住。
+        """
+        if getattr(self, "_hotkey_warned", False):
+            return
+        self._hotkey_warned = True
+        try:
+            ctypes.windll.user32.MessageBoxW(
+                0,
+                "Ctrl+Alt+R 已被其他程序占用，本次无法用快捷键暂停。\r\n"
+                "\r\n"
+                "仍可用：托盘图标右键菜单 ->「暂停 / 继续」，"
+                "或点面板右上角的状态区。",
+                "桌面特效", 0x40)
+        except Exception:
+            pass
+
+
+    def _toggle_pause(self):
+        """切换暂停：统一交给 App 处理，界面只负责跟着刷新。
+
+        面板上点状态区、托盘右键菜单、Ctrl+Alt+R —— 三条路都汇到
+        App 的 `on_pause_event`，状态只有一处说了算。
+        """
+        fn = getattr(self.app, "on_pause_event", None)
+        if fn is not None:
+            fn("pause", None)
+        else:
+            # 兜底：App 没有统一入口（旧版本）时自己切
+            self.app.toggle_pause()
+        self._pause_state_changed()
+
+    def _pause_state_changed(self):
+        """暂停状态已被别处（App）改过，这里只把界面同步过来。
+
+        控制面板**不能**再切一次状态 —— 那会让暂停变成"切两下"。
+        以前按 Ctrl+Alt+R 之所以时灵时不灵，正是因为状态被两处各切
+        一次（App 与面板），谁后处理谁说了算，界面与实际状态还对不上。
+        """
+        self._paused = bool(getattr(self.app, "paused", False))
         self._status_paint(False)
 
     def _status_paint(self, hover):
@@ -3773,13 +3819,26 @@ class ControlPanel:
                     else:
                         self.hide()
                 elif kind == "pause":
-                    self._pause()
+                    # 托盘菜单 / 快捷键来的暂停：**App 已经处理过**了
+                    # （暂停是全局状态，由 App 自己管），这里只同步界面
+                    # 上的"[已暂停]"标记，不能再切一次状态。
+                    self._pause_state_changed()
+                elif kind == "pause-state":
+                    # 同上：App 已切好状态，这里只刷新界面。
+                    # ⚠️ **绝不能再调 _pause()**（它会再切一次状态，
+                    # 把 App 刚切好的又切反 —— 这正是以前"按两下才生效"
+                    # 的原因）。
+                    self._pause_state_changed()
                 elif kind == "quit":
                     self._quit()
                     return
                 elif kind == "hotkey-failed":
+                    # 热键被占用 = 用户按 Ctrl+Alt+R 毫无反应。只写
+                    # error.log 的话用户完全不知道原因，所以弹一次
+                    # 提示（只弹一次，不反复打扰）。
                     app.report_error("hotkey", RuntimeError(
                         "Ctrl+Alt+R 已被其他程序占用，暂停快捷键不可用"))
+                    self._notify_hotkey_failed()
                 elif kind == "tray-failed":
                     app.report_error("tray", RuntimeError(
                         "托盘窗口创建失败，托盘图标与右键菜单不可用"))

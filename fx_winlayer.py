@@ -877,17 +877,29 @@ class Overlay:
             | SWP_NOOWNERZORDER))
 
     def leave_panel_ride(self, panel_hwnd):
-        """结束"骑在面板之上"：降回面板之下，并恢复抢顶保活。
+        """结束"骑在面板之上"：降回常态，并恢复抢顶保活。
 
-        插入点用面板本身（SetWindowPos(A, B) 把 A 插到 B **之下**），
-        恢复常态"面板浮在特效之上"。置顶位自愈交给下一帧 keep_on_top。
+        ⚠️ **不能把窗口插到面板之下** —— 面板自 2026-10-19 起是**普通
+        窗口**（不再 topmost），而 SetWindowPos 把置顶窗插到**非置顶**窗
+        之下时会连带清掉 `WS_EX_TOPMOST`。于是特效层变成普通窗口，被任何
+        窗口盖住 —— 用户报的"恢复后无法显示在最上层"就是这么来的。
+
+        覆盖层本来就是 topmost，"骑乘"结束后它天然压在普通面板之上，
+        所以只需要回到置顶组顶部即可。
         """
         self._ride_above_panel = False
-        if not self.hwnd or not panel_hwnd:
+        if not self.hwnd:
             return False
         self._last_sig = None
+        # 面板自己也是置顶窗时，插到它之下是安全的（"面板压着特效"是
+        # 预期状态）；否则回置顶组顶部。
+        if panel_hwnd and _is_topmost_window(panel_hwnd):
+            return bool(user32.SetWindowPos(
+                self.hwnd, HWND(panel_hwnd), 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOCOPYBITS
+                | SWP_NOOWNERZORDER))
         return bool(user32.SetWindowPos(
-            self.hwnd, HWND(panel_hwnd), 0, 0, 0, 0,
+            self.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOCOPYBITS
             | SWP_NOOWNERZORDER))
 
